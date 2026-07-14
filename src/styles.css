@@ -1064,3 +1064,21 @@ body.pin-mode .pin-image-container { display: flex; }
   width: 100%;
   transition: width 0.15s ease, opacity 0.3s ease 0.1s;
 }
+
+/* === Settings section headers (v0.4.1 reorg) === */
+.views-section-header {
+  margin: 22px 0 2px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 650;
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+.views-section-header:first-child { margin-top: 4px; }
+.views-section-sub {
+  margin: 2px 0 8px;
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+}
+.views-settings { display: flex; flex-direction: column; }

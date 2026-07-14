@@ -195,13 +195,33 @@ export class ViewsController {
       form.appendChild(wrap);
     };
 
-    addToggle("passwordAutosave", "Save & autofill passwords", true);
-    addToggle("generalAutofill", "Autofill addresses & forms", true);
+    // Section header + a short description, so settings read as grouped cards
+    // instead of one long undifferentiated list.
+    const addSection = (title: string, subtitle?: string) => {
+      const h = document.createElement("div");
+      h.className = "views-section-header";
+      h.textContent = title;
+      form.appendChild(h);
+      if (subtitle) {
+        const s = document.createElement("div");
+        s.className = "views-section-sub";
+        s.textContent = subtitle;
+        form.appendChild(s);
+      }
+    };
+
+    addSection("Browsing");
     addToggle("adblock", "Block ads & trackers (uBlock Origin Lite)", true);
     addToggle("searchSuggestions", "Search suggestions (sends keystrokes to engine)", false);
+
+    addSection("Privacy & security");
+    addToggle("passwordAutosave", "Save & autofill passwords", true);
+    addToggle("generalAutofill", "Autofill addresses & forms", true);
     addToggle("clearHistoryOnExit", "Clear history on exit", false);
-    addToggle("restoreSession", "Restore tabs on startup", false);
     addToggle("allowFileUrls", "Allow local file:// URLs", false);
+
+    addSection("Startup & window");
+    addToggle("restoreSession", "Restore tabs on startup", false);
 
     // Autostart setting
     const autostartWrap = document.createElement("label");
@@ -245,6 +265,7 @@ export class ViewsController {
 
     const updaterEnabled = await invoke<boolean>("updater_enabled").catch(() => false);
     if (updaterEnabled) {
+      addSection("Updates");
       addToggle("updateCheck", "Automatically check for updates", false);
 
       const checkUpdateBtn = document.createElement("button");
@@ -286,7 +307,7 @@ export class ViewsController {
     // --- Global hotkeys (rebindable) ---
     const hkHeader = document.createElement("div");
     hkHeader.textContent = "Global hotkeys";
-    hkHeader.style.cssText = "margin-top:14px;font-weight:600;font-size:0.8125rem;";
+    hkHeader.className = "views-section-header";
     form.appendChild(hkHeader);
     const hkNote = document.createElement("div");
     hkNote.textContent = "Format: Ctrl+Alt+K, Ctrl+Shift+Space, … Press Apply to save; conflicts are rejected.";
@@ -340,7 +361,7 @@ export class ViewsController {
     // --- In-window shortcuts (reference) ---
     const swHeader = document.createElement("div");
     swHeader.textContent = "In-window shortcuts";
-    swHeader.style.cssText = "margin-top:14px;font-weight:600;font-size:0.8125rem;";
+    swHeader.className = "views-section-header";
     form.appendChild(swHeader);
     const swNote = document.createElement("div");
     swNote.textContent = "Active while browsing a page. Rebinding these is planned for a later release.";
@@ -383,14 +404,7 @@ export class ViewsController {
       form.appendChild(row);
     }
 
-    const wipe = document.createElement("button");
-    wipe.className = "views-btn views-btn-danger interactive";
-    wipe.textContent = "Wipe all history";
-    wipe.addEventListener("click", async () => {
-      await invoke("history_delete", { mode: "all" }).catch(() => {});
-    });
-    form.appendChild(wipe);
-
+    addSection("Setup & data");
     const rerun = document.createElement("button");
     rerun.className = "views-btn interactive";
     rerun.textContent = "Run first-time setup again";
@@ -400,13 +414,22 @@ export class ViewsController {
     });
     form.appendChild(rerun);
 
+    const wipe = document.createElement("button");
+    wipe.className = "views-btn views-btn-danger interactive";
+    wipe.textContent = "Wipe all history";
+    wipe.style.marginTop = "8px";
+    wipe.addEventListener("click", async () => {
+      await invoke("history_delete", { mode: "all" }).catch(() => {});
+    });
+    form.appendChild(wipe);
+
     this.content.appendChild(form);
   }
 
   private renderExtensionsSection(form: HTMLElement): void {
     const header = document.createElement("div");
     header.textContent = "Extensions";
-    header.style.cssText = "margin-top:14px;font-weight:600;font-size:0.8125rem;";
+    header.className = "views-section-header";
     form.appendChild(header);
 
     const note = document.createElement("div");
@@ -474,6 +497,18 @@ export class ViewsController {
         const ver = document.createElement("span");
         ver.textContent = ext.version;
         ver.style.cssText = "color:var(--text-dim);font-size:0.6875rem;";
+        const options = document.createElement("button");
+        options.className = "views-btn interactive";
+        options.textContent = "Options";
+        options.title = "Open this extension's settings page";
+        options.disabled = !ext.enabled;
+        options.addEventListener("click", async () => {
+          try {
+            await invoke("extensions_open_options", { id: ext.id });
+          } catch (err) {
+            alert(String(err));
+          }
+        });
         const remove = document.createElement("button");
         remove.className = "views-btn views-btn-danger interactive";
         remove.textContent = "Remove";
@@ -482,7 +517,7 @@ export class ViewsController {
           showRestartNote();
           refresh();
         });
-        row.append(toggle, name, ver, remove);
+        row.append(toggle, name, ver, options, remove);
         listWrap.appendChild(row);
       }
     };

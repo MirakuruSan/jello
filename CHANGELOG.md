@@ -4,6 +4,27 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.1] — 2026-07-14
+
+### Fixed
+- **Screenshot / OCR overlay not appearing.** Enabling browser extensions on the
+  main window in 0.4.0 left the capture and pinned-image windows with a mismatched
+  setting, so WebView2 refused to create their webview and no overlay showed. All
+  windows now agree on the setting.
+
+### Changed
+- **Settings reorganized** into clear sections (Browsing, Privacy & security,
+  Startup & window, Updates, Extensions, hotkeys, Setup & data) with headers,
+  instead of one long flat list.
+
+### Added
+- **Extension settings in their own window.** The Extensions panel now has an
+  "Options" button that opens an installed extension's dashboard/settings page
+  (e.g. uBlock Origin Lite's dashboard) in a dedicated window. The runtime
+  extension id is derived deterministically from its load path, and the page is
+  hosted in a top-level window (content tabs can't host non-web-accessible
+  extension pages).
+
 ## [0.4.0] — 2026-07-14
 
 Major polish release closing the remaining post-Gemini bug reports. Highlights:

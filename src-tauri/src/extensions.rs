@@ -326,6 +326,79 @@ pub async fn extensions_uninstall(
     Ok(())
 }
 
+/// Chromium derives an unpacked extension's runtime id deterministically from
+/// the absolute path it was loaded from: SHA-256 of the path encoded as UTF-16LE,
+/// first 16 bytes, each nibble mapped to a..p. WebView2 loads our extensions from
+/// `extensions_active/<store_id>`, so this yields the chrome-extension:// id
+/// without any COM enumeration. (Verified against a live uBOL load.)
+fn chromium_unpacked_id(abs_path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut bytes = Vec::new();
+    for u in abs_path.to_string_lossy().encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    let hash = Sha256::digest(&bytes);
+    hash[..16]
+        .iter()
+        .flat_map(|b| [(b'a' + (b >> 4)) as char, (b'a' + (b & 0x0f)) as char])
+        .collect()
+}
+
+/// Parse an extension's options page (MV2 `options_page` or MV3
+/// `options_ui.page`) from its manifest, if any.
+fn read_options_page(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join("manifest.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if let Some(s) = v.get("options_page").and_then(|x| x.as_str()) {
+        return Some(s.to_string());
+    }
+    v.get("options_ui")
+        .and_then(|o| o.get("page"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Open an installed extension's options/settings page in a new tab. Computes
+/// the runtime chrome-extension:// id from the staging path (see
+/// `chromium_unpacked_id`) so the page loads from the loaded extension.
+#[command]
+pub async fn extensions_open_options(
+    id: String,
+    db: State<'_, DbState>,
+    pool: tauri::State<'_, std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let staging = active_extensions_dir(&app).join(&id);
+    if !staging.join("manifest.json").exists() {
+        return Err("Extension isn't loaded — enable it and restart Jello first.".to_string());
+    }
+    let options = read_options_page(&staging)
+        .ok_or_else(|| "This extension has no options page.".to_string())?;
+    let runtime_id = chromium_unpacked_id(&staging);
+    let url = format!("chrome-extension://{}/{}", runtime_id, options.trim_start_matches('/'));
+    let _ = (&db, &pool);
+
+    // Open in a dedicated top-level window (the user's suggestion). A separate
+    // window may host the extension page where a content tab can't.
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("bad extension url: {e}"))?;
+    let label = format!("ext_{}", &runtime_id[..8]);
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed))
+        .title("Extension settings")
+        .inner_size(920.0, 720.0)
+        .browser_extensions_enabled(true)
+        // Load extensions here too, so the page resolves even if no content tab
+        // has loaded this extension into the profile yet.
+        .extensions_path(active_extensions_dir(&app))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Flat staging directory that wry's `extensions_path` expects: its immediate
 /// children must each be an unpacked extension (manifest.json inside). We store
 /// installs as `extensions/<id>/<version>/`, so this holds one entry per ENABLED

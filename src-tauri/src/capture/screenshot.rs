@@ -159,6 +159,9 @@ pub fn execute_screenshot_action(
             .always_on_top(true)
             .decorations(false)
             .transparent(true)
+            // Match the other app windows (see capture/mod.rs) so the pinned
+            // image webview can create in the shared WebView2 environment.
+            .browser_extensions_enabled(true)
             .build()
             .map_err(|e| e.to_string())?;
         }

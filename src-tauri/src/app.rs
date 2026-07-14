@@ -839,6 +839,7 @@ pub fn run() {
             crate::extensions::extensions_set_enabled,
             crate::extensions::extensions_install_ubol,
             crate::extensions::extensions_uninstall,
+            crate::extensions::extensions_open_options,
             crate::palette::palette_show,
             crate::palette::palette_hide,
             crate::palette::palette_resize,

@@ -51,6 +51,11 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
             .decorations(false)
             .transparent(true)
             .skip_taskbar(true)
+            // Must match the other app windows: webviews sharing the app data
+            // dir must agree on this, or WebView2 refuses to create the second
+            // environment and the overlay webview never loads (regression from
+            // enabling extensions on the main window).
+            .browser_extensions_enabled(true)
             .build()
             .map_err(|e| format!("Failed to build capture overlay window: {}", e))?;
             
