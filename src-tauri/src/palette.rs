@@ -366,26 +366,36 @@ pub async fn palette_open(
             let encoded_url = crate::search::percent_encode(&target_url);
             let window_url = format!("index.html?window_id={}&initial_url={}", id, encoded_url);
 
-            let _ = tauri::WebviewWindowBuilder::new(
-                &app,
-                &label,
-                tauri::WebviewUrl::App(window_url.into()),
-            )
-            .inner_size(800.0, 600.0)
-            .title("Jello")
-            .decorations(false)
-            .transparent(true)
-            // Consistent with the other app windows so the shared WebView2
-            // environment agrees on extensions (Phase 4).
-            .browser_extensions_enabled(true)
-            .build()
-            .map_err(|e| e.to_string())?;
-
-            // Overlay pass-through + resize plumbing, same as other windows
-            // (Phase 8 item 12 — palette-created windows lacked it).
-            if let Some(win) = app.get_window(&label) {
-                crate::app::attach_window_plumbing(&app, win);
-            }
+            // Main-thread build + force-resize + show (see window_new_impl).
+            let (txw, rxw) = std::sync::mpsc::channel();
+            let app_m = app.clone();
+            let label_m = label.clone();
+            app.run_on_main_thread(move || {
+                let res = (|| -> Result<(), String> {
+                    let built = tauri::WebviewWindowBuilder::new(
+                        &app_m,
+                        &label_m,
+                        tauri::WebviewUrl::App(window_url.into()),
+                    )
+                    .inner_size(800.0, 600.0)
+                    .title("Jello")
+                    .decorations(false)
+                    .transparent(true)
+                    .position(140.0, 120.0)
+                    .browser_extensions_enabled(true)
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                    if let Some(win) = app_m.get_window(&label_m) {
+                        crate::app::attach_window_plumbing(&app_m, win);
+                    }
+                    let _ = built.set_size(tauri::LogicalSize::new(800.0, 600.0));
+                    let _ = built.show();
+                    let _ = built.set_focus();
+                    Ok(())
+                })();
+                let _ = txw.send(res);
+            }).map_err(|e| e.to_string())?;
+            rxw.recv().unwrap_or(Ok(()))?;
         }
         _ => return Err(format!("Unknown disposition: {}", disposition)),
     }

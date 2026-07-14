@@ -139,7 +139,7 @@ pub async fn process_startup_arg(
 }
 
 #[tauri::command]
-pub fn window_controls(action: String, window: Window) -> Result<(), String> {
+pub async fn window_controls(action: String, window: Window, app: AppHandle) -> Result<(), String> {
     match action.as_str() {
         "min" => window.minimize().map_err(|e| e.to_string()),
         "max" => {
@@ -149,7 +149,26 @@ pub fn window_controls(action: String, window: Window) -> Result<(), String> {
                 window.maximize().map_err(|e| e.to_string())
             }
         }
-        "close" => window.close().map_err(|e| e.to_string()),
+        "close" => {
+            // For the main window, apply the minimize-to-tray choice DIRECTLY
+            // here. Going through window.close() -> CloseRequested from a command
+            // handler proved unreliable (the hide never took effect), so we hide
+            // or exit here and let CloseRequested only handle the OS × / Alt+F4.
+            if window.label() == "main" {
+                let minimize_to_tray = crate::capture::screenshot::get_setting(&app, "minimizeToTray")
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                if minimize_to_tray {
+                    window.hide().map_err(|e| e.to_string())
+                } else {
+                    crate::sessions::on_exit(&app);
+                    app.exit(0);
+                    Ok(())
+                }
+            } else {
+                window.close().map_err(|e| e.to_string())
+            }
+        }
         _ => Err(format!("Unknown window action: {}", action)),
     }
 }
@@ -646,26 +665,49 @@ pub fn run() {
                     if let Some(item) = matched_item {
                         match item.action.as_str() {
                             "summon" => {
-                                // Toggle: hide if visible, else bring back (recreating if needed).
-                                match app.get_window("main") {
-                                    Some(win) if win.is_visible().unwrap_or(false) => {
-                                        let _ = win.hide();
+                                // Marshal window ops to the main thread (doing them
+                                // on the shortcut-handler thread froze the app), and
+                                // hide only when actually front-and-focused — so a
+                                // hidden/backgrounded window reliably comes back
+                                // instead of getting toggled off again.
+                                let app_h = app.clone();
+                                let _ = app.run_on_main_thread(move || {
+                                    match app_h.get_webview_window("main") {
+                                        Some(win) => {
+                                            let visible = win.is_visible().unwrap_or(false);
+                                            let focused = win.is_focused().unwrap_or(false);
+                                            if visible && focused {
+                                                let _ = win.hide();
+                                            } else {
+                                                let _ = win.unminimize();
+                                                let _ = win.show();
+                                                let _ = win.set_focus();
+                                            }
+                                        }
+                                        None => { crate::windows::ensure_main_window(&app_h); }
                                     }
-                                    _ => {
-                                        crate::windows::ensure_main_window(app);
-                                    }
-                                }
+                                });
                             }
                             "palette" => {
                                 let app_h = app.clone();
                                 std::thread::spawn(move || crate::palette::show_palette(&app_h, "search", ""));
                             }
                             "addressbar" => {
-                                // Summon the main window, then open the palette in
-                                // address-bar mode (Enter navigates the current tab).
-                                crate::windows::ensure_main_window(app);
+                                // Show the main window and open its IN-WINDOW address
+                                // bar (not the palette) — that's what "address bar"
+                                // means to the user.
                                 let app_h = app.clone();
-                                std::thread::spawn(move || crate::palette::show_palette(&app_h, "addressbar", ""));
+                                let _ = app.run_on_main_thread(move || {
+                                    match app_h.get_webview_window("main") {
+                                        Some(win) => {
+                                            let _ = win.unminimize();
+                                            let _ = win.show();
+                                            let _ = win.set_focus();
+                                        }
+                                        None => { crate::windows::ensure_main_window(&app_h); }
+                                    }
+                                    let _ = app_h.emit("window:shortcut", "Ctrl+L");
+                                });
                             }
                             "screenshot" => {
                                 let app_h = app.clone();
@@ -772,6 +814,26 @@ pub fn run() {
 
             // Wire pass-through watcher + resize handler for the main window.
             attach_window_plumbing(app.handle(), window);
+
+            // Reliably show the main window from the main thread (setup runs on
+            // it). The frontend also calls show() after should_show_on_startup,
+            // but that webview-thread show() is flaky for transparent frameless
+            // windows and sometimes left the window hidden. Skip only when the
+            // user opted into start-minimized / --minimized.
+            {
+                let args: Vec<String> = std::env::args().collect();
+                let start_minimized = args.iter().any(|a| a == "--minimized")
+                    || crate::capture::screenshot::get_setting(app.handle(), "startMinimized")
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                if !start_minimized {
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.set_size(tauri::LogicalSize::new(800.0, 600.0));
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                }
+            }
 
             let app_h = app.handle().clone();
             std::thread::spawn(move || {

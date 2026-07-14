@@ -107,22 +107,43 @@ pub fn window_new_impl(app: &AppHandle) -> Result<(), String> {
     });
     let _ = rx.recv().unwrap_or(Err(rusqlite::Error::QueryReturnedNoRows)).map_err(|e| e.to_string())?;
 
-    let _ = WebviewWindowBuilder::new(
-        &app,
-        &label,
-        WebviewUrl::App("index.html".into()),
-    )
-    .inner_size(800.0, 600.0)
-    .title("Jello")
-    .decorations(false)
-    .transparent(true)
-    .browser_extensions_enabled(true)
-    .build()
-    .map_err(|e| e.to_string())?;
-
-    if let Some(win) = app.get_window(&label) {
-        crate::app::attach_window_plumbing(&app, win);
-    }
+    // Build + show the window ON THE MAIN THREAD. Creating it from the async
+    // command thread produced a broken window (0x0, then created-but-hidden).
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    let app_m = app.clone();
+    let label_m = label.clone();
+    app.run_on_main_thread(move || {
+        let res = (|| -> Result<(), String> {
+            let built = WebviewWindowBuilder::new(
+                &app_m,
+                &label_m,
+                WebviewUrl::App("index.html".into()),
+            )
+            .inner_size(800.0, 600.0)
+            .title("Jello")
+            .decorations(false)
+            .transparent(true)
+            // Explicit position (not .center(), which scattered the window onto
+            // whichever monitor and read as "didn't open") — cascade near the
+            // top-left of the primary monitor.
+            .position(140.0, 120.0)
+            .browser_extensions_enabled(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+            if let Some(win) = app_m.get_window(&label_m) {
+                crate::app::attach_window_plumbing(&app_m, win);
+            }
+            // The frameless window comes up 0x0 because it's shown before the
+            // WM_NCCALCSIZE subclass exists; now that plumbing installed it,
+            // force a resize so the client area recomputes to the real size.
+            let _ = built.set_size(tauri::LogicalSize::new(800.0, 600.0));
+            let _ = built.show();
+            let _ = built.set_focus();
+            Ok(())
+        })();
+        let _ = tx2.send(res);
+    }).map_err(|e| e.to_string())?;
+    rx2.recv().unwrap_or(Ok(()))?;
 
     Ok(())
 }
@@ -140,23 +161,37 @@ pub fn window_new_incognito_impl(app: &AppHandle) -> Result<(), String> {
     let label = format!("incognito_{}", id);
     
     crate::incognito::add_incognito_tab(id, "about:blank".to_string());
-    
-    let _ = WebviewWindowBuilder::new(
-        &app,
-        &label,
-        WebviewUrl::App("index.html?incognito=true".into()),
-    )
-    .inner_size(800.0, 600.0)
-    .title("Jello (Incognito)")
-    .decorations(false)
-    .transparent(true)
-    .incognito(true)
-    .build()
-    .map_err(|e| e.to_string())?;
 
-    if let Some(win) = app.get_window(&label) {
-        crate::app::attach_window_plumbing(&app, win);
-    }
+    // Same main-thread build + force-resize + show as window_new_impl.
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    let app_m = app.clone();
+    let label_m = label.clone();
+    app.run_on_main_thread(move || {
+        let res = (|| -> Result<(), String> {
+            let built = WebviewWindowBuilder::new(
+                &app_m,
+                &label_m,
+                WebviewUrl::App("index.html?incognito=true".into()),
+            )
+            .inner_size(800.0, 600.0)
+            .title("Jello (Incognito)")
+            .decorations(false)
+            .transparent(true)
+            .position(160.0, 140.0)
+            .incognito(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+            if let Some(win) = app_m.get_window(&label_m) {
+                crate::app::attach_window_plumbing(&app_m, win);
+            }
+            let _ = built.set_size(tauri::LogicalSize::new(800.0, 600.0));
+            let _ = built.show();
+            let _ = built.set_focus();
+            Ok(())
+        })();
+        let _ = tx2.send(res);
+    }).map_err(|e| e.to_string())?;
+    rx2.recv().unwrap_or(Ok(()))?;
 
     Ok(())
 }

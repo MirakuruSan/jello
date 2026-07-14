@@ -163,6 +163,13 @@ function showWebstoreBanner(url: string): void {
   setTimeout(close, 15000); // auto-dismiss
 }
 
+// Keep the top-bar tab-count pill in sync with the in-memory tab list, so it's
+// correct on launch instead of showing the hardcoded "1" until the panel opens.
+function updateTabCountBadge(): void {
+  const badge = document.getElementById("btn-tab-count");
+  if (badge) badge.textContent = String(tabs.length);
+}
+
 function getWindowId(): number {
   const label = getCurrentWebviewWindow().label;
   if (label === "main") return 1;
@@ -657,6 +664,7 @@ window.addEventListener("DOMContentLoaded", () => {
   // Load initial tabs for main state
   invoke<Tab[]>("tabs_list", { windowId: winId }).then((result) => {
     tabs = result;
+    updateTabCountBadge();
     // On the main window, restore last session if enabled and no tabs exist yet.
     if (winId === 1 && tabs.length === 0) {
       invoke<Record<string, unknown>>("settings_get").then((s) => {
@@ -833,6 +841,7 @@ window.addEventListener("DOMContentLoaded", () => {
   listen<Tab>("tab:created", (event) => {
     if (event.payload.windowId === winId) {
       tabs.push(event.payload);
+      updateTabCountBadge();
     }
   });
 
@@ -847,6 +856,7 @@ window.addEventListener("DOMContentLoaded", () => {
   // Backend emits BARE ids for these (tabs.rs: app.emit("tab:closed", id)).
   listen<number>("tab:closed", (event) => {
     tabs = tabs.filter((t) => t.id !== event.payload);
+    updateTabCountBadge();
   });
 
   listen<number>("tab:activated", (event) => {

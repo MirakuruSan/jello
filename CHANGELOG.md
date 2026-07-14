@@ -4,6 +4,27 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.2] — 2026-07-15
+
+### Fixed
+- **Close button now minimizes to tray (or quits).** Clicking close, or pressing
+  Ctrl+Q, reliably hides the window to the system tray (default) or exits, instead
+  of doing nothing. Window-control commands now run asynchronously so they can't
+  deadlock the WebView2 IPC handler.
+- **Show/hide hotkey summons the window back.** Toggling with the global hotkey now
+  brings a hidden or minimized window back and focuses it, instead of hiding it and
+  leaving the app unresponsive until killed from Task Manager.
+- **Address-bar hotkey opens the in-window address bar** (Ctrl+L / F6) rather than
+  the command palette.
+- **"Open in new window" opens a real new window.** New and incognito windows are
+  built on the main thread and force-resized so they appear at the correct size and
+  position instead of coming up hidden or 0×0.
+- **Extension Options window opens reliably.** The dashboard now navigates to the
+  extension page after the extension has finished loading, fixing a race where the
+  window opened blank.
+- **Tab count is correct on launch.** The tab-count badge reflects the real number
+  of tabs immediately, instead of showing "1" until the tab panel is first opened.
+
 ## [0.4.1] — 2026-07-14
 
 ### Fixed

@@ -387,7 +387,7 @@ pub async fn extensions_open_options(
         let _ = existing.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed))
+    let win = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed.clone()))
         .title("Extension settings")
         .inner_size(920.0, 720.0)
         .browser_extensions_enabled(true)
@@ -396,6 +396,16 @@ pub async fn extensions_open_options(
         .extensions_path(active_extensions_dir(&app))
         .build()
         .map_err(|e| e.to_string())?;
+
+    // Race fix: wry runs the initial navigation BEFORE it finishes loading the
+    // extension into this window, so on a fresh session (no content tab yet) the
+    // first load lands on an error page. Once the extension is loaded (~1s), do a
+    // native navigate() — which has extension-page privilege, unlike web-initiated
+    // JS — to (re)load the options page. Harmless if the first load already worked.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1400));
+        let _ = win.navigate(parsed);
+    });
     Ok(())
 }
 
