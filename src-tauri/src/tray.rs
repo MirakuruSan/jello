@@ -20,7 +20,13 @@ pub fn setup_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Erro
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "summon" => {
-                crate::windows::ensure_main_window(app);
+                // Window show/create MUST run on the main thread; the tray
+                // callback fires on a different thread, so marshal it (doing it
+                // here directly left the window hidden — see threading rules).
+                let app_h = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    crate::windows::ensure_main_window(&app_h);
+                });
             }
             "palette" => {
                 let app_h = app.clone();
@@ -56,7 +62,11 @@ pub fn setup_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Erro
                 ..
             } = event
             {
-                crate::windows::ensure_main_window(tray.app_handle());
+                // Marshal to the main thread (tray events fire off-thread).
+                let app_h = tray.app_handle().clone();
+                let _ = app_h.clone().run_on_main_thread(move || {
+                    crate::windows::ensure_main_window(&app_h);
+                });
             }
         })
         .build(app)?;

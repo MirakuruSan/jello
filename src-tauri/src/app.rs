@@ -144,10 +144,43 @@ pub async fn window_controls(action: String, window: Window, app: AppHandle) -> 
         "min" => window.minimize().map_err(|e| e.to_string()),
         "max" => {
             if window.is_maximized().unwrap_or(false) {
-                window.unmaximize().map_err(|e| e.to_string())
+                window.unmaximize().map_err(|e| e.to_string())?;
             } else {
-                window.maximize().map_err(|e| e.to_string())
+                window.maximize().map_err(|e| e.to_string())?;
             }
+            // The Resized event resizes the active tab, but it uses try_lock and
+            // silently skips when the pool is busy, and navigations don't re-read
+            // the rect — so the content webview could keep its pre-maximize size
+            // ("sites load as if not maximized"). Resize the active tab directly
+            // after the (async) maximize message settles so inner_size is correct.
+            let app_h = app.clone();
+            let win = window.clone();
+            std::thread::spawn(move || {
+                // Retry: read inner_size + resize the active tab ON THE MAIN
+                // THREAD (WebView2 bounds calls are UI-thread-only), using
+                // try_lock so we never block the main thread. Break once done.
+                for _ in 0..5 {
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    let app_i = app_h.clone();
+                    let win_i = win.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let _ = app_h.run_on_main_thread(move || {
+                        let pool = app_i.state::<Arc<Mutex<crate::engine::pool::TabPool>>>();
+                        let rect = crate::windows::content_rect(&win_i);
+                        let done = if let Ok(mut p) = pool.try_lock() {
+                            if let Some(active_id) = p.get_active_tab_id() {
+                                p.resize_tab(active_id, rect);
+                            }
+                            true
+                        } else {
+                            false
+                        };
+                        let _ = tx.send(done);
+                    });
+                    if rx.recv().unwrap_or(false) { break; }
+                }
+            });
+            Ok(())
         }
         "close" => {
             // For the main window, apply the minimize-to-tray choice DIRECTLY
@@ -486,26 +519,41 @@ pub struct HotkeyItem {
     pub shortcut: String,
 }
 
+fn default_hotkeys() -> Vec<HotkeyItem> {
+    vec![
+        HotkeyItem { action: "summon".to_string(), shortcut: "Ctrl+Shift+Space".to_string() },
+        HotkeyItem { action: "palette".to_string(), shortcut: "Ctrl+Alt+Space".to_string() },
+        HotkeyItem { action: "screenshot".to_string(), shortcut: "Ctrl+Alt+S".to_string() },
+        HotkeyItem { action: "ocr".to_string(), shortcut: "Ctrl+Alt+T".to_string() },
+        HotkeyItem { action: "incognito".to_string(), shortcut: "Ctrl+Alt+N".to_string() },
+        HotkeyItem { action: "addressbar".to_string(), shortcut: "Ctrl+Alt+L".to_string() },
+        HotkeyItem { action: "leader".to_string(), shortcut: "Ctrl+Space".to_string() },
+    ]
+}
+
 fn get_hotkeys_sync(db: &crate::db::DbState) -> Vec<HotkeyItem> {
     let (tx, rx) = std::sync::mpsc::channel();
     db.execute(move |conn| {
         let res = (|| -> rusqlite::Result<Vec<HotkeyItem>> {
             let mut stmt = conn.prepare("SELECT value_json FROM settings WHERE key = 'global_hotkeys'")?;
             let opt: Option<String> = stmt.query_row([], |row| row.get::<_, String>(0)).optional()?;
+            // Always start from the full default set so every action renders with
+            // a value; a saved list that is a subset (or has a blank entry) must
+            // never leave a hotkey row empty. Saved non-empty shortcuts override.
+            let mut merged = default_hotkeys();
             if let Some(json_str) = opt {
-                if let Ok(items) = serde_json::from_str::<Vec<HotkeyItem>>(&json_str) {
-                    return Ok(items);
+                if let Ok(saved) = serde_json::from_str::<Vec<HotkeyItem>>(&json_str) {
+                    for s in saved {
+                        if s.shortcut.trim().is_empty() { continue; }
+                        if let Some(existing) = merged.iter_mut().find(|d| d.action == s.action) {
+                            existing.shortcut = s.shortcut;
+                        } else {
+                            merged.push(s);
+                        }
+                    }
                 }
             }
-            Ok(vec![
-                HotkeyItem { action: "summon".to_string(), shortcut: "Ctrl+Shift+Space".to_string() },
-                HotkeyItem { action: "palette".to_string(), shortcut: "Ctrl+Alt+Space".to_string() },
-                HotkeyItem { action: "screenshot".to_string(), shortcut: "Ctrl+Alt+S".to_string() },
-                HotkeyItem { action: "ocr".to_string(), shortcut: "Ctrl+Alt+T".to_string() },
-                HotkeyItem { action: "incognito".to_string(), shortcut: "Ctrl+Alt+N".to_string() },
-                HotkeyItem { action: "addressbar".to_string(), shortcut: "Ctrl+Alt+L".to_string() },
-                HotkeyItem { action: "leader".to_string(), shortcut: "Ctrl+Space".to_string() },
-            ])
+            Ok(merged)
         })();
         let _ = tx.send(res);
     });

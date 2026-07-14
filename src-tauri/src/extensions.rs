@@ -88,20 +88,25 @@ pub fn extensions_list(db: State<'_, DbState>) -> Result<Vec<Extension>, String>
     db_list_extensions(&db)
 }
 
+/// A valid Chrome extension id is exactly 32 chars in a..p.
+fn is_ext_id(s: &str) -> bool {
+    s.len() == 32 && s.chars().all(|c| ('a'..='p').contains(&c))
+}
+
 fn resolve_ext_id(crx_id_or_url: &str) -> Result<String, String> {
-    if crx_id_or_url.len() == 32 && crx_id_or_url.chars().all(|c| c.is_ascii_lowercase()) {
-        Ok(crx_id_or_url.to_string())
-    } else if let Some(pos) = crx_id_or_url.find("/detail/") {
-        let suffix = &crx_id_or_url[pos + 8..];
-        let id_part = suffix.split('/').next().unwrap_or("");
-        if id_part.len() == 32 {
-            Ok(id_part.to_string())
-        } else {
-            Err("Could not extract extension ID from URL".to_string())
-        }
-    } else {
-        Err("Invalid extension ID or Web Store URL".to_string())
+    let trimmed = crx_id_or_url.trim();
+    if is_ext_id(trimmed) {
+        return Ok(trimmed.to_string());
     }
+    // Web Store URLs are `.../detail/<slug>/<id>` (modern) or `.../detail/<id>`
+    // (legacy). The id is the 32-char [a-p] path segment — NOT necessarily the
+    // first one after /detail/, which is usually the human-readable slug. Scan
+    // all path segments (strip any query/fragment) and take the id-shaped one.
+    let path = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    if let Some(id) = path.split('/').map(|s| s.to_ascii_lowercase()).find(|s| is_ext_id(s)) {
+        return Ok(id);
+    }
+    Err("Could not find a 32-character extension ID in that value or URL.".to_string())
 }
 
 /// Download the CRX bytes over HTTPS with a Chrome-like User-Agent so Google's
@@ -397,14 +402,23 @@ pub async fn extensions_open_options(
         .build()
         .map_err(|e| e.to_string())?;
 
-    // Race fix: wry runs the initial navigation BEFORE it finishes loading the
-    // extension into this window, so on a fresh session (no content tab yet) the
-    // first load lands on an error page. Once the extension is loaded (~1s), do a
-    // native navigate() — which has extension-page privilege, unlike web-initiated
-    // JS — to (re)load the options page. Harmless if the first load already worked.
+    // The window's INITIAL document load can render a non-web-accessible
+    // extension page (e.g. uBOL's dashboard). A later programmatic navigate()
+    // to that same page, however, is treated as a web-initiated navigation and
+    // BLOCKED (ERR_BLOCKED_BY_CLIENT) — which is what broke the page when the
+    // extension was already loaded and the first load had succeeded. So only
+    // re-navigate as a RECOVERY when the initial load did NOT land on the
+    // extension page (fresh session where the extension wasn't loaded yet).
+    let target_prefix = format!("chrome-extension://{}/", runtime_id);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(1400));
-        let _ = win.navigate(parsed);
+        let on_target = win
+            .url()
+            .map(|u| u.as_str().starts_with(&target_prefix))
+            .unwrap_or(false);
+        if !on_target {
+            let _ = win.navigate(parsed);
+        }
     });
     Ok(())
 }

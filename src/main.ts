@@ -185,6 +185,13 @@ function getWindowId(): number {
 function activeTab(): Tab | undefined {
   return tabs.find((t) => t.id === activeTabId);
 }
+// Show the new-tab page (and its search pill) only for a blank tab. Must run on
+// navigation too (tab:updated), not just tab switches — otherwise the search
+// pill lingers over a loaded site after navigating away from about:blank.
+function updateNewtabVisibility(tab: Tab | undefined): void {
+  const newtab = document.getElementById("newtab-page");
+  if (newtab) newtab.classList.toggle("visible", tab?.url === "about:blank" || !tab);
+}
 function activeHost(): string {
   try {
     return new URL(activeTab()?.url || "").hostname;
@@ -194,6 +201,10 @@ function activeHost(): string {
 }
 let views: ViewsController | null = null;
 let zoomFactor = 1.0;
+// Bookmark star: maps the current bookmark set (url -> id) so the star button
+// can toggle and reflect whether the active page is bookmarked. Wired in init.
+let bookmarkMap = new Map<string, number>();
+let refreshBookmarkStar: () => void = () => {};
 function applyZoom(f: number): void {
   zoomFactor = Math.min(5, Math.max(0.25, f));
   invoke("zoom_set", { factor: zoomFactor, host: activeHost() }).catch(console.error);
@@ -205,6 +216,7 @@ function updateDomainPill(tab: Tab | undefined): void {
   const domainText = document.getElementById("domain-text");
   const lock = document.querySelector<HTMLElement>("#domain-pill .lock-icon");
   if (!domainText) return;
+  refreshBookmarkStar();
   if (!tab || tab.url === "about:blank" || !tab.url) {
     domainText.textContent = "New Tab";
     if (lock) lock.innerHTML = "";
@@ -263,6 +275,82 @@ function switchAdjacentTab(dir: -1 | 1): void {
   if (target) invoke("tabs_activate", { id: target.id }).catch(console.error);
 }
 
+// Map a keyboard event to a shortcut action string (mirrors the native
+// WebView2 accelerator key map in webview2.rs) so the overlay/chrome can
+// dispatch the same shortcuts the content webviews do. Uses e.code so it is
+// layout- and case-independent.
+function keyEventToAction(e: KeyboardEvent): string | null {
+  const c = e.ctrlKey, s = e.shiftKey, a = e.altKey;
+  const code = e.code;
+  if (e.key === "BrowserBack") return "Nav+Back";
+  if (e.key === "BrowserForward") return "Nav+Forward";
+  if (a && !c && !s) {
+    if (code === "ArrowLeft") return "Tab+Prev";
+    if (code === "ArrowRight") return "Tab+Next";
+    return null;
+  }
+  if (!c && !s && !a) {
+    if (code === "F5") return "F5";
+    if (code === "F6") return "F6";
+    if (code === "Escape") return "Esc";
+    return null;
+  }
+  if (c && !s && !a) {
+    switch (code) {
+      case "KeyT": return "Ctrl+T";
+      case "KeyW": return "Ctrl+W";
+      case "KeyN": return "Ctrl+N";
+      case "KeyL": return "Ctrl+L";
+      case "KeyF": return "Ctrl+F";
+      case "KeyR": return "Ctrl+R";
+      case "KeyJ": return "Ctrl+J";
+      case "KeyD": return "Ctrl+D";
+      case "KeyH": return "Ctrl+H";
+      case "KeyM": return "Ctrl+M";
+      case "KeyQ": return "Ctrl+Q";
+      case "Tab": return "Ctrl+Tab";
+      case "Equal": case "NumpadAdd": return "Ctrl+ZoomIn";
+      case "Minus": case "NumpadSubtract": return "Ctrl+ZoomOut";
+      case "Digit0": case "Numpad0": return "Ctrl+ZoomReset";
+    }
+    if (/^Digit[1-9]$/.test(code)) return "Ctrl+" + code.slice(5);
+    return null;
+  }
+  if (c && s && !a) {
+    switch (code) {
+      case "KeyT": return "Ctrl+Shift+T";
+      case "KeyN": return "Ctrl+Shift+N";
+      case "KeyE": return "Ctrl+Shift+E";
+      case "KeyU": return "Ctrl+Shift+U";
+      case "KeyR": return "Ctrl+Shift+R";
+      case "KeyO": return "Ctrl+Shift+O";
+      case "KeyC": return "Ctrl+Shift+C";
+      case "KeyV": return "Ctrl+Shift+V";
+      case "Tab": return "Ctrl+Shift+Tab";
+    }
+    return null;
+  }
+  return null;
+}
+
+// Add or remove the active page from bookmarks, based on current state.
+async function toggleCurrentBookmark(): Promise<void> {
+  const t = activeTab();
+  if (!t || !t.url || t.url === "about:blank") {
+    showToast("Nothing to bookmark");
+    return;
+  }
+  if (bookmarkMap.has(t.url)) {
+    await invoke("bookmarks_remove", { id: bookmarkMap.get(t.url) }).catch(() => {});
+    bookmarkMap.delete(t.url);
+    showToast("Bookmark removed");
+  } else {
+    await invoke("bookmark_current_tab", { url: t.url, title: t.title || t.url }).catch(console.error);
+    showToast("Bookmarked");
+  }
+  refreshBookmarkStar();
+}
+
 // ===== Shortcut dispatch =====
 function handleShortcut(action: string): void {
   resetTopBarFade();
@@ -303,15 +391,15 @@ function handleShortcut(action: string): void {
       // In-app address bar (no detached window), like any other browser.
       openAddressBar();
       break;
-    case "Ctrl+D": {
-      const t = activeTab();
-      if (t) {
-        invoke("bookmark_current_tab", { url: t.url, title: t.title || t.url })
-          .then(() => showToast("Bookmarked"))
-          .catch(console.error);
-      }
+    case "Ctrl+D":
+      // Toggle (add/remove) so the star and Ctrl+D agree; reload the set so the
+      // star reflects the new state.
+      toggleCurrentBookmark().then(() => {
+        invoke<{ id: number; url: string }[]>("bookmarks_list")
+          .then((marks) => { bookmarkMap = new Map(marks.map((m) => [m.url, m.id])); refreshBookmarkStar(); })
+          .catch(() => {});
+      });
       break;
-    }
     case "Ctrl+Shift+C": {
       const t = activeTab();
       if (t?.url) {
@@ -686,6 +774,30 @@ window.addEventListener("DOMContentLoaded", () => {
     views?.open("settings");
   });
 
+  // Bookmark star: toggles the current page in/out of bookmarks, and reflects
+  // whether the active page is already bookmarked (★ = saved, ☆ = not).
+  const bookmarkBtn = document.getElementById("btn-bookmark");
+  if (bookmarkBtn) {
+    const loadBookmarks = async () => {
+      const marks = await invoke<{ id: number; url: string }[]>("bookmarks_list").catch(() => []);
+      bookmarkMap = new Map(marks.map((m) => [m.url, m.id]));
+      refreshBookmarkStar();
+    };
+    refreshBookmarkStar = () => {
+      const t = activeTab();
+      const marked = !!(t && t.url && bookmarkMap.has(t.url));
+      bookmarkBtn.textContent = marked ? "★" : "☆";
+      bookmarkBtn.classList.toggle("pinned", marked);
+      bookmarkBtn.setAttribute("aria-pressed", String(marked));
+      bookmarkBtn.setAttribute("title", marked ? "Remove bookmark (Ctrl+D)" : "Bookmark this page (Ctrl+D)");
+    };
+    bookmarkBtn.addEventListener("click", async () => {
+      await toggleCurrentBookmark();
+      await loadBookmarks();
+    });
+    loadBookmarks();
+  }
+
   // Pin-on-top toggle
   const pinBtn = document.getElementById("btn-pin");
   if (pinBtn) {
@@ -789,36 +901,21 @@ window.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("overlay:layout", updateHitRects);
   setInterval(updateHitRects, 250);
 
-  // Overlay-side keyboard shortcuts (the accelerator handler only covers
-  // content webviews; when the overlay itself has focus we map keys here).
+  // Overlay-side keyboard shortcuts. The native WebView2 accelerator handler
+  // only fires when a CONTENT webview has focus; when the chrome/overlay has
+  // focus (new-tab page, after clicking chrome UI, address bar) those keys never
+  // reach the backend, so the same shortcuts would silently stop working. Map
+  // the full set here too so shortcuts work regardless of which surface is
+  // focused (fixes "hotkeys work then stop then start again").
   document.addEventListener("keydown", (e: KeyboardEvent) => {
     const t = e.target as HTMLElement | null;
-    const typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
-    if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "u") {
-      e.preventDefault();
-      toggleChromeUi();
-    } else if (!typing && e.altKey && e.key === "ArrowLeft") {
-      e.preventDefault();
-      switchAdjacentTab(-1);
-    } else if (!typing && e.altKey && e.key === "ArrowRight") {
-      e.preventDefault();
-      switchAdjacentTab(1);
-    } else if (!typing && e.ctrlKey && (e.key === "+" || e.key === "=")) {
-      e.preventDefault();
-      applyZoom(zoomFactor + 0.1);
-    } else if (!typing && e.ctrlKey && e.key === "-") {
-      e.preventDefault();
-      applyZoom(zoomFactor - 0.1);
-    } else if (!typing && e.ctrlKey && e.key === "0") {
-      e.preventDefault();
-      applyZoom(1.0);
-    } else if (e.key === "BrowserBack") {
-      invoke("nav_back", {}).catch(console.error);
-    } else if (e.key === "BrowserForward") {
-      invoke("nav_forward", {}).catch(console.error);
-    } else if (e.key === "Escape") {
-      handleShortcut("Esc");
-    }
+    const typing = !!(t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable));
+    const action = keyEventToAction(e);
+    if (!action) return;
+    // While typing in a field, let the field own text-editing keys and Esc.
+    if (typing && action === "Esc") return;
+    e.preventDefault();
+    handleShortcut(action);
   });
 
   // ===== Hover-fade =====
@@ -849,7 +946,10 @@ window.addEventListener("DOMContentLoaded", () => {
     if (event.payload.windowId === winId) {
       const idx = tabs.findIndex((t) => t.id === event.payload.id);
       if (idx >= 0) tabs[idx] = event.payload;
-      if (event.payload.id === activeTabId) updateDomainPill(event.payload);
+      if (event.payload.id === activeTabId) {
+        updateDomainPill(event.payload);
+        updateNewtabVisibility(event.payload);
+      }
     }
   });
 
@@ -863,11 +963,7 @@ window.addEventListener("DOMContentLoaded", () => {
     activeTabId = event.payload;
     const tab = tabs.find((t) => t.id === activeTabId);
     updateDomainPill(tab);
-    // Hide/show newtab page
-    const newtab = document.getElementById("newtab-page");
-    if (newtab) {
-      newtab.classList.toggle("visible", tab?.url === "about:blank" || !tab);
-    }
+    updateNewtabVisibility(tab);
   });
 
   listen<string>("window:shortcut", (event) => {

@@ -4,6 +4,40 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.3] — 2026-07-15
+
+### Fixed
+- **Window reopens from the tray again.** Clicking the tray icon (or "Show
+  Jello") after closing to tray now reliably brings the window back — the show
+  was running off the main thread and silently failing.
+- **Hotkeys no longer "stop working" mid-session.** Tab/window shortcuts
+  (Ctrl+T, Ctrl+W, Ctrl+N, …) now work whether the page or the chrome/new-tab
+  page has focus, instead of only when a web page was focused. Ctrl+W closes the
+  tab.
+- **Extension Options page opens** instead of showing ERR_BLOCKED_BY_CLIENT: the
+  window no longer re-navigates to the extension page (which Chromium blocks)
+  once the initial load has succeeded.
+- **Installing extensions by Web Store URL works.** The 32-character extension
+  ID is now extracted correctly from modern `/detail/<slug>/<id>` URLs (it was
+  grabbing the slug and failing).
+- **Screenshots no longer capture a ghost Jello window.** Jello's own windows
+  are hidden before the screen is grabbed and restored afterward.
+- **Maximizing resizes page content** to fill the window instead of leaving
+  pages at the pre-maximize size.
+- **The new-tab search pill no longer lingers** over a loaded website after
+  navigating away from the new-tab page.
+- **Global hotkey rows are never blank** — the list always falls back to the
+  full set of defaults.
+
+### Changed
+- The Settings "Run first-time setup again" button is now **"Configure"**, and
+  the redundant "Wipe all history" was removed from Settings (it lives in the
+  History tab as "Clear all").
+
+### Added
+- **Bookmark star** in the top bar to bookmark/un-bookmark the current page
+  (Ctrl+D also toggles); the star reflects whether the page is bookmarked.
+
 ## [0.4.2] — 2026-07-15
 
 ### Fixed

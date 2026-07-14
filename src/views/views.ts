@@ -407,21 +407,15 @@ export class ViewsController {
     addSection("Setup & data");
     const rerun = document.createElement("button");
     rerun.className = "views-btn interactive";
-    rerun.textContent = "Run first-time setup again";
+    rerun.textContent = "Configure";
     rerun.addEventListener("click", () => {
       invoke("settings_set", { patch: { wizardComplete: false } }).catch(() => {});
       window.dispatchEvent(new CustomEvent("jello:run-wizard"));
     });
     form.appendChild(rerun);
 
-    const wipe = document.createElement("button");
-    wipe.className = "views-btn views-btn-danger interactive";
-    wipe.textContent = "Wipe all history";
-    wipe.style.marginTop = "8px";
-    wipe.addEventListener("click", async () => {
-      await invoke("history_delete", { mode: "all" }).catch(() => {});
-    });
-    form.appendChild(wipe);
+    // "Wipe all history" lives in the History tab ("Clear all"); not duplicated
+    // here.
 
     this.content.appendChild(form);
   }
