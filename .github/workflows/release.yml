@@ -1,0 +1,54 @@
+name: Release
+
+# Build, sign, and publish a GitHub Release (with latest.json for the in-app
+# updater) whenever a v* tag is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, sign, and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Add these two under Settings > Secrets and variables > Actions:
+          #   TAURI_SIGNING_PRIVATE_KEY          = contents of ~/.tauri/jello-updater.key
+          #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD = the password you set (empty if none)
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # Force npm (the runner has no pnpm, which tauri-action otherwise
+          # defaults to); runs `npx tauri build ...`.
+          tauriScript: npx tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "Jello ${{ github.ref_name }}"
+          releaseBody: "See CHANGELOG.md for details."
+          releaseDraft: true
+          prerelease: false
+          # Emits latest.json alongside the installers for the updater endpoint.
+          includeUpdaterJson: true

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Jello",
+  "version": "0.4.0",
+  "identifier": "com.jello.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Jello",
+        "width": 800,
+        "height": 600,
+        "minWidth": 480,
+        "minHeight": 360,
+        "decorations": false,
+        "transparent": true,
+        "visible": false,
+        "browserExtensionsEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc:;",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$TEMP/**/*", "$PICTURE/**/*"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI1N0M3MzMxM0Y4N0EzMEIKUldRTG80Yy9NWE44SmFHVWgweUl1S09JdGNoMDJybzVYdXQvbFZoZjVVa3NHUDA0WUR5WmJCeWsK",
+      "endpoints": ["https://github.com/MirakuruSan/jello/releases/latest/download/latest.json"]
+    }
+  }
+}

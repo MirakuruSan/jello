@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Jello</title>
+    <meta name="description" content="Jello — a privacy-first chromeless browser" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <!-- Window drag region for undecorated window -->
+    <div class="drag-region interactive" data-tauri-drag-region></div>
+
+    <div id="overlay-ui">
+      <!-- Top navigation loading bar (Phase 8) -->
+      <div class="nav-progress region-visible" id="nav-progress"></div>
+      <!-- ===== Top bar: floating pills ===== -->
+      <div class="top-bar interactive" id="top-bar" data-tauri-drag-region>
+
+        <!-- Navigation pill (top-left) -->
+        <div class="nav-pill glass interactive no-drag" id="nav-pill">
+          <button class="pill-btn interactive" id="btn-back" title="Back (Alt+←)">←</button>
+          <button class="pill-btn interactive" id="btn-forward" title="Forward (Alt+→)">→</button>
+          <button class="pill-btn interactive" id="btn-reload" title="Reload (Ctrl+R)">↻</button>
+        </div>
+
+        <!-- Domain pill (top-center) — click to edit the URL inline -->
+        <div class="domain-pill glass interactive no-drag" id="domain-pill" title="Click to edit URL (Ctrl+L)">
+          <span class="lock-icon"></span>
+          <span id="domain-text">New Tab</span>
+          <input type="text" class="address-input interactive no-drag" id="address-input" spellcheck="false" autocomplete="off" placeholder="Search or enter URL…" />
+        </div>
+
+        <!-- Controls pill (top-right) -->
+        <div class="controls-pill glass interactive no-drag" id="controls-pill">
+          <button class="pill-btn interactive" id="btn-pin" title="Pin window on top" aria-pressed="false"></button>
+          <button class="pill-btn tab-count-btn interactive" id="btn-tab-count" title="Toggle tab list (Ctrl+Shift+E)">1</button>
+          <button class="pill-btn interactive" id="btn-menu" title="Menu">⋯</button>
+          <button class="pill-btn interactive" id="btn-min" title="Minimize">─</button>
+          <button class="pill-btn interactive" id="btn-max" title="Maximize">□</button>
+          <button class="pill-btn close-btn interactive" id="btn-close" title="Close (Ctrl+Q)">×</button>
+        </div>
+      </div>
+
+      <!-- ===== Tab list panel (right side, slides in) ===== -->
+      <div class="tab-panel glass" id="tab-panel">
+        <div class="tab-panel-header">
+          <h3>Tabs</h3>
+          <button class="pill-btn interactive" id="btn-close-panel" title="Close panel">×</button>
+        </div>
+        <input type="text" class="tab-search interactive" id="tab-search" placeholder="Search tabs…" />
+        <div class="tab-list-viewport" id="tab-list-viewport">
+          <div class="tab-list-spacer" id="tab-list-spacer"></div>
+        </div>
+      </div>
+
+      <!-- ===== Find bar ===== -->
+      <div class="find-bar glass" id="find-bar">
+        <input type="text" class="interactive" id="find-input" placeholder="Find in page…" />
+        <button class="pill-btn interactive" id="find-prev" title="Previous">▲</button>
+        <button class="pill-btn interactive" id="find-next" title="Next">▼</button>
+        <button class="pill-btn interactive" id="find-close" title="Close">×</button>
+      </div>
+
+      <!-- ===== Toast container ===== -->
+      <div class="toast-container region-visible" id="toast-container"></div>
+
+      <!-- ===== New-tab page ===== -->
+      <div class="newtab-page visible" id="newtab-page">
+        <div class="newtab-clock" id="newtab-clock">00:00</div>
+        <input type="text" class="newtab-search glass interactive" id="newtab-search" placeholder="Search or enter URL…" autocomplete="off" />
+        <div class="top-sites" id="top-sites"></div>
+      </div>
+
+      <!-- ===== Chord HUD ===== -->
+      <div class="chord-hud glass region-visible" id="chord-hud">
+        <div class="chord-hud-keys" id="chord-hud-keys"></div>
+        <div class="chord-hud-slots" id="chord-hud-slots"></div>
+      </div>
+
+      <!-- ===== Views panel (History / Bookmarks / Downloads / Settings) ===== -->
+      <div class="views-panel glass" id="views-panel">
+        <div class="views-header">
+          <div class="views-tabs" id="views-tabs">
+            <button class="views-tab interactive" data-view="history">History</button>
+            <button class="views-tab interactive" data-view="bookmarks">Bookmarks</button>
+            <button class="views-tab interactive" data-view="downloads">Downloads</button>
+            <button class="views-tab interactive" data-view="settings">Settings</button>
+          </div>
+          <button class="pill-btn interactive" id="views-close" title="Close">×</button>
+        </div>
+        <div class="views-content interactive" id="views-content"></div>
+      </div>
+
+    </div>
+
+    <!-- ===== Quick Palette UI (own window; sibling of #overlay-ui so
+         body.palette-mode can hide the overlay without hiding the palette) ===== -->
+    <div class="palette-ui" id="palette-ui" data-tauri-drag-region>
+      <input type="text" class="palette-search interactive no-drag" id="palette-search" placeholder="Search tabs, history, bookmarks..." autocomplete="off" />
+      <div class="palette-results no-drag" id="palette-results"></div>
+    </div>
+
+    <!-- ===== First-run wizard ===== -->
+    <div class="wizard-overlay" id="wizard-overlay">
+      <div class="wizard-card glass">
+        <h1 class="wizard-title">Welcome to Jello</h1>
+        <p class="wizard-sub">A few quick choices. You can change all of these later in Settings.</p>
+
+        <label class="wizard-field">Default search engine
+          <select id="wiz-search" class="interactive">
+            <option value="https://duckduckgo.com/?q=%s">DuckDuckGo (private)</option>
+            <option value="https://google.com/search?q=%s">Google</option>
+            <option value="https://www.bing.com/search?q=%s">Bing</option>
+            <option value="https://search.brave.com/search?q=%s">Brave</option>
+          </select>
+        </label>
+
+        <label class="wizard-field">Default AI chatbot
+          <select id="wiz-chatbot" class="interactive">
+            <option value="https://chatgpt.com/?q=%s">ChatGPT</option>
+            <option value="https://www.perplexity.ai/search?q=%s">Perplexity</option>
+            <option value="https://claude.ai/">Claude</option>
+            <option value="https://gemini.google.com/">Gemini</option>
+          </select>
+        </label>
+
+        <label class="wizard-field">Theme
+          <select id="wiz-theme" class="interactive">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+            <option value="system">System</option>
+          </select>
+        </label>
+
+        <label class="wizard-check"><input type="checkbox" id="wiz-adblock" class="interactive" checked /> Block ads &amp; trackers (installs uBlock Origin Lite)</label>
+        <label class="wizard-check"><input type="checkbox" id="wiz-suggest" class="interactive" /> Search suggestions (sends keystrokes to the engine)</label>
+        <label class="wizard-check"><input type="checkbox" id="wiz-restore" class="interactive" /> Restore tabs on startup</label>
+        <label class="wizard-check"><input type="checkbox" id="wiz-update" class="interactive" /> Automatically check for updates</label>
+
+        <p class="wizard-note">Passwords: Jello saves &amp; autofills passwords locally. For cross-browser
+        sync, install a vault extension (Bitwarden, Proton Pass, 1Password) in both browsers.</p>
+
+        <div class="wizard-actions">
+          <button class="views-btn interactive" id="wiz-skip">Skip</button>
+          <button class="views-btn interactive" id="wiz-finish">Finish setup</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Capture selection overlay ===== -->
+    <div class="capture-overlay" id="capture-overlay">
+      <div class="capture-bg" id="capture-bg"></div>
+      <div class="capture-selection" id="capture-selection">
+        <div class="capture-badge" id="capture-badge">0 × 0</div>
+      </div>
+      <!-- Screenshot action bar (shown after a selection is drawn) -->
+      <div class="capture-actionbar glass" id="capture-actionbar">
+        <button class="capture-action-btn" data-action="copy">Copy</button>
+        <button class="capture-action-btn" data-action="save">Save</button>
+        <button class="capture-action-btn" data-action="search">Search</button>
+        <button class="capture-action-btn" data-action="ask_ai">Ask AI</button>
+        <button class="capture-action-btn" data-action="pin">Pin</button>
+      </div>
+      <!-- OCR result popover -->
+      <div class="capture-ocr-popover glass" id="capture-ocr-popover">
+        <textarea id="capture-ocr-text" class="capture-ocr-text" spellcheck="false"></textarea>
+        <div class="capture-ocr-actions">
+          <button class="capture-action-btn" data-ocr-action="copy">Copy</button>
+          <button class="capture-action-btn" data-ocr-action="search">Search</button>
+          <button class="capture-action-btn" data-ocr-action="ask_ai">Ask AI</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Pin image viewer ===== -->
+    <div class="pin-image-container" id="pin-image-container">
+      <img id="pin-image" src="" alt="Pinned crop" />
+      <button class="pin-close-btn" id="pin-close-btn">×</button>
+    </div>
+  </body>
+</html>
