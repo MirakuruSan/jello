@@ -466,6 +466,25 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                     }
                 }
             }
+            // Drag-and-drop install (P1.3.2): a dropped .crx/.zip installs as an
+            // extension (with the normal consent dialog inside the command).
+            tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                for p in paths {
+                    let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+                    if matches!(ext.as_deref(), Some("crx") | Some("zip")) {
+                        let app_h = scale_app.clone();
+                        let path_str = p.to_string_lossy().to_string();
+                        tauri::async_runtime::spawn(async move {
+                            let db = app_h.state::<crate::db::DbState>();
+                            match crate::extensions::extensions_install_file(path_str, db, app_h.clone()).await {
+                                Ok(ext) => { let _ = app_h.emit("toast:show", format!("Installed extension: {}", ext.name)); }
+                                Err(e) => { let _ = app_h.emit("toast:show", format!("Extension install failed: {}", e)); }
+                            }
+                        });
+                        break;
+                    }
+                }
+            }
             // Closing the primary window minimizes to the system tray when
             // minimizeToTray is on (default). This keeps tabs/session alive and,
             // crucially, keeps the "main" window ALIVE so tray/summon/relaunch
@@ -1040,6 +1059,9 @@ pub fn run() {
             crate::extensions::extensions_install_ubol,
             crate::extensions::extensions_uninstall,
             crate::extensions::extensions_open_options,
+            crate::extensions::extensions_restart_app,
+            crate::extensions::extensions_install_file,
+            crate::extensions::extensions_install_file_dialog,
             crate::palette::palette_show,
             crate::palette::palette_hide,
             crate::palette::palette_resize,

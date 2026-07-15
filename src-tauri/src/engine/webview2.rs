@@ -58,6 +58,8 @@ fn persist_tab_meta(
     if let Some(u) = &url {
         if u.contains("chromewebstore.google.com/detail/")
             || u.contains("chrome.google.com/webstore/detail/")
+            // Edge Add-ons detail pages (P1.4) — same "Install to Jello" banner.
+            || u.contains("microsoftedge.microsoft.com/addons/detail/")
         {
             let _ = app.emit("webstore:detected", u.clone());
         }

@@ -293,17 +293,18 @@ impl TabPool {
                 if is_incognito {
                     webview_builder = webview_builder.incognito(true);
                 } else {
-                    // Load enabled browser extensions (uBOL etc.) into normal
-                    // content webviews. Enabled uniformly with the chrome windows
-                    // so the shared app data dir has a consistent setting; the
-                    // staging dir holds one unpacked-extension entry per enabled
-                    // extension, which wry AddBrowserExtension's on creation.
-                    let active = crate::extensions::active_extensions_dir(&app_for_ext);
-                    webview_builder = webview_builder
-                        .browser_extensions_enabled(true)
-                        .extensions_path(active);
+                    // Enable extensions on the shared profile; the actual loading
+                    // is done per-extension via explicit AddBrowserExtension COM
+                    // calls after add_child (P1.1) — NOT the destructive
+                    // extensions_path staging that corrupted under a live session.
+                    webview_builder = webview_builder.browser_extensions_enabled(true);
                 }
                 let res = window.add_child(webview_builder, pos, size).map_err(|e| e.to_string());
+                if let Ok(ref wv) = res {
+                    if !is_incognito {
+                        crate::extensions::load_all_enabled(&app_for_ext, wv);
+                    }
+                }
                 let _ = tx.send(res);
             }).map_err(|e| e.to_string())?;
         }

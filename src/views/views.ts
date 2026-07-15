@@ -436,8 +436,16 @@ export class ViewsController {
     restartNote.textContent = "↻ Restart Jello to apply extension changes everywhere.";
     restartNote.style.cssText =
       "color:var(--warn);font-size:0.6875rem;margin:4px 0;display:none;";
+    const restartBtn = document.createElement("button");
+    restartBtn.className = "views-btn interactive";
+    restartBtn.textContent = "↻ Restart Jello now";
+    restartBtn.style.cssText = "display:none;margin:4px 0;";
+    restartBtn.addEventListener("click", () => {
+      invoke("extensions_restart_app").catch(() => {});
+    });
     const showRestartNote = () => {
       restartNote.style.display = "block";
+      restartBtn.style.display = "inline-block";
     };
 
     // Install row
@@ -451,14 +459,24 @@ export class ViewsController {
     const installBtn = document.createElement("button");
     installBtn.className = "views-btn interactive";
     installBtn.textContent = "Install";
+    const fileBtn = document.createElement("button");
+    fileBtn.className = "views-btn interactive";
+    fileBtn.textContent = "From file…";
+    fileBtn.title = "Install an extension from a local .crx or .zip file";
     const installStatus = document.createElement("span");
     installStatus.style.cssText = "font-size:0.6875rem;min-width:70px;";
-    installRow.append(input, installBtn, installStatus);
+    installRow.append(input, installBtn, fileBtn, installStatus);
     form.appendChild(installRow);
+
+    const dropHint = document.createElement("div");
+    dropHint.textContent = "Tip: you can also drag a .crx/.zip file onto the window to install it.";
+    dropHint.style.cssText = "color:var(--text-dim);font-size:0.6875rem;margin-bottom:6px;";
+    form.appendChild(dropHint);
 
     const listWrap = document.createElement("div");
     form.appendChild(listWrap);
     form.appendChild(restartNote);
+    form.appendChild(restartBtn);
 
     const refresh = async () => {
       listWrap.innerHTML = "";
@@ -515,6 +533,29 @@ export class ViewsController {
         listWrap.appendChild(row);
       }
     };
+
+    fileBtn.addEventListener("click", async () => {
+      fileBtn.disabled = true;
+      installStatus.textContent = "Installing…";
+      installStatus.style.color = "var(--text-dim)";
+      try {
+        const ext = await invoke<{ name: string } | null>("extensions_install_file_dialog");
+        if (ext) {
+          installStatus.textContent = "Installed";
+          installStatus.style.color = "var(--ok)";
+          showRestartNote();
+          refresh();
+        } else {
+          installStatus.textContent = "";
+        }
+      } catch (err) {
+        installStatus.textContent = "Failed";
+        installStatus.style.color = "var(--danger)";
+        console.error(err);
+      } finally {
+        fileBtn.disabled = false;
+      }
+    });
 
     installBtn.addEventListener("click", async () => {
       const val = input.value.trim();
