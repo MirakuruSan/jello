@@ -284,6 +284,10 @@ pub fn window_new_incognito_impl(app: &AppHandle) -> Result<(), String> {
             .transparent(true)
             .position(160.0, 140.0)
             .incognito(true)
+            // Match the other app windows' extensions setting so WebView2 doesn't
+            // refuse to create the environment (the capture-window constraint);
+            // incognito still loads no extensions (we skip load_all_enabled).
+            .browser_extensions_enabled(true)
             .build()
             .map_err(|e| e.to_string())?;
             if let Some(win) = app_m.get_window(&label_m) {

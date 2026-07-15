@@ -50,6 +50,12 @@ function resetTopBarFade(): void {
   topBar.classList.remove("faded");
   if (topBarFadeTimer) clearTimeout(topBarFadeTimer);
   topBarFadeTimer = setTimeout(() => {
+    // Don't fade away the address bar while it's open/focused — it hid what the
+    // user was typing (#6). Reschedule instead so it fades once editing ends.
+    if (document.getElementById("domain-pill")?.classList.contains("editing")) {
+      resetTopBarFade();
+      return;
+    }
     topBar.classList.add("faded");
     updateHitRects();
   }, 2000);
@@ -181,6 +187,12 @@ function getWindowId(): number {
   return 1;
 }
 
+// Navigate from THIS window: pass our own active tab + window id so the backend
+// targets the calling window, not the pool's single global active tab (#1).
+function navTo(input: string): void {
+  invoke("nav_to", { input, tabId: activeTabId, windowId: getWindowId() }).catch(console.error);
+}
+
 // ===== Active-tab helpers =====
 function activeTab(): Tab | undefined {
   return tabs.find((t) => t.id === activeTabId);
@@ -190,7 +202,16 @@ function activeTab(): Tab | undefined {
 // pill lingers over a loaded site after navigating away from about:blank.
 function updateNewtabVisibility(tab: Tab | undefined): void {
   const newtab = document.getElementById("newtab-page");
-  if (newtab) newtab.classList.toggle("visible", tab?.url === "about:blank" || !tab);
+  if (!newtab) return;
+  const show = tab?.url === "about:blank" || !tab;
+  const wasVisible = newtab.classList.contains("visible");
+  newtab.classList.toggle("visible", show);
+  // Auto-focus the search/URL pill when a blank tab appears (e.g. Ctrl+T) so
+  // the user can type immediately without clicking (#4).
+  if (show && !wasVisible) {
+    const s = document.getElementById("newtab-search") as HTMLInputElement | null;
+    requestAnimationFrame(() => { s?.focus(); });
+  }
 }
 function activeHost(): string {
   try {
@@ -295,6 +316,7 @@ function openAddressBar(): void {
   if (!pill || !input) return;
   input.value = activeTab()?.url || "";
   pill.classList.add("editing");
+  resetTopBarFade(); // ensure the bar is un-faded and stays put while editing (#6)
   updateHitRects();
   requestAnimationFrame(() => {
     input.focus();
@@ -363,6 +385,7 @@ function keyEventToAction(e: KeyboardEvent): string | null {
   if (c && s && !a) {
     switch (code) {
       case "KeyT": return "Ctrl+Shift+T";
+      case "KeyW": return "Ctrl+Shift+W";
       case "KeyN": return "Ctrl+Shift+N";
       case "KeyE": return "Ctrl+Shift+E";
       case "KeyU": return "Ctrl+Shift+U";
@@ -403,7 +426,11 @@ function handleShortcut(action: string): void {
       invoke("tabs_create", { windowId: getWindowId() }).catch(console.error);
       break;
     case "Ctrl+W":
-      if (activeTabId > 0) invoke("tabs_close", { id: activeTabId }).catch(console.error);
+      if (activeTabId !== -1) invoke("tabs_close", { id: activeTabId }).catch(console.error);
+      break;
+    case "Ctrl+Shift+W":
+      // Unload (discard) the current tab and move to the next one (#10).
+      if (activeTabId !== -1) invoke("tabs_unload", { id: activeTabId }).catch(console.error);
       break;
     case "Ctrl+Shift+T":
       invoke("tabs_reopen_closed", { windowId: getWindowId() }).catch(console.error);
@@ -453,7 +480,7 @@ function handleShortcut(action: string): void {
     }
     case "Ctrl+Shift+V":
       navigator.clipboard.readText().then((text) => {
-        if (text.trim()) invoke("nav_to", { input: text.trim() }).catch(console.error);
+        if (text.trim()) navTo(text.trim());
       }).catch(() => {});
       break;
     case "Ctrl+ZoomIn":
@@ -776,7 +803,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   // Views panel (history / bookmarks / downloads / settings)
   views = new ViewsController(
-    (url) => invoke("nav_to", { input: url }).catch(console.error),
+    (url) => navTo(url),
     () => {
       syncPanelOpen();
       updateHitRects();
@@ -817,6 +844,9 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-menu")?.addEventListener("click", () => {
     views?.open("settings");
   });
+  // '+' new-tab button (#5).
+  document.getElementById("btn-new-tab")?.addEventListener("click", () =>
+    invoke("tabs_create", { windowId: getWindowId() }).catch(console.error));
 
   // Bookmark star: toggles the current page in/out of bookmarks, and reflects
   // whether the active page is already bookmarked (★ = saved, ☆ = not).
@@ -871,7 +901,7 @@ window.addEventListener("DOMContentLoaded", () => {
     if (e.key === "Enter") {
       const text = newtabSearch.value.trim();
       if (text) {
-        invoke("nav_to", { input: text }).catch(console.error);
+        navTo(text);
         newtabSearch.value = "";
       }
     }
@@ -894,7 +924,7 @@ window.addEventListener("DOMContentLoaded", () => {
         label: "Paste and go",
         onClick: () => {
           navigator.clipboard.readText()
-            .then((text) => { if (text.trim()) invoke("nav_to", { input: text.trim() }); })
+            .then((text) => { if (text.trim()) navTo(text.trim()); })
             .catch(() => {});
         },
       },
@@ -906,7 +936,7 @@ window.addEventListener("DOMContentLoaded", () => {
       e.preventDefault();
       const val = addressInput.value.trim();
       closeAddressBar();
-      if (val) invoke("nav_to", { input: val }).catch(console.error);
+      if (val) navTo(val);
     } else if (e.key === "Escape") {
       e.preventDefault();
       closeAddressBar();

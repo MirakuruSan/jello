@@ -181,6 +181,8 @@ export class TabPanelController {
           invoke("tabs_set_pinned", { id: tab.id, pinned: !tab.pinned }).then(reload).catch(console.error) },
       { label: tab.muted ? "Unmute" : "Mute", onClick: () =>
           invoke("tabs_set_muted", { id: tab.id, muted: !tab.muted }).then(reload).catch(console.error) },
+      { label: "Unload", onClick: () =>
+          invoke("tabs_unload", { id: tab.id }).then(reload).catch(console.error) },
       "separator",
       { label: "Close others", disabled: this.tabs.length <= 1, onClick: () => {
           const others = this.tabs.filter((t) => t.id !== tab.id).map((t) => t.id);

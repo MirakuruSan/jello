@@ -462,6 +462,28 @@ impl TabPool {
         }
     }
 
+    /// Give a tab's webview keyboard focus (used after closing a tab so page
+    /// accelerators keep working without a click — #3).
+    pub fn focus_tab(&self, id: i32) {
+        if let Some(TabState::Live { view, .. }) = self.tabs.get(&id) {
+            view.focus();
+        }
+    }
+
+    /// Discard a tab's live webview (free memory) while keeping the tab row, and
+    /// clear it as the active tab. The tab goes Cold and reloads on next
+    /// activation (#10 "unload tab").
+    pub fn discard_tab(&mut self, id: i32) {
+        if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.remove(&id) {
+            view.close();
+        }
+        self.tabs.insert(id, TabState::Cold);
+        if self.active_tab_id == Some(id) {
+            self.active_tab_id = None;
+        }
+        self.mru.retain(|&x| x != id);
+    }
+
     fn with_active_view<F: FnOnce(&(dyn ContentView + Send + Sync))>(&self, f: F) -> Result<(), String> {
         let id = self.active_tab_id.ok_or_else(|| "No active tab".to_string())?;
         match self.tabs.get(&id) {

@@ -271,6 +271,64 @@ impl WebView2ContentView {
                 }
             });
 
+            // Middle-click / target=_blank / window.open → open in a BACKGROUND
+            // tab in the same window instead of a popup (#15). WebView2 fires
+            // NewWindowRequested; we take the Uri, mark it handled (no popup), and
+            // create the tab off the COM thread.
+            let nw_app = webview.app_handle().clone();
+            let nw_view_id = id.0 as i32;
+            let nw_incog = is_incognito;
+            let _ = webview.with_webview(move |w| {
+                use webview2_com::NewWindowRequestedEventHandler;
+                use windows::core::PWSTR;
+                unsafe {
+                    if let Ok(core) = w.controller().CoreWebView2() {
+                        let handler = NewWindowRequestedEventHandler::create(Box::new(move |_s, args| {
+                            if let Some(args) = args {
+                                let mut uri = PWSTR::null();
+                                let mut url = String::new();
+                                if args.Uri(&mut uri).is_ok() && !uri.is_null() {
+                                    url = uri.to_string().unwrap_or_default();
+                                }
+                                // We handle it ourselves → suppress the popup window.
+                                let _ = args.SetHandled(true);
+                                if url.starts_with("http") {
+                                    let app = nw_app.clone();
+                                    std::thread::spawn(move || {
+                                        use tauri::Manager;
+                                        // Resolve which window this content tab lives in.
+                                        let win_id = if nw_incog || nw_view_id < 0 {
+                                            crate::incognito::get_incognito_tab(nw_view_id)
+                                                .map(|t| t.window_id)
+                                                .unwrap_or(1)
+                                        } else {
+                                            let db = app.state::<crate::db::DbState>();
+                                            let (tx, rx) = std::sync::mpsc::channel();
+                                            let vid = nw_view_id;
+                                            db.execute(move |conn| {
+                                                let w = crate::db::tabs_repo::get_tab(conn, vid)
+                                                    .map(|o| o.map(|t| t.window_id).unwrap_or(1))
+                                                    .unwrap_or(1);
+                                                let _ = tx.send(w);
+                                            });
+                                            rx.recv().unwrap_or(1)
+                                        };
+                                        let db = app.state::<crate::db::DbState>();
+                                        let pool = app.state::<Arc<Mutex<crate::engine::pool::TabPool>>>();
+                                        let _ = crate::tabs::tabs_create_impl(
+                                            Some(url), Some(true), Some(win_id), &db, &pool, &app,
+                                        );
+                                    });
+                                }
+                            }
+                            Ok(())
+                        }));
+                        let mut token: i64 = 0;
+                        let _ = core.add_NewWindowRequested(&handler, &mut token as *mut i64);
+                    }
+                }
+            });
+
             // Event-driven tab metadata: DocumentTitleChanged + SourceChanged
             // write through to the DB and emit tab:updated, so titles/URLs in the
             // tab panel and domain pill stay fresh live — replacing the old 250ms
@@ -622,6 +680,17 @@ impl ContentView for WebView2ContentView {
     fn zoom(&self, factor: f64) {
         let _ = self.webview.set_zoom(factor);
     }
+    fn focus(&self) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = self.webview.with_webview(|w| {
+                use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
+                unsafe {
+                    let _ = w.controller().MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                }
+            });
+        }
+    }
     fn close(self: Box<Self>) {
         self.alive.store(false, Ordering::Relaxed);
         let _ = self.webview.close();
@@ -672,6 +741,8 @@ fn is_in_window_shortcut(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<
         (0x54, true, true, false) => Some("Ctrl+Shift+T"),
         // Ctrl+W
         (0x57, true, false, false) => Some("Ctrl+W"),
+        // Ctrl+Shift+W — unload current tab
+        (0x57, true, true, false) => Some("Ctrl+Shift+W"),
         // Ctrl+N
         (0x4E, true, false, false) => Some("Ctrl+N"),
         // Ctrl+Shift+N

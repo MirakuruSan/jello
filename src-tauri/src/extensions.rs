@@ -620,6 +620,53 @@ pub async fn extensions_install_ubol(
     Ok(ext)
 }
 
+/// Install the full uBlock Origin (MV2) from its latest GitHub release (#9) —
+/// the wizard/settings now offer this instead of the weaker uBO Lite.
+#[command]
+pub async fn extensions_install_ubo(
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<Extension, String> {
+    let client = crx_http_client()?;
+    let rel = client
+        .get("https://api.github.com/repos/gorhill/uBlock/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("uBO release lookup failed: {e}"))?;
+    let body = rel.text().await.map_err(|e| format!("release read failed: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("bad release json: {e}"))?;
+    let asset_url = json["assets"]
+        .as_array()
+        .and_then(|a| {
+            a.iter().find_map(|x| {
+                let name = x["name"].as_str()?;
+                if name.ends_with(".chromium.zip") {
+                    x["browser_download_url"].as_str()
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| "no uBO chromium.zip asset found".to_string())?
+        .to_string();
+    let bytes = client
+        .get(&asset_url)
+        .send()
+        .await
+        .map_err(|e| format!("uBO download failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("uBO download interrupted: {e}"))?
+        .to_vec();
+    // Stable id so re-running the wizard updates in place.
+    let id = slug_id_from("uBlock Origin (GitHub)");
+    let ext = install_from_zip_bytes(bytes, id, false, &db, &app).await?;
+    stage_one_additive(&app, &ext);
+    refresh_enabled_cache(&db);
+    Ok(ext)
+}
+
 #[command]
 pub async fn extensions_uninstall(
     id: String,
@@ -696,7 +743,17 @@ pub async fn extensions_open_options(
 ) -> Result<(), String> {
     let staging = active_extensions_dir(&app).join(&id);
     if !staging.join("manifest.json").exists() {
-        return Err("Extension isn't loaded — enable it and restart Jello first.".to_string());
+        // Staging can be stale/missing (disable, a mid-session rebuild, etc.).
+        // Re-stage from the installed source on demand instead of failing with
+        // "Extension isn't loaded" (#11) — that error was firing far too often.
+        if let Ok(exts) = db_list_extensions(&db) {
+            if let Some(ext) = exts.iter().find(|e| e.id == id) {
+                stage_one_additive(&app, ext);
+            }
+        }
+    }
+    if !staging.join("manifest.json").exists() {
+        return Err("Extension files are missing — try reinstalling it.".to_string());
     }
     let options = read_options_page(&staging)
         .ok_or_else(|| "This extension has no options page.".to_string())?;

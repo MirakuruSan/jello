@@ -48,7 +48,8 @@ export class Wizard {
       await invoke("settings_set", { patch }).catch(console.error);
       applyTheme(this.val("wiz-theme"));
       if (adblock) {
-        invoke("extensions_install_ubol").catch(console.error);
+        // Full uBlock Origin (MV2) — far more effective than uBO Lite (#9).
+        invoke("extensions_install_ubo").catch(console.error);
       }
     } else {
       await invoke("settings_set", { patch: { wizardComplete: true } }).catch(console.error);

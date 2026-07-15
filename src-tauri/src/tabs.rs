@@ -254,6 +254,9 @@ pub async fn tabs_close(
             // Find closest index or just activate the last tab
             let next_id = remaining.last().unwrap().id;
             tabs_activate_impl(next_id, &db, &pool, &app)?;
+            // Refocus the newly active webview so its in-page accelerators
+            // (Alt+←/→ tab switch, Ctrl+±, …) keep working without a click (#3).
+            pool.lock().unwrap().focus_tab(next_id);
         } else {
             // Reset active tab in pool; overlay takes input again (new-tab page).
             let mut pool_guard = pool.lock().unwrap();
@@ -270,6 +273,64 @@ pub async fn tabs_close(
         }
     }
 
+    Ok(())
+}
+
+/// Unload (discard) a tab's webview to free memory while keeping the tab, then
+/// move to the next tab in the window (or the new-tab/home screen if none) —
+/// #10. Works for the active tab or any tab.
+#[command]
+pub async fn tabs_unload(
+    id: i32,
+    db: State<'_, DbState>,
+    pool: State<'_, Arc<Mutex<TabPool>>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let was_active = {
+        let pool_guard = pool.lock().unwrap();
+        pool_guard.get_active_tab_id() == Some(id)
+    };
+
+    // Window of the unloaded tab.
+    let win_id = if id < 0 {
+        crate::incognito::get_incognito_tab(id).map(|t| t.window_id).unwrap_or(0)
+    } else {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db_c = db.clone();
+        db_c.execute(move |conn| {
+            let w = tabs_repo::get_tab(conn, id).map(|o| o.map(|t| t.window_id).unwrap_or(0)).unwrap_or(0);
+            let _ = tx.send(w);
+        });
+        rx.recv().unwrap_or(0)
+    };
+
+    // Discard the live webview; the tab stays in the list and reloads on return.
+    {
+        let mut pool_guard = pool.lock().unwrap();
+        pool_guard.discard_tab(id);
+    }
+    let _ = app.emit("tab:updated", &id);
+
+    if was_active && win_id != 0 {
+        let remaining: Vec<Tab> = tabs_list_impl(win_id, &db)?.into_iter().filter(|t| t.id != id).collect();
+        if let Some(next) = remaining.last() {
+            tabs_activate_impl(next.id, &db, &pool, &app)?;
+            pool.lock().unwrap().focus_tab(next.id);
+        } else {
+            // No other tabs → show the new-tab/home screen.
+            let mut pool_guard = pool.lock().unwrap();
+            pool_guard.set_active_tab_id(None);
+            drop(pool_guard);
+            let label = if win_id == 1 {
+                "main".to_string()
+            } else if app.get_window(&format!("main_{}", win_id)).is_some() {
+                format!("main_{}", win_id)
+            } else {
+                format!("incognito_{}", win_id)
+            };
+            crate::app::overlay_mark_content(&app, &label, false);
+        }
+    }
     Ok(())
 }
 

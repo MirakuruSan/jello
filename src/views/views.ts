@@ -287,8 +287,20 @@ export class ViewsController {
       }
     };
 
+    addSection("Setup & data");
+    const rerun = document.createElement("button");
+    rerun.className = "views-btn interactive";
+    rerun.textContent = "Configure";
+    rerun.addEventListener("click", () => {
+      invoke("settings_set", { patch: { wizardComplete: false } }).catch(() => {});
+      window.dispatchEvent(new CustomEvent("jello:run-wizard"));
+    });
+    form.appendChild(rerun);
+
+
+
     addSection("Browsing");
-    addToggle("adblock", "Block ads & trackers (uBlock Origin Lite)", true);
+    addToggle("adblock", "Block ads & trackers (uBlock Origin)", true);
     addToggle("searchSuggestions", "Search suggestions (sends keystrokes to engine)", false);
 
     addSection("Privacy & security");
@@ -340,43 +352,6 @@ export class ViewsController {
     addToggle("startMinimized", "Start Jello minimized in system tray", false);
     addToggle("minimizeToTray", "Closing the window minimizes to the system tray", true);
 
-    const updaterEnabled = await invoke<boolean>("updater_enabled").catch(() => false);
-    if (updaterEnabled) {
-      addSection("Updates");
-      addToggle("updateCheck", "Automatically check for updates", false);
-
-      const checkUpdateBtn = document.createElement("button");
-      checkUpdateBtn.className = "views-btn interactive";
-      checkUpdateBtn.textContent = "Check for updates";
-      checkUpdateBtn.style.marginTop = "12px";
-      checkUpdateBtn.style.marginBottom = "12px";
-      checkUpdateBtn.addEventListener("click", async () => {
-        checkUpdateBtn.disabled = true;
-        checkUpdateBtn.textContent = "Checking…";
-        try {
-          const updateVersion = await invoke<string | null>("updater_check");
-          if (updateVersion) {
-            const confirmInstall = confirm(`Update version ${updateVersion} is available! Do you want to download and install it now?`);
-            if (confirmInstall) {
-              checkUpdateBtn.textContent = "Installing…";
-              await invoke("updater_apply");
-            } else {
-              checkUpdateBtn.textContent = "Check for updates";
-              checkUpdateBtn.disabled = false;
-            }
-          } else {
-            alert("Jello is up to date!");
-            checkUpdateBtn.textContent = "Check for updates";
-            checkUpdateBtn.disabled = false;
-          }
-        } catch (err) {
-          alert(`Error checking for updates: ${err}`);
-          checkUpdateBtn.textContent = "Check for updates";
-          checkUpdateBtn.disabled = false;
-        }
-      });
-      form.appendChild(checkUpdateBtn);
-    }
 
     // --- Extensions ---
     this.renderExtensionsSection(form);
@@ -395,6 +370,7 @@ export class ViewsController {
       summon: "Summon / hide Jello",
       palette: "Open quick palette",
       addressbar: "Open address bar",
+      aichat: "Open AI chatbot",
       screenshot: "Screenshot capture",
       ocr: "OCR text capture",
       incognito: "New incognito window",
@@ -481,18 +457,47 @@ export class ViewsController {
       form.appendChild(row);
     }
 
-    addSection("Setup & data");
-    const rerun = document.createElement("button");
-    rerun.className = "views-btn interactive";
-    rerun.textContent = "Configure";
-    rerun.addEventListener("click", () => {
-      invoke("settings_set", { patch: { wizardComplete: false } }).catch(() => {});
-      window.dispatchEvent(new CustomEvent("jello:run-wizard"));
-    });
-    form.appendChild(rerun);
 
     // "Wipe all history" lives in the History tab ("Clear all"); not duplicated
     // here.
+
+    const updaterEnabled = await invoke<boolean>("updater_enabled").catch(() => false);
+    if (updaterEnabled) {
+      addSection("Updates");
+      addToggle("updateCheck", "Automatically check for updates", false);
+
+      const checkUpdateBtn = document.createElement("button");
+      checkUpdateBtn.className = "views-btn interactive";
+      checkUpdateBtn.textContent = "Check for updates";
+      checkUpdateBtn.style.marginTop = "12px";
+      checkUpdateBtn.style.marginBottom = "12px";
+      checkUpdateBtn.addEventListener("click", async () => {
+        checkUpdateBtn.disabled = true;
+        checkUpdateBtn.textContent = "Checking…";
+        try {
+          const updateVersion = await invoke<string | null>("updater_check");
+          if (updateVersion) {
+            const confirmInstall = confirm(`Update version ${updateVersion} is available! Do you want to download and install it now?`);
+            if (confirmInstall) {
+              checkUpdateBtn.textContent = "Installing…";
+              await invoke("updater_apply");
+            } else {
+              checkUpdateBtn.textContent = "Check for updates";
+              checkUpdateBtn.disabled = false;
+            }
+          } else {
+            alert("Jello is up to date!");
+            checkUpdateBtn.textContent = "Check for updates";
+            checkUpdateBtn.disabled = false;
+          }
+        } catch (err) {
+          alert(`Error checking for updates: ${err}`);
+          checkUpdateBtn.textContent = "Check for updates";
+          checkUpdateBtn.disabled = false;
+        }
+      });
+      form.appendChild(checkUpdateBtn);
+    }
 
     this.content.appendChild(form);
   }

@@ -288,6 +288,8 @@ pub async fn zoom_get(host: String, db: State<'_, crate::db::DbState>) -> Result
 #[tauri::command]
 pub async fn nav_to(
     input: String,
+    tab_id: Option<i32>,
+    window_id: Option<i32>,
     db: State<'_, crate::db::DbState>,
     pool: State<'_, Arc<Mutex<crate::engine::pool::TabPool>>>,
     app: AppHandle,
@@ -299,19 +301,24 @@ pub async fn nav_to(
         let _ = tx.send(get_search_engines(conn));
     });
     let engines = rx.recv().unwrap_or(Ok(Vec::new())).map_err(|e| e.to_string())?;
+    let default_engine = crate::search::default_search_url(&app);
     let target = match classify_input(&input) {
         InputClassification::Url(u) => u,
-        InputClassification::SearchQuery(q) => route_query(&q, &engines, "https://duckduckgo.com/?q=%s"),
+        InputClassification::SearchQuery(q) => route_query(&q, &engines, &default_engine),
     };
 
-    let active = pool.lock().unwrap().get_active_tab_id();
-    match active {
-        Some(tid) => pool.lock().unwrap().navigate_tab(&db, &app, tid, &target),
-        None => {
-            crate::tabs::tabs_create_impl(Some(target), Some(false), None, &db, &pool, &app)?;
-            Ok(())
+    // Route to the CALLING window's active tab (the frontend passes its own
+    // activeTabId + windowId). The pool has a single GLOBAL active tab, so
+    // relying on it navigated the wrong window when more than one was open (#1).
+    if let Some(tid) = tab_id.filter(|&t| t != 0) {
+        let res = pool.lock().unwrap().navigate_tab(&db, &app, tid, &target);
+        if res.is_ok() {
+            return Ok(());
         }
+        // Tab no longer exists → fall through to create in the given window.
     }
+    crate::tabs::tabs_create_impl(Some(target), Some(false), window_id, &db, &pool, &app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -586,8 +593,21 @@ fn default_hotkeys() -> Vec<HotkeyItem> {
         HotkeyItem { action: "ocr".to_string(), shortcut: "Ctrl+Alt+T".to_string() },
         HotkeyItem { action: "incognito".to_string(), shortcut: "Ctrl+Alt+N".to_string() },
         HotkeyItem { action: "addressbar".to_string(), shortcut: "Ctrl+Alt+L".to_string() },
+        HotkeyItem { action: "aichat".to_string(), shortcut: "Ctrl+Alt+A".to_string() },
         HotkeyItem { action: "leader".to_string(), shortcut: "Ctrl+Space".to_string() },
     ]
+}
+
+/// The AI chatbot URL to open for the aichat hotkey / new-tab AI button (#7,#13),
+/// from the `aiChatUrl` setting, defaulting to ChatGPT.
+pub fn ai_chat_url(app: &AppHandle) -> String {
+    // `defaultChatbot` is what the wizard writes. It may be a query template
+    // (…?q=%s); for the "open the chatbot" hotkey we strip the %s so it lands on
+    // a ready-to-type page (e.g. Google AI Mode …&q= , ChatGPT …?q=).
+    let raw = crate::capture::screenshot::get_setting(app, "defaultChatbot")
+        .filter(|s| s.starts_with("http"))
+        .unwrap_or_else(|| "https://chatgpt.com/".to_string());
+    raw.replace("%s", "")
 }
 
 fn get_hotkeys_sync(db: &crate::db::DbState) -> Vec<HotkeyItem> {
@@ -902,6 +922,21 @@ pub fn run() {
                                     let _ = crate::windows::window_new_incognito_impl(&app_h);
                                 });
                             }
+                            "aichat" => {
+                                // Show the main window and open the configured AI
+                                // chatbot site in a new tab for quick chat/research.
+                                let app_h = app.clone();
+                                std::thread::spawn(move || {
+                                    let url = ai_chat_url(&app_h);
+                                    let _ = app_h.run_on_main_thread({
+                                        let app_i = app_h.clone();
+                                        move || { crate::windows::ensure_main_window(&app_i); }
+                                    });
+                                    let db = app_h.state::<crate::db::DbState>();
+                                    let pool = app_h.state::<Arc<Mutex<crate::engine::pool::TabPool>>>();
+                                    let _ = crate::tabs::tabs_create_impl(Some(url), Some(false), Some(1), &db, &pool, &app_h);
+                                });
+                            }
                             "leader" => {
                                 crate::chords::arm_chords(app.clone());
                             }
@@ -1074,10 +1109,12 @@ pub fn run() {
             crate::tabs::tabs_duplicate,
             crate::tabs::tabs_suspend_all,
             crate::tabs::tabs_reopen_closed,
+            crate::tabs::tabs_unload,
             crate::extensions::extensions_list,
             crate::extensions::extensions_install,
             crate::extensions::extensions_set_enabled,
             crate::extensions::extensions_install_ubol,
+            crate::extensions::extensions_install_ubo,
             crate::extensions::extensions_uninstall,
             crate::extensions::extensions_open_options,
             crate::extensions::extensions_restart_app,

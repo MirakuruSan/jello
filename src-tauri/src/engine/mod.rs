@@ -37,6 +37,10 @@ pub trait ContentView {
     fn mute(&self, m: bool);
     fn find(&self, text: &str, forward: bool);
     fn zoom(&self, factor: f64);
+    /// Give this view's webview keyboard focus. After closing a tab the newly
+    /// activated webview has no focus, so its in-page accelerators (Alt+←/→,
+    /// Ctrl+±, …) don't fire until the user clicks (#3).
+    fn focus(&self) {}
     fn close(self: Box<Self>);
     fn is_audio_playing(&self) -> bool { false }
 }

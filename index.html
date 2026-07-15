@@ -37,6 +37,7 @@
         <div class="controls-pill glass interactive no-drag" id="controls-pill">
           <button class="pill-btn interactive" id="btn-pin" title="Pin window on top" aria-pressed="false"></button>
           <button class="pill-btn interactive" id="btn-bookmark" title="Bookmark this page (Ctrl+D)" aria-pressed="false">☆</button>
+          <button class="pill-btn interactive" id="btn-new-tab" title="New tab (Ctrl+T)">+</button>
           <button class="pill-btn tab-count-btn interactive" id="btn-tab-count" title="Toggle tab list (Ctrl+Shift+E)">1</button>
           <button class="pill-btn interactive" id="btn-menu" title="Menu">⋯</button>
           <button class="pill-btn interactive" id="btn-min" title="Minimize">─</button>
@@ -122,6 +123,7 @@
         <label class="wizard-field">Default AI chatbot
           <select id="wiz-chatbot" class="interactive">
             <option value="https://chatgpt.com/?q=%s">ChatGPT</option>
+            <option value="https://www.google.com/search?udm=50&amp;q=%s">Google AI Mode</option>
             <option value="https://www.perplexity.ai/search?q=%s">Perplexity</option>
             <option value="https://claude.ai/">Claude</option>
             <option value="https://gemini.google.com/">Gemini</option>
@@ -136,7 +138,7 @@
           </select>
         </label>
 
-        <label class="wizard-check"><input type="checkbox" id="wiz-adblock" class="interactive" checked /> Block ads &amp; trackers (installs uBlock Origin Lite)</label>
+        <label class="wizard-check"><input type="checkbox" id="wiz-adblock" class="interactive" checked /> Block ads &amp; trackers (installs uBlock Origin)</label>
         <label class="wizard-check"><input type="checkbox" id="wiz-suggest" class="interactive" /> Search suggestions (sends keystrokes to the engine)</label>
         <label class="wizard-check"><input type="checkbox" id="wiz-restore" class="interactive" /> Restore tabs on startup</label>
         <label class="wizard-check"><input type="checkbox" id="wiz-update" class="interactive" /> Automatically check for updates</label>
