@@ -25,6 +25,11 @@ fn close_overlays_and_restore(app: &AppHandle) {
         for label in labels {
             if let Some(w) = app_h.get_webview_window(&label) {
                 let _ = w.show();
+                // Raw force-show fallback for the main window so it reliably comes
+                // back even if tauri's show() no-ops in the degraded state.
+                if label == "main" {
+                    crate::windows::force_show_main();
+                }
             }
         }
     });
@@ -60,13 +65,28 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
                 if label.starts_with("capture_") { continue; }
                 if win.is_visible().unwrap_or(false) {
                     let _ = win.hide();
+                    // Belt-and-suspenders for the main window: verify at the OS
+                    // level and raw-hide if tauri's hide didn't take (degraded
+                    // plumbing, §2) — otherwise it ghosts into the frozen frame.
+                    if label == "main" && crate::windows::main_is_visible() {
+                        crate::windows::force_hide_main();
+                    }
                     hidden.push(label);
                 }
             }
             let _ = tx.send(hidden);
         });
         let hidden = rx.recv().unwrap_or_default();
-        *HIDDEN_FOR_CAPTURE.lock().unwrap() = hidden;
+        // MERGE (dedupe) into the restore list — never overwrite. A second
+        // trigger while overlays are open hides nothing new, so overwriting would
+        // clobber the original list with [] and the windows would never restore
+        // (§2 finding #10).
+        {
+            let mut guard = HIDDEN_FOR_CAPTURE.lock().unwrap();
+            for l in hidden {
+                if !guard.contains(&l) { guard.push(l); }
+            }
+        }
     }
     // Let DWM drop the just-hidden windows from the composited frame before we
     // BitBlt the screen.

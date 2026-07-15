@@ -148,38 +148,10 @@ pub async fn window_controls(action: String, window: Window, app: AppHandle) -> 
             } else {
                 window.maximize().map_err(|e| e.to_string())?;
             }
-            // The Resized event resizes the active tab, but it uses try_lock and
-            // silently skips when the pool is busy, and navigations don't re-read
-            // the rect — so the content webview could keep its pre-maximize size
-            // ("sites load as if not maximized"). Resize the active tab directly
-            // after the (async) maximize message settles so inner_size is correct.
-            let app_h = app.clone();
-            let win = window.clone();
-            std::thread::spawn(move || {
-                // Retry: read inner_size + resize the active tab ON THE MAIN
-                // THREAD (WebView2 bounds calls are UI-thread-only), using
-                // try_lock so we never block the main thread. Break once done.
-                for _ in 0..5 {
-                    std::thread::sleep(std::time::Duration::from_millis(120));
-                    let app_i = app_h.clone();
-                    let win_i = win.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let _ = app_h.run_on_main_thread(move || {
-                        let pool = app_i.state::<Arc<Mutex<crate::engine::pool::TabPool>>>();
-                        let rect = crate::windows::content_rect(&win_i);
-                        let done = if let Ok(mut p) = pool.try_lock() {
-                            if let Some(active_id) = p.get_active_tab_id() {
-                                p.resize_tab(active_id, rect);
-                            }
-                            true
-                        } else {
-                            false
-                        };
-                        let _ = tx.send(done);
-                    });
-                    if rx.recv().unwrap_or(false) { break; }
-                }
-            });
+            // The Resized event handler (attach_window_plumbing) now resizes the
+            // active tab on EVERY resize path — button, Win+Up, snap, title-drag —
+            // with a debounced off-main retry when the pool is busy (P2.1). No
+            // per-command retry needed here; one mechanism covers them all.
             Ok(())
         }
         "close" => {
@@ -288,6 +260,29 @@ pub async fn zoom_set(
         }
     }
     Ok(())
+}
+
+/// Read the saved per-host zoom factor (P2.3). Returns None when the host has no
+/// saved zoom so the frontend can leave the current factor untouched.
+#[tauri::command]
+pub async fn zoom_get(host: String, db: State<'_, crate::db::DbState>) -> Result<Option<f64>, String> {
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let key = format!("zoom:{}", host);
+    let (tx, rx) = std::sync::mpsc::channel();
+    db.execute(move |conn| {
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = tx.send(v);
+    });
+    let parsed = rx.recv().unwrap_or(None).and_then(|s| s.trim().trim_matches('"').parse::<f64>().ok());
+    Ok(parsed)
 }
 
 #[tauri::command]
@@ -452,6 +447,9 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
     let scale_state = overlay_state;
     let scale_label = window.label().to_string();
     let scale_app = app.clone();
+    // Debounce flag for the resize-retry thread (P2.1): at most one retry thread
+    // in flight per window, so a resize storm doesn't spawn a thread per event.
+    let resize_retry_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     window.on_window_event(move |event| {
         match event {
             tauri::WindowEvent::ScaleFactorChanged { scale_factor: new_scale, .. } => {
@@ -464,6 +462,26 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                     if let Some(active_id) = pool.get_active_tab_id() {
                         pool.resize_tab(active_id, rect);
                     }
+                } else if !resize_retry_pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // Pool busy — the try_lock skip is exactly why OS-driven
+                    // maximize (Win+Up, snap, title-drag-to-top) left content at
+                    // the pre-maximize size (P2.1). Spawn ONE retry thread that
+                    // blocks on the lock off-main and recomputes the rect fresh.
+                    // resize_tab only calls webview set_size/set_position, which
+                    // marshal internally, so running it off the main thread is safe.
+                    let pool_c = tab_pool.clone();
+                    let win_c = resize_window.clone();
+                    let flag = resize_retry_pending.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(60));
+                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                        let rect = crate::windows::content_rect(&win_c);
+                        if let Ok(mut pool) = pool_c.lock() {
+                            if let Some(active_id) = pool.get_active_tab_id() {
+                                pool.resize_tab(active_id, rect);
+                            }
+                        }
+                    });
                 }
             }
             // Drag-and-drop install (P1.3.2): a dropped .crx/.zip installs as an
@@ -1039,6 +1057,7 @@ pub fn run() {
             nav_to,
             find_in_page,
             zoom_set,
+            zoom_get,
             bookmark_current_tab,
             tabs_mru_switch,
             crate::windows::window_new,

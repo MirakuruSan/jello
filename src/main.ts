@@ -208,6 +208,50 @@ let refreshBookmarkStar: () => void = () => {};
 function applyZoom(f: number): void {
   zoomFactor = Math.min(5, Math.max(0.25, f));
   invoke("zoom_set", { factor: zoomFactor, host: activeHost() }).catch(console.error);
+  showZoomHud(zoomFactor);
+}
+
+// Transient zoom pill (P2.3): shows e.g. "120%" for ~1.2s while adjusting.
+let zoomHudTimer = 0;
+function showZoomHud(f: number): void {
+  let hud = document.getElementById("zoom-hud");
+  if (!hud) {
+    hud = document.createElement("div");
+    hud.id = "zoom-hud";
+    hud.className = "glass";
+    hud.style.cssText =
+      "position:fixed;bottom:18px;left:50%;transform:translateX(-50%);padding:6px 14px;" +
+      "border-radius:999px;font-size:0.8rem;font-weight:600;z-index:99999;pointer-events:none;" +
+      "transition:opacity 0.15s ease;";
+    document.body.appendChild(hud);
+  }
+  hud.textContent = `${Math.round((f * 100) / 5) * 5}%`;
+  hud.style.opacity = "1";
+  clearTimeout(zoomHudTimer);
+  zoomHudTimer = window.setTimeout(() => {
+    const el = document.getElementById("zoom-hud");
+    if (el) el.style.opacity = "0";
+  }, 1200);
+}
+
+// Per-site zoom restore (P2.3): when the active host changes, apply its saved
+// zoom (or 100% if none). Guarded by lastZoomHost so same-host navigations and
+// repeated tab:updated events don't re-apply.
+let lastZoomHost = "";
+async function maybeRestoreZoom(host: string): Promise<void> {
+  if (!host || host === lastZoomHost) return;
+  lastZoomHost = host;
+  let saved: number | null = null;
+  try {
+    saved = await invoke<number | null>("zoom_get", { host });
+  } catch {
+    saved = null;
+  }
+  const f = typeof saved === "number" ? saved : 1.0;
+  zoomFactor = f;
+  // Apply to the active view. Only pass the host (which saves) when we actually
+  // have a stored value, so we never pollute settings with 100% for every host.
+  invoke("zoom_set", { factor: f, host: typeof saved === "number" ? host : "" }).catch(() => {});
 }
 
 // Update the domain pill: hostname text + a theme-aware padlock (closed/green
@@ -949,6 +993,7 @@ window.addEventListener("DOMContentLoaded", () => {
       if (event.payload.id === activeTabId) {
         updateDomainPill(event.payload);
         updateNewtabVisibility(event.payload);
+        maybeRestoreZoom(activeHost());
       }
     }
   });
@@ -964,6 +1009,10 @@ window.addEventListener("DOMContentLoaded", () => {
     const tab = tabs.find((t) => t.id === activeTabId);
     updateDomainPill(tab);
     updateNewtabVisibility(tab);
+    // Force a re-check on activation even if the host string matches the last
+    // one applied (switching tabs can land on the same host at a different zoom).
+    lastZoomHost = "";
+    maybeRestoreZoom(activeHost());
   });
 
   listen<string>("window:shortcut", (event) => {
@@ -980,6 +1029,7 @@ window.addEventListener("DOMContentLoaded", () => {
     zoomFactor = event.payload;
     const host = activeHost();
     if (host) invoke("zoom_set", { factor: zoomFactor, host }).catch(() => {});
+    showZoomHud(zoomFactor);
   });
 
   listen<string>("window:open-view", (event) => {
