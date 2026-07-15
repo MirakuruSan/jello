@@ -4,6 +4,49 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.4] — 2026-07-15
+
+### Fixed
+- **The main window can no longer get permanently stuck hidden.** Summon, tray
+  click, and relaunch now verify visibility at the OS level and fall back to a
+  raw Win32 show/hide, so a degraded runtime state (where the window plumbing
+  silently no-ops) self-heals instead of leaving the window unreachable.
+- **Global hotkeys are reliable and self-healing.** The keypress path no longer
+  does a database round trip; re-registration is serialized so rebinding one
+  hotkey can't drop the others, and a background watchdog re-registers any
+  hotkey the OS silently dropped within a minute. Failed registrations now
+  surface a toast instead of failing silently.
+- **The leader/chord key hook no longer eats keystrokes system-wide.** It caches
+  its shortcuts (no database access inside the low-level keyboard hook), installs
+  on a thread that pumps messages, and passes modifiers and unrelated keys
+  through instead of swallowing them.
+- **Extensions load reliably and the options page opens.** Extension loading was
+  rebuilt on explicit per-extension WebView2 calls that capture each extension's
+  real runtime id, and the staging folder is no longer rewritten underneath a
+  live session (the cause of "Extension isn't loaded" and the options window
+  landing on an error page). A real **Restart Jello** button was added.
+- **Maximizing fills the window on every path.** Content now resizes correctly
+  whether you maximize with the button, Win+Up, or by dragging the title to the
+  top of the screen.
+- **Screenshots no longer leave a Jello ghost or a stuck-hidden window.** The
+  hide/restore list is merged instead of overwritten so a rapid double-trigger
+  can't lose it, with a raw fallback for the main window.
+
+### Added
+- **Install extensions from a file or by drag-and-drop.** Drop a `.crx`/`.zip`
+  onto the window, or use the new "From file…" button (Settings → Extensions).
+  Single-root release zips (like uBlock Origin's) are handled.
+- **Microsoft Edge Add-ons store support.** Installing from a
+  `microsoftedge.microsoft.com/addons` URL works, and the install banner appears
+  on those pages too.
+- **Per-site zoom that persists.** Your zoom level is remembered per website and
+  re-applied automatically on return and after restarting, with a transient
+  percentage indicator while you adjust.
+- **Downloads you can control.** Pause, resume, and cancel downloads with a live
+  progress bar, and open the containing folder when they finish.
+- **A diagnostic log** at `%APPDATA%\Jello\logs\jello.log` so field issues are
+  traceable.
+
 ## [0.4.3] — 2026-07-15
 
 ### Fixed
