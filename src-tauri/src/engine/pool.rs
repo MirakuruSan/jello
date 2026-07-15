@@ -315,8 +315,13 @@ impl TabPool {
 
         let webview_clone = webview.clone();
 
-        // Create ContentView wrapper
+        // Create ContentView wrapper. Its internal bounds default to 800x600 and
+        // set_visible re-applies that default — which shrank a webview that
+        // add_child had just created at a larger (e.g. maximized) size. Seed the
+        // real creation rect FIRST so a page opened while the window is already
+        // maximized fills it (no Resized event fires afterward to correct it).
         let view = Box::new(WebView2ContentView::new(ViewId(id as u32), webview, is_incognito));
+        view.set_bounds(rect);
         view.set_visible(true);
 
         // Restore scroll position after DOMContentLoaded

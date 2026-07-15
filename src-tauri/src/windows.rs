@@ -117,16 +117,19 @@ pub fn content_rect(window: &tauri::Window) -> crate::engine::Rect {
 /// somehow been destroyed, recreate it with the startup options so reopen can
 /// never silently no-op (past bug: window.close() killed it → dead reopen).
 pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
-    if let Some(win) = app.get_webview_window("main") {
+    // IMPORTANT: use get_window, NOT get_webview_window. Once content tabs are
+    // added as child webviews (window.add_child), the main window is no longer a
+    // 1:1 WebviewWindow and get_webview_window("main") returns None — which made
+    // this fall through to a doomed "recreate" (fails: label `main` already
+    // exists) so the window never came back after any tab was opened. That was
+    // the real cause of "summon dead" and "won't reopen". get_window always
+    // finds it, and force_show_main drives the raw HWND regardless.
+    if let Some(win) = app.get_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
-        // ALWAYS follow the tauri path with the raw-Win32 fallback: in the
-        // degraded state (§2) win.show() reports success but the window stays
-        // hidden. force_show_main drives ShowWindow on the real HWND so reopen
-        // can never silently no-op.
         force_show_main();
-        return Some(win);
+        return app.get_webview_window("main");
     }
     // Defensive recreate (mirrors tauri.conf.json "main" window options).
     match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))

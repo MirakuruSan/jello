@@ -513,7 +513,7 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                     .unwrap_or(true);
                 if minimize_to_tray {
                     api.prevent_close();
-                    if let Some(win) = scale_app.get_webview_window("main") {
+                    if let Some(win) = scale_app.get_window("main") {
                         let _ = win.hide();
                     }
                     crate::windows::force_hide_main();
@@ -854,7 +854,9 @@ pub fn run() {
                                     let visible = crate::windows::main_is_visible();
                                     let focused = crate::windows::main_is_foreground();
                                     if visible && focused {
-                                        if let Some(win) = app_h.get_webview_window("main") {
+                                        // get_window (not get_webview_window): the
+                                        // latter returns None once tabs are open.
+                                        if let Some(win) = app_h.get_window("main") {
                                             let _ = win.hide();
                                         }
                                         crate::windows::force_hide_main();
