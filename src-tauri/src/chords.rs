@@ -27,6 +27,14 @@ pub struct ChordManager {
     sequence: Vec<String>,
     app_handle: Option<AppHandle>,
     timer_cancel_tx: Option<std::sync::mpsc::Sender<()>>,
+    /// Quick-launch slots cached ONCE at arm time (P0.3.1). The low-level
+    /// keyboard hook must never touch the DB — a slow round trip inside
+    /// `low_level_keyboard_proc` stalls every keystroke system-wide and gets the
+    /// hook killed by Windows.
+    slots: Vec<QuickLaunchItem>,
+    /// Synchronous armed flag. The hook itself is installed asynchronously on the
+    /// main thread, so `hhook` alone can't guard against a double-arm race.
+    armed: bool,
 }
 
 static CHORD_MANAGER: Mutex<ChordManager> = Mutex::new(ChordManager {
@@ -34,7 +42,24 @@ static CHORD_MANAGER: Mutex<ChordManager> = Mutex::new(ChordManager {
     sequence: Vec::new(),
     app_handle: None,
     timer_cancel_tx: None,
+    slots: Vec::new(),
+    armed: false,
 });
+
+/// VKs for modifier keys — while armed, these are passed through untouched and
+/// do NOT disarm (the user may still be releasing the Ctrl of the Ctrl+Space
+/// leader, and modifiers are never part of a chord sequence).
+fn is_modifier_vk(vk: u32) -> bool {
+    matches!(
+        vk,
+        0x10 | 0x11 | 0x12 // Shift / Ctrl / Alt (generic)
+        | 0xA0 | 0xA1      // L/R Shift
+        | 0xA2 | 0xA3      // L/R Ctrl
+        | 0xA4 | 0xA5      // L/R Alt
+        | 0x5B | 0x5C      // L/R Win
+        | 0x14 | 0x90 | 0x91 // Caps/Num/Scroll lock
+    )
+}
 
 fn vk_to_string(vk: u32) -> Option<String> {
     match vk {
@@ -48,22 +73,38 @@ fn vk_to_string(vk: u32) -> Option<String> {
 }
 
 pub fn arm_chords(app: AppHandle) {
-    let mut manager = CHORD_MANAGER.lock().unwrap();
-    if manager.hhook.is_some() {
-        return; // Already armed
-    }
-    
-    manager.app_handle = Some(app.clone());
-    manager.sequence.clear();
-    
-    let slots = get_all_quick_launch_slots(&app);
-    let _ = app.emit("hotkey:chord-hud", ChordHudPayload {
-        keys: String::new(),
-        matching_slots: slots,
-    });
+    // Fetch slots + set up state synchronously (this runs off the hook, on the
+    // global-shortcut poller thread — DB access is acceptable HERE, never inside
+    // the hook). Guard against a double-arm race with the `armed` flag since the
+    // hook is installed asynchronously on the main thread below.
+    let rx = {
+        let mut manager = CHORD_MANAGER.lock().unwrap();
+        if manager.armed {
+            return; // Already armed
+        }
+        manager.armed = true;
+        manager.app_handle = Some(app.clone());
+        manager.sequence.clear();
 
-    // Install low-level keyboard hook
-    unsafe {
+        let slots = get_all_quick_launch_slots(&app);
+        manager.slots = slots.clone();
+        let _ = app.emit("hotkey:chord-hud", ChordHudPayload {
+            keys: String::new(),
+            matching_slots: slots,
+        });
+
+        // 2-second timeout.
+        let (tx, rx) = std::sync::mpsc::channel();
+        manager.timer_cancel_tx = Some(tx);
+        rx
+    };
+
+    // Install the low-level keyboard hook on the MAIN thread. A WH_KEYBOARD_LL
+    // hook only fires reliably when installed from a thread that pumps messages;
+    // arm_chords is called from the poller thread (no message loop), so
+    // marshaling to the main thread is required (P0.3.2). The hook callback then
+    // also runs on the main thread.
+    let _ = app.run_on_main_thread(move || unsafe {
         use windows::Win32::Foundation::HINSTANCE;
         let hook_res = SetWindowsHookExW(
             WH_KEYBOARD_LL,
@@ -71,18 +112,21 @@ pub fn arm_chords(app: AppHandle) {
             Some(HINSTANCE(std::ptr::null_mut())),
             0,
         );
-        if let Ok(hook) = hook_res {
-            manager.hhook = Some(SendHhook(hook));
-            tracing::info!("Low-level keyboard hook installed successfully.");
-        } else {
-            tracing::error!("Failed to install low-level keyboard hook.");
+        match hook_res {
+            Ok(hook) => {
+                CHORD_MANAGER.lock().unwrap().hhook = Some(SendHhook(hook));
+                tracing::info!("Low-level keyboard hook installed successfully.");
+            }
+            Err(_) => {
+                tracing::error!("Failed to install low-level keyboard hook.");
+                // Roll back the armed flag so a later leader press can retry.
+                let mut m = CHORD_MANAGER.lock().unwrap();
+                m.armed = false;
+                m.timer_cancel_tx = None;
+            }
         }
-    }
+    });
 
-    // Set 2-second timeout
-    let (tx, rx) = std::sync::mpsc::channel();
-    manager.timer_cancel_tx = Some(tx);
-    
     std::thread::spawn(move || {
         match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -96,8 +140,12 @@ pub fn arm_chords(app: AppHandle) {
     });
 }
 
-pub fn disarm_chords() {
-    let mut manager = CHORD_MANAGER.lock().unwrap();
+/// Disarm with the manager lock already held (callable from the hook callback,
+/// which holds the lock and cannot re-lock the non-reentrant Mutex).
+fn disarm_locked(manager: &mut ChordManager) {
+    manager.armed = false;
+    manager.sequence.clear();
+    manager.slots.clear();
     if let Some(tx) = manager.timer_cancel_tx.take() {
         let _ = tx.send(());
     }
@@ -115,6 +163,11 @@ pub fn disarm_chords() {
     }
 }
 
+pub fn disarm_chords() {
+    let mut manager = CHORD_MANAGER.lock().unwrap();
+    disarm_locked(&mut manager);
+}
+
 unsafe extern "system" fn low_level_keyboard_proc(
     code: i32,
     wparam: WPARAM,
@@ -127,101 +180,97 @@ unsafe extern "system" fn low_level_keyboard_proc(
         if event_type == WM_KEYDOWN || event_type == WM_SYSKEYDOWN {
             let hook_struct = *(lparam.0 as *const KBDLLHOOKSTRUCT);
             let vk = hook_struct.vkCode;
-            
+
+            // Esc cancels the chord — swallow it so it doesn't also reach the app.
             if vk == VK_ESCAPE.0 as u32 {
-                std::thread::spawn(|| {
-                    disarm_chords();
-                });
+                disarm_chords();
                 return LRESULT(1);
             }
-            
+
+            // Modifiers pass straight through and never disarm (the user may still
+            // be releasing the Ctrl of the leader; modifiers are never chord keys).
+            if is_modifier_vk(vk) {
+                return CallNextHookEx(None, code, wparam, lparam);
+            }
+
             if let Some(key_str) = vk_to_string(vk) {
-                let run_result = handle_chord_key(key_str);
-                if run_result {
-                    return LRESULT(1); // Swallow
+                // Swallow ONLY if this key extends a valid chord prefix; otherwise
+                // handle_chord_key disarms and returns false → we pass it through
+                // so we never eat unrelated keystrokes system-wide (P0.3.3).
+                if handle_chord_key(key_str) {
+                    return LRESULT(1);
                 }
             } else {
-                // Unmapped key, disarm and swallow to avoid passing raw chord keys to parent app
-                std::thread::spawn(|| {
-                    disarm_chords();
-                });
-                return LRESULT(1);
+                // Unmapped, non-modifier key: not part of any chord. Disarm and
+                // pass it through rather than eating it.
+                disarm_chords();
             }
         }
     }
-    
+
     CallNextHookEx(None, code, wparam, lparam)
 }
 
+/// Returns true if the key should be SWALLOWED (it extends a valid chord prefix
+/// or triggered a launch); false if it should PASS THROUGH (it matched nothing —
+/// the chord is abandoned and the manager is disarmed). Reads slots from the
+/// arm-time cache: NO DB access here — this runs inside the keyboard hook.
 fn handle_chord_key(key: String) -> bool {
     let mut manager = CHORD_MANAGER.lock().unwrap();
-    manager.sequence.push(key);
-    
-    let typed_sequence = manager.sequence.join(",");
     let app = match &manager.app_handle {
         Some(a) => a.clone(),
         None => return false,
     };
-    
-    let slots = get_all_quick_launch_slots(&app);
-    let mut matching_slots = Vec::new();
-    for slot in slots {
-        let normalized_slot = slot.sequence.to_uppercase().replace(" ", "");
-        let normalized_typed = typed_sequence.to_uppercase().replace(" ", "");
-        if normalized_slot.starts_with(&normalized_typed) {
-            matching_slots.push(slot);
-        }
-    }
-    
+    manager.sequence.push(key);
+
+    let typed_sequence = manager.sequence.join(",");
+    let normalized_typed = typed_sequence.to_uppercase().replace(' ', "");
+
+    let matching_slots: Vec<QuickLaunchItem> = manager
+        .slots
+        .iter()
+        .filter(|slot| {
+            slot.sequence
+                .to_uppercase()
+                .replace(' ', "")
+                .starts_with(&normalized_typed)
+        })
+        .cloned()
+        .collect();
+
     if matching_slots.is_empty() {
-        let _ = manager.timer_cancel_tx.take();
-        let hook = manager.hhook.take();
-        if let Some(SendHhook(h)) = hook {
-            unsafe { let _ = UnhookWindowsHookEx(h); }
-        }
-        let _ = app.emit("hotkey:chord-hud", ChordHudPayload {
-            keys: String::new(),
-            matching_slots: Vec::new(),
-        });
-        return true;
+        // Nothing matches this prefix — abandon the chord and let the key through.
+        disarm_locked(&mut manager);
+        return false;
     }
-    
-    let normalized_typed = typed_sequence.to_uppercase().replace(" ", "");
-    let exact_match = matching_slots.iter().find(|s| {
-        s.sequence.to_uppercase().replace(" ", "") == normalized_typed
-    });
-    
+
+    let exact_match = matching_slots
+        .iter()
+        .find(|s| s.sequence.to_uppercase().replace(' ', "") == normalized_typed);
+
     if let Some(slot) = exact_match {
         let has_prefix_match = matching_slots.iter().any(|s| {
-            s.id != slot.id && s.sequence.to_uppercase().replace(" ", "").starts_with(&normalized_typed)
+            s.id != slot.id
+                && s.sequence.to_uppercase().replace(' ', "").starts_with(&normalized_typed)
         });
-        
+
         if !has_prefix_match {
             let slot_clone = slot.clone();
             let app_thread = app.clone();
             std::thread::spawn(move || {
                 let _ = execute_quick_launch(app_thread, slot_clone);
             });
-            
-            let _ = manager.timer_cancel_tx.take();
-            let hook = manager.hhook.take();
-            if let Some(SendHhook(h)) = hook {
-                unsafe { let _ = UnhookWindowsHookEx(h); }
-            }
-            let _ = app.emit("hotkey:chord-hud", ChordHudPayload {
-                keys: String::new(),
-                matching_slots: Vec::new(),
-            });
+            disarm_locked(&mut manager);
             return true;
         }
     }
-    
+
     let display_keys = manager.sequence.join(" ➔ ");
     let _ = app.emit("hotkey:chord-hud", ChordHudPayload {
         keys: display_keys,
         matching_slots,
     });
-    
+
     true
 }
 

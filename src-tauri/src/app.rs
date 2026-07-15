@@ -192,7 +192,11 @@ pub async fn window_controls(action: String, window: Window, app: AppHandle) -> 
                     .map(|v| v != "false")
                     .unwrap_or(true);
                 if minimize_to_tray {
-                    window.hide().map_err(|e| e.to_string())
+                    window.hide().map_err(|e| e.to_string())?;
+                    // Follow tauri's hide with the raw fallback so tao's flag and
+                    // on-screen reality can't diverge (P0.1 step 6).
+                    crate::windows::force_hide_main();
+                    Ok(())
                 } else {
                     crate::sessions::on_exit(&app);
                     app.exit(0);
@@ -429,6 +433,11 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
         if !hwnd.is_invalid() {
             crate::platform::win_window::install_resize_subclass(hwnd);
         }
+        // Store the main window's HWND for the self-healing raw-Win32 show/hide
+        // fallback (P0.1). Runs at creation on the main thread, so hwnd() is safe.
+        if window.label() == "main" && !hwnd.is_invalid() {
+            crate::windows::set_main_hwnd(hwnd.0 as isize);
+        }
     }
 
     overlay_state
@@ -470,6 +479,7 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                     if let Some(win) = scale_app.get_webview_window("main") {
                         let _ = win.hide();
                     }
+                    crate::windows::force_hide_main();
                 } else {
                     // Full quit: no zombie tray process left behind.
                     scale_app.exit(0);
@@ -518,6 +528,18 @@ pub struct HotkeyItem {
     pub action: String,
     pub shortcut: String,
 }
+
+/// Hot-path caches (P0.2): the global-shortcut handler runs on the plugin's
+/// poller thread and must NOT touch the DB on a keypress (that blocking round
+/// trip on the hot path was a source of dropped/laggy hotkeys). These are
+/// refreshed from the DB only inside `reregister_all_shortcuts`; the handler
+/// reads them lock-and-clone.
+static HOTKEY_CACHE: Mutex<Vec<HotkeyItem>> = Mutex::new(Vec::new());
+static QUICKLAUNCH_CACHE: Mutex<Vec<crate::ipc_types::QuickLaunchItem>> = Mutex::new(Vec::new());
+/// Serializes `reregister_all_shortcuts` so a startup registration and a
+/// settings-save can't interleave `unregister_all` / `register` and silently
+/// drop hotkeys (this raced before).
+static REREGISTER_LOCK: Mutex<()> = Mutex::new(());
 
 fn default_hotkeys() -> Vec<HotkeyItem> {
     vec![
@@ -617,34 +639,96 @@ fn get_quick_launch_slots(db: &crate::db::DbState) -> Vec<crate::ipc_types::Quic
 }
 
 /// Register every global shortcut: action hotkeys plus quick-launch slots whose
-/// sequence is a plain combo (no comma = not a leader chord).
+/// sequence is a plain combo (no comma = not a leader chord). Refreshes the
+/// hot-path caches from the DB, then rebuilds the registration atomically under
+/// REREGISTER_LOCK. Registration failures are surfaced via a toast so they are
+/// never silent again (P0.2.4).
 pub fn reregister_all_shortcuts(app: &AppHandle) -> Result<(), String> {
+    // Serialize concurrent callers (startup thread + settings save) so their
+    // unregister_all/register can't interleave and drop hotkeys.
+    let _guard = REREGISTER_LOCK.lock().unwrap();
+
+    let db = app.state::<crate::db::DbState>();
+    let hotkeys = get_hotkeys_sync(&db);
+    let slots = get_quick_launch_slots(&db);
+
+    // Refresh caches BEFORE (re)registering so the handler always reads the
+    // set that is actually registered.
+    *HOTKEY_CACHE.lock().unwrap() = hotkeys.clone();
+    *QUICKLAUNCH_CACHE.lock().unwrap() = slots.clone();
+
     let global_shortcut = app.global_shortcut();
     let _ = global_shortcut.unregister_all();
 
-    let db = app.state::<crate::db::DbState>();
-    for item in get_hotkeys_sync(&db) {
+    let mut failures: Vec<String> = Vec::new();
+
+    for item in &hotkeys {
         match item.shortcut.parse::<Shortcut>() {
             Ok(shortcut) => {
                 if let Err(e) = global_shortcut.register(shortcut) {
                     tracing::error!("Failed to register '{}': {}", item.shortcut, e);
+                    failures.push(item.shortcut.clone());
                 }
             }
-            Err(_) => tracing::error!("Failed to parse shortcut '{}'", item.shortcut),
+            Err(_) => {
+                tracing::error!("Failed to parse shortcut '{}'", item.shortcut);
+                failures.push(item.shortcut.clone());
+            }
         }
     }
 
-    for slot in get_quick_launch_slots(&db) {
+    for slot in &slots {
         if slot.sequence.contains(',') {
             continue; // leader chord, handled by the low-level hook
         }
         if let Ok(shortcut) = slot.sequence.parse::<Shortcut>() {
             if let Err(e) = global_shortcut.register(shortcut) {
                 tracing::error!("Failed to register quick-launch '{}': {}", slot.sequence, e);
+                failures.push(slot.sequence.clone());
             }
         }
     }
+
+    if !failures.is_empty() {
+        let msg = format!(
+            "Hotkey {} couldn't be registered (in use by another app)",
+            failures.join(", ")
+        );
+        let _ = app.emit("toast:show", msg);
+    }
     Ok(())
+}
+
+/// Background watchdog (P0.2.3): every 60s, re-register any cached shortcut the
+/// OS has silently dropped. REGISTER ONLY — never unregister_all here (that is
+/// what the reregister path is for) so we can't race a live rebind.
+pub fn spawn_hotkey_watchdog(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let global_shortcut = app.global_shortcut();
+            let hotkeys = HOTKEY_CACHE.lock().unwrap().clone();
+            let slots = QUICKLAUNCH_CACHE.lock().unwrap().clone();
+            let mut combos: Vec<String> = hotkeys.into_iter().map(|h| h.shortcut).collect();
+            for slot in slots {
+                if !slot.sequence.contains(',') {
+                    combos.push(slot.sequence);
+                }
+            }
+            for combo in combos {
+                if let Ok(shortcut) = combo.parse::<Shortcut>() {
+                    if !global_shortcut.is_registered(shortcut) {
+                        if let Err(e) = global_shortcut.register(shortcut) {
+                            tracing::error!("watchdog: re-register '{}' failed: {}", combo, e);
+                        } else {
+                            tracing::warn!("watchdog: re-registered dropped hotkey '{}'", combo);
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(target_os = "windows")]
@@ -665,6 +749,10 @@ fn is_powertoys_run_active() -> bool {
 }
 
 pub fn run() {
+    // Install the file logger FIRST so any startup failure below is captured.
+    // Hold the guard for the whole process — it flushes the non-blocking writer.
+    let _log_guard = crate::logging::init();
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if args.len() > 1 {
@@ -685,24 +773,28 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new()
             .with_handler(|app, shortcut, event| {
                 if event.state() == ShortcutState::Pressed {
-                    let db = app.state::<crate::db::DbState>();
-                    let items = get_hotkeys_sync(&db);
-                    
-                    let matched_item = items.iter().find(|item| {
-                        if let Ok(s) = item.shortcut.parse::<Shortcut>() {
-                            s == *shortcut
-                        } else {
-                            false
-                        }
-                    });
-                    
+                    // HOT PATH: read the caches only — NEVER touch the DB here
+                    // (blocking DB round trips on a keypress caused dropped/laggy
+                    // hotkeys, P0.2). Clone out and drop the lock before acting.
+                    let matched_item = HOTKEY_CACHE
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|item| item.shortcut.parse::<Shortcut>().map(|s| s == *shortcut).unwrap_or(false))
+                        .cloned();
+
                     // No action hotkey matched -> maybe a quick-launch plain combo.
                     if matched_item.is_none() {
-                        let slots = get_quick_launch_slots(&db);
-                        if let Some(slot) = slots.into_iter().find(|s| {
-                            !s.sequence.contains(',')
-                                && s.sequence.parse::<Shortcut>().map(|sc| sc == *shortcut).unwrap_or(false)
-                        }) {
+                        let slot = QUICKLAUNCH_CACHE
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|s| {
+                                !s.sequence.contains(',')
+                                    && s.sequence.parse::<Shortcut>().map(|sc| sc == *shortcut).unwrap_or(false)
+                            })
+                            .cloned();
+                        if let Some(slot) = slot {
                             let app_h = app.clone();
                             std::thread::spawn(move || {
                                 let _ = crate::chords::execute_quick_launch_public(app_h, slot);
@@ -714,25 +806,23 @@ pub fn run() {
                         match item.action.as_str() {
                             "summon" => {
                                 // Marshal window ops to the main thread (doing them
-                                // on the shortcut-handler thread froze the app), and
-                                // hide only when actually front-and-focused — so a
-                                // hidden/backgrounded window reliably comes back
-                                // instead of getting toggled off again.
+                                // on the shortcut-handler thread froze the app).
+                                // Decide visible/focused via OS-level truth (raw
+                                // Win32), NOT tauri's is_visible() which lies in the
+                                // degraded state (§2). Hide via tauri THEN raw
+                                // fallback; show via ensure_main_window (which
+                                // already carries the raw force_show fallback).
                                 let app_h = app.clone();
                                 let _ = app.run_on_main_thread(move || {
-                                    match app_h.get_webview_window("main") {
-                                        Some(win) => {
-                                            let visible = win.is_visible().unwrap_or(false);
-                                            let focused = win.is_focused().unwrap_or(false);
-                                            if visible && focused {
-                                                let _ = win.hide();
-                                            } else {
-                                                let _ = win.unminimize();
-                                                let _ = win.show();
-                                                let _ = win.set_focus();
-                                            }
+                                    let visible = crate::windows::main_is_visible();
+                                    let focused = crate::windows::main_is_foreground();
+                                    if visible && focused {
+                                        if let Some(win) = app_h.get_webview_window("main") {
+                                            let _ = win.hide();
                                         }
-                                        None => { crate::windows::ensure_main_window(&app_h); }
+                                        crate::windows::force_hide_main();
+                                    } else {
+                                        crate::windows::ensure_main_window(&app_h);
                                     }
                                 });
                             }
@@ -746,14 +836,10 @@ pub fn run() {
                                 // means to the user.
                                 let app_h = app.clone();
                                 let _ = app.run_on_main_thread(move || {
-                                    match app_h.get_webview_window("main") {
-                                        Some(win) => {
-                                            let _ = win.unminimize();
-                                            let _ = win.show();
-                                            let _ = win.set_focus();
-                                        }
-                                        None => { crate::windows::ensure_main_window(&app_h); }
-                                    }
+                                    // ensure_main_window carries the raw force_show
+                                    // fallback, so the address bar reliably surfaces
+                                    // even from the degraded hidden state.
+                                    crate::windows::ensure_main_window(&app_h);
                                     let _ = app_h.emit("window:shortcut", "Ctrl+L");
                                 });
                             }
@@ -894,6 +980,10 @@ pub fn run() {
                 if let Err(e) = reregister_all_shortcuts(&app_h) {
                     tracing::error!("Failed to reregister shortcuts: {}", e);
                 }
+
+                // Self-healing watchdog: re-register any dropped hotkey within 60s
+                // (starts AFTER the initial reregister has populated the caches).
+                spawn_hotkey_watchdog(&app_h);
 
                 // Consent-gated 24h update check.
                 crate::updater::spawn_periodic_check(&app_h);

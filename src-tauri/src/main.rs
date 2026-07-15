@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod app;
+pub mod logging;
 pub mod db;
 pub mod engine;
 pub mod error;

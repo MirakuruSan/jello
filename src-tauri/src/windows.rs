@@ -1,4 +1,100 @@
 use tauri::{AppHandle, WebviewUrl, WebviewWindowBuilder, Manager};
+use std::sync::atomic::{AtomicIsize, Ordering};
+
+/// Raw Win32 HWND of the "main" window, stored at creation on the main thread
+/// (`window.hwnd()` is safe there). Used by the self-healing show/hide helpers
+/// (P0.1): in the degraded runtime state tauri's own visibility plumbing can
+/// lie or no-op, so we drive `ShowWindow` on this HWND directly as the
+/// authoritative fallback. 0 = not yet resolved.
+pub static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Record the main window's HWND (called from attach_window_plumbing on the
+/// main thread, and on defensive recreate).
+pub fn set_main_hwnd(hwnd: isize) {
+    MAIN_HWND.store(hwnd, Ordering::SeqCst);
+}
+
+/// Raw-Win32 show of the main window — bypasses tauri entirely so it works even
+/// when tao's internal window map/flags have desynced from reality (the P0.1
+/// degradation: `win.show()` silently no-ops). Restores if minimized, shows if
+/// hidden, then foregrounds. No-op if the HWND isn't resolved yet.
+pub fn force_show_main() {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+        };
+        let raw = MAIN_HWND.load(Ordering::SeqCst);
+        if raw == 0 {
+            return;
+        }
+        unsafe {
+            let h = HWND(raw as *mut _);
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, SW_RESTORE);
+            }
+            if !IsWindowVisible(h).as_bool() {
+                let _ = ShowWindow(h, SW_SHOW);
+            }
+            let _ = SetForegroundWindow(h);
+        }
+    }
+}
+
+/// Raw-Win32 hide of the main window — the counterpart to force_show_main, so
+/// tao's flag and on-screen reality can't diverge in the hide direction either.
+pub fn force_hide_main() {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_HIDE};
+        let raw = MAIN_HWND.load(Ordering::SeqCst);
+        if raw == 0 {
+            return;
+        }
+        unsafe {
+            let h = HWND(raw as *mut _);
+            if IsWindowVisible(h).as_bool() {
+                let _ = ShowWindow(h, SW_HIDE);
+            }
+        }
+    }
+}
+
+/// OS-level truth: is the main window actually visible right now? Reads
+/// `IsWindowVisible` on the stored HWND rather than trusting tauri's
+/// `is_visible()` (which can report true while the window is hidden — see §2).
+pub fn main_is_visible() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        let raw = MAIN_HWND.load(Ordering::SeqCst);
+        if raw == 0 {
+            return false;
+        }
+        unsafe { IsWindowVisible(HWND(raw as *mut _)).as_bool() }
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
+/// OS-level truth: is the main window the foreground window?
+pub fn main_is_foreground() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let raw = MAIN_HWND.load(Ordering::SeqCst);
+        if raw == 0 {
+            return false;
+        }
+        unsafe { GetForegroundWindow() == HWND(raw as *mut _) }
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
+}
 
 /// The full logical client rect of a window — content webviews fill the whole
 /// window (chromeless: all UI floats above the page). SPEC §F.
@@ -25,6 +121,11 @@ pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
+        // ALWAYS follow the tauri path with the raw-Win32 fallback: in the
+        // degraded state (§2) win.show() reports success but the window stays
+        // hidden. force_show_main drives ShowWindow on the real HWND so reopen
+        // can never silently no-op.
+        force_show_main();
         return Some(win);
     }
     // Defensive recreate (mirrors tauri.conf.json "main" window options).
@@ -43,6 +144,7 @@ pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         Ok(win) => {
             crate::app::attach_window_plumbing(app, win.as_ref().window());
             let _ = win.set_focus();
+            force_show_main();
             Some(win)
         }
         Err(e) => {

@@ -30,6 +30,8 @@ arboard = "3.6.1"
 nucleo-matcher = "0.3.1"
 thiserror = "2.0.18"
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_System_Registry", "Win32_Security"] }
