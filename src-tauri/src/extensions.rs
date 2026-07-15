@@ -131,8 +131,12 @@ fn add_browser_extension(webview: &tauri::Webview<tauri::Wry>, store_id: String,
                     }
                     tracing::info!("extensions: AddBrowserExtension ok for {}", store_cb);
                 } else {
-                    tracing::error!("extensions: AddBrowserExtension failed for {}: {:?}", store_cb, result.err());
-                    LOADED_IDS.lock().unwrap().retain(|s| s != &store_cb);
+                    // The common failure is the shared profile already having this
+                    // extension registered (0x80004005) — the extension still
+                    // works and options resolves via the path-hash fallback. Keep
+                    // it marked loaded (don't retry on every new tab → no error
+                    // spam) and log at warn, not error.
+                    tracing::warn!("extensions: AddBrowserExtension for {} returned {:?} (likely already loaded)", store_cb, result.err());
                 }
                 Ok(())
             },

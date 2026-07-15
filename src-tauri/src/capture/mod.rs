@@ -13,7 +13,11 @@ static HIDDEN_FOR_CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// hidden for the capture (so the main window returns exactly when it was
 /// visible before, and stays hidden when it wasn't).
 fn close_overlays_and_restore(app: &AppHandle) {
-    for win in app.webview_windows().values() {
+    // Iterate windows() (Window), NOT webview_windows(): once content tabs are
+    // added as child webviews, the main window drops out of webview_windows(), so
+    // the old loop neither hid nor restored it → screenshot left main stuck
+    // hidden with tabs open.
+    for win in app.windows().values() {
         if win.label().starts_with("capture_") {
             let _ = win.close();
         }
@@ -23,13 +27,15 @@ fn close_overlays_and_restore(app: &AppHandle) {
     let app_h = app.clone();
     let _ = app.run_on_main_thread(move || {
         for label in labels {
-            if let Some(w) = app_h.get_webview_window(&label) {
-                let _ = w.show();
-                // Raw force-show fallback for the main window so it reliably comes
-                // back even if tauri's show() no-ops in the degraded state.
-                if label == "main" {
-                    crate::windows::force_show_main();
+            if label == "main" {
+                // Never gate the raw fallback behind a getter that returns None
+                // when tabs are open — that was the restore bug.
+                if let Some(w) = app_h.get_window("main") {
+                    let _ = w.show();
                 }
+                crate::windows::force_show_main();
+            } else if let Some(w) = app_h.get_window(&label) {
+                let _ = w.show();
             }
         }
     });
@@ -60,15 +66,20 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
         let app_m = app.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let _ = app.run_on_main_thread(move || {
-            for win in app_m.webview_windows().values() {
+            for win in app_m.windows().values() {
                 let label = win.label().to_string();
                 if label.starts_with("capture_") { continue; }
-                if win.is_visible().unwrap_or(false) {
+                // For main, trust OS-level visibility (tauri's can lie once tabs
+                // are open); for others, the Window's own is_visible.
+                let visible = if label == "main" {
+                    crate::windows::main_is_visible()
+                } else {
+                    win.is_visible().unwrap_or(false)
+                };
+                if visible {
                     let _ = win.hide();
-                    // Belt-and-suspenders for the main window: verify at the OS
-                    // level and raw-hide if tauri's hide didn't take (degraded
-                    // plumbing, §2) — otherwise it ghosts into the frozen frame.
-                    if label == "main" && crate::windows::main_is_visible() {
+                    if label == "main" {
+                        // Raw-hide so it can't ghost into the frozen frame.
                         crate::windows::force_hide_main();
                     }
                     hidden.push(label);
@@ -95,7 +106,7 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
     let monitors = crate::platform::win_capture::capture_all_monitors(&app)?;
 
     // Close any existing capture windows first to be safe
-    for win in app.webview_windows().values() {
+    for win in app.windows().values() {
         if win.label().starts_with("capture_") {
             let _ = win.close();
         }
