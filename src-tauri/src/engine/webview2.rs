@@ -247,39 +247,19 @@ impl WebView2ContentView {
                 }
             });
 
-            // Register a DownloadStarting handler that emits download:started.
+            // Register a DownloadStarting handler that tracks the operation so it
+            // can be paused/resumed/cancelled, and streams progress (P3.1).
             let dl_app = webview.app_handle().clone();
             let _ = webview.with_webview(move |w| {
                 use webview2_com::DownloadStartingEventHandler;
-                use windows::core::{Interface, PWSTR};
-                use tauri::Emitter;
+                use windows::core::Interface;
                 unsafe {
                     if let Ok(core) = w.controller().CoreWebView2() {
                         let handler = DownloadStartingEventHandler::create(Box::new(move |_sender, args| {
                             if let Some(args) = args {
-                                let mut url = String::new();
-                                let mut file_name = String::new();
                                 if let Ok(op) = args.DownloadOperation() {
-                                    let mut uri = PWSTR::null();
-                                    if op.Uri(&mut uri).is_ok() && !uri.is_null() {
-                                        url = uri.to_string().unwrap_or_default();
-                                    }
+                                    register_download(&dl_app, op);
                                 }
-                                let mut path = PWSTR::null();
-                                if args.ResultFilePath(&mut path).is_ok() && !path.is_null() {
-                                    let full = path.to_string().unwrap_or_default();
-                                    file_name = full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string();
-                                }
-                                let id = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis().to_string())
-                                    .unwrap_or_default();
-                                let _ = dl_app.emit("download:started", serde_json::json!({
-                                    "id": id,
-                                    "fileName": file_name,
-                                    "url": url,
-                                    "state": "started",
-                                }));
                             }
                             Ok(())
                         }));
@@ -879,4 +859,187 @@ unsafe extern "system" fn raw_invoke(
         }
     }
     windows::core::HRESULT(0) // S_OK
+}
+
+// ── Download management (P3.1) ───────────────────────────────────────────────
+// The DownloadStarting handler used to drop the DownloadOperation; now we retain
+// it so the download can be paused/resumed/cancelled and its progress streamed.
+
+#[cfg(target_os = "windows")]
+use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2DownloadOperation;
+
+/// A tracked download operation. COM objects aren't Send; the documented
+/// invariant is that this is ONLY ever touched on the main (UI) thread — the
+/// DownloadStarting/StateChanged handlers run there, and pause/resume/cancel
+/// marshal onto it via run_on_main_thread (same pattern as chords' SendHhook).
+#[cfg(target_os = "windows")]
+struct SendDownloadOp(ICoreWebView2DownloadOperation);
+#[cfg(target_os = "windows")]
+unsafe impl Send for SendDownloadOp {}
+
+#[cfg(target_os = "windows")]
+static DOWNLOADS: Mutex<Vec<(String, SendDownloadOp)>> = Mutex::new(Vec::new());
+#[cfg(target_os = "windows")]
+static LAST_DL_EMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+fn register_download(app: &tauri::AppHandle, op: ICoreWebView2DownloadOperation) {
+    use tauri::Emitter;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+    };
+    use webview2_com::{BytesReceivedChangedEventHandler, StateChangedEventHandler};
+    use windows::core::PWSTR;
+    unsafe {
+        let id = now_millis().to_string();
+
+        let mut url = String::new();
+        let mut uri = PWSTR::null();
+        if op.Uri(&mut uri).is_ok() && !uri.is_null() {
+            url = uri.to_string().unwrap_or_default();
+        }
+        let mut path = String::new();
+        let mut p = PWSTR::null();
+        if op.ResultFilePath(&mut p).is_ok() && !p.is_null() {
+            path = p.to_string().unwrap_or_default();
+        }
+        let file_name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+        let mut total: i64 = 0;
+        let _ = op.TotalBytesToReceive(&mut total);
+
+        tracing::info!("download started id={} file={} total={}", id, file_name, total);
+        let _ = app.emit("download:started", serde_json::json!({
+            "id": id, "fileName": file_name, "url": url, "state": "started",
+            "total": total, "path": path,
+        }));
+
+        // Progress (throttled ~4/s).
+        let prog_app = app.clone();
+        let prog_id = id.clone();
+        let bytes_handler = BytesReceivedChangedEventHandler::create(Box::new(move |sender, _args| {
+            if let Some(op) = sender {
+                let now = now_millis();
+                let last = LAST_DL_EMIT.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= 250 {
+                    LAST_DL_EMIT.store(now, std::sync::atomic::Ordering::Relaxed);
+                    let mut received: i64 = 0;
+                    let _ = op.BytesReceived(&mut received);
+                    let mut tot: i64 = 0;
+                    let _ = op.TotalBytesToReceive(&mut tot);
+                    let _ = prog_app.emit("download:progress", serde_json::json!({
+                        "id": prog_id, "received": received, "total": tot,
+                    }));
+                }
+            }
+            Ok(())
+        }));
+        let mut tok: i64 = 0;
+        let _ = op.add_BytesReceivedChanged(&bytes_handler, &mut tok);
+
+        // Terminal state → download:done + drop from the map.
+        let state_app = app.clone();
+        let state_id = id.clone();
+        let state_handler = StateChangedEventHandler::create(Box::new(move |sender, _args| {
+            if let Some(op) = sender {
+                let mut st = COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED;
+                let _ = op.State(&mut st);
+                let mut rp = PWSTR::null();
+                let mut result_path = String::new();
+                if op.ResultFilePath(&mut rp).is_ok() && !rp.is_null() {
+                    result_path = rp.to_string().unwrap_or_default();
+                }
+                let state_str = if st == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+                    "completed"
+                } else if st == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                    "interrupted"
+                } else {
+                    "inprogress"
+                };
+                let _ = state_app.emit("download:done", serde_json::json!({
+                    "id": state_id, "state": state_str, "path": result_path,
+                }));
+                if st == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
+                    || st == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
+                {
+                    DOWNLOADS.lock().unwrap().retain(|(k, _)| k != &state_id);
+                }
+            }
+            Ok(())
+        }));
+        let mut tok2: i64 = 0;
+        let _ = op.add_StateChanged(&state_handler, &mut tok2);
+
+        DOWNLOADS.lock().unwrap().push((id, SendDownloadOp(op)));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn download_action(app: &tauri::AppHandle, id: String, action: u8) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let map = DOWNLOADS.lock().unwrap();
+        let res = match map.iter().find(|(k, _)| k == &id) {
+            Some((_, SendDownloadOp(op))) => unsafe {
+                match action {
+                    0 => op.Pause().map_err(|e| e.to_string()),
+                    1 => op.Resume().map_err(|e| e.to_string()),
+                    _ => op.Cancel().map_err(|e| e.to_string()),
+                }
+            },
+            None => Err("download not found (already finished?)".to_string()),
+        };
+        let _ = tx.send(res);
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn download_pause(id: String, app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    { download_action(&app, id, 0) }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (id, app); Ok(()) }
+}
+
+#[tauri::command]
+pub async fn download_resume(id: String, app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    { download_action(&app, id, 1) }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (id, app); Ok(()) }
+}
+
+#[tauri::command]
+pub async fn download_cancel(id: String, app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    { download_action(&app, id, 2) }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (id, app); Ok(()) }
+}
+
+/// Reveal a completed download in the OS file manager (selecting the file).
+#[tauri::command]
+pub async fn download_reveal(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer")
+            .creation_flags(0x08000000)
+            .arg("/select,")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = path; Ok(()) }
 }

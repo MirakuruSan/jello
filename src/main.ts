@@ -1067,6 +1067,22 @@ window.addEventListener("DOMContentLoaded", () => {
     showToast(`Downloading ${event.payload.fileName}`);
   });
 
+  // Live progress + terminal state for downloads (P3.1).
+  listen<{ id: string; received: number; total: number }>("download:progress", (event) => {
+    views?.updateDownload(event.payload.id, {
+      received: event.payload.received,
+      total: event.payload.total,
+      state: "inprogress",
+    });
+  });
+  listen<{ id: string; state: string; path: string }>("download:done", (event) => {
+    views?.updateDownload(event.payload.id, {
+      state: event.payload.state,
+      path: event.payload.path,
+    });
+    if (event.payload.state === "completed") showToast("Download complete");
+  });
+
   // Listen to chord HUD event from Rust
   listen<{ keys: string; matchingSlots: any[] }>("hotkey:chord-hud", (event) => {
     const hud = document.getElementById("chord-hud");

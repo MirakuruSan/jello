@@ -3,7 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 
 interface HistoryEntry { id: number; url: string; title: string; visitCount: number; lastVisit: number; }
 interface Bookmark { id: number; url: string; title: string; position: number; }
-export interface DownloadItem { id: string; fileName: string; url: string; state: string; }
+export interface DownloadItem {
+  id: string;
+  fileName: string;
+  url: string;
+  state: string;
+  received?: number;
+  total?: number;
+  path?: string;
+}
 
 type ViewName = "history" | "bookmarks" | "downloads" | "settings";
 
@@ -50,6 +58,15 @@ export class ViewsController {
     const existing = this.downloads.find((d) => d.id === item.id);
     if (existing) Object.assign(existing, item);
     else this.downloads.unshift(item);
+    if (this.isOpen() && this.current === "downloads") this.render();
+  }
+
+  /// Merge a progress/done update into an existing download (P3.1). Re-renders
+  /// only the affected row's dynamic bits to avoid a full rebuild storm.
+  updateDownload(id: string, patch: Partial<DownloadItem>): void {
+    const d = this.downloads.find((x) => x.id === id);
+    if (!d) return;
+    Object.assign(d, patch);
     if (this.isOpen() && this.current === "downloads") this.render();
   }
 
@@ -159,12 +176,72 @@ export class ViewsController {
     if (this.downloads.length === 0) {
       list.innerHTML = "<div class='views-empty'>No downloads this session.</div>";
     }
+    const fmtBytes = (n: number): string => {
+      if (!n || n < 0) return "";
+      const u = ["B", "KB", "MB", "GB"];
+      let i = 0;
+      let v = n;
+      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+      return `${v.toFixed(i === 0 ? 0 : 1)}${u[i]}`;
+    };
     for (const d of this.downloads) {
       const row = this.rowHtml(d.fileName, d.url);
+      const done = d.state === "completed" || d.state === "interrupted" || d.state === "cancelled";
+      const inflight = !done;
+
+      // Progress bar (received/total) for in-flight downloads.
+      if (inflight && (d.total ?? 0) > 0) {
+        const bar = document.createElement("div");
+        bar.className = "views-dl-bar";
+        bar.style.cssText = "flex-basis:100%;height:4px;border-radius:2px;background:var(--surface-2,rgba(128,128,128,0.25));overflow:hidden;margin-top:4px;";
+        const fill = document.createElement("div");
+        const pct = Math.min(100, Math.round(((d.received ?? 0) / (d.total || 1)) * 100));
+        fill.style.cssText = `height:100%;width:${pct}%;background:var(--accent,#4a9eff);transition:width 0.2s;`;
+        bar.appendChild(fill);
+        row.appendChild(bar);
+      }
+
       const state = document.createElement("span");
       state.className = "views-dl-state";
-      state.textContent = d.state;
+      const sizeText = (d.total ?? 0) > 0 ? ` ${fmtBytes(d.received ?? 0)}/${fmtBytes(d.total ?? 0)}` : "";
+      state.textContent = done ? d.state : `${d.state}${sizeText}`;
       row.appendChild(state);
+
+      const mkBtn = (label: string, cmd: string) => {
+        const b = document.createElement("button");
+        b.className = "views-btn interactive";
+        b.textContent = label;
+        b.addEventListener("click", () => {
+          invoke(cmd, { id: d.id }).catch(() => {});
+        });
+        return b;
+      };
+
+      const mkToggle = (label: string, cmd: string, newState: string) => {
+        const b = document.createElement("button");
+        b.className = "views-btn interactive";
+        b.textContent = label;
+        b.addEventListener("click", () => {
+          invoke(cmd, { id: d.id })
+            .then(() => this.updateDownload(d.id, { state: newState }))
+            .catch(() => {});
+        });
+        return b;
+      };
+
+      if (inflight) {
+        if (d.state === "paused") row.appendChild(mkToggle("Resume", "download_resume", "inprogress"));
+        else row.appendChild(mkToggle("Pause", "download_pause", "paused"));
+        row.appendChild(mkBtn("Cancel", "download_cancel"));
+      } else if (d.state === "completed" && d.path) {
+        const open = document.createElement("button");
+        open.className = "views-btn interactive";
+        open.textContent = "Open folder";
+        open.addEventListener("click", () => {
+          invoke("download_reveal", { path: d.path }).catch(() => {});
+        });
+        row.appendChild(open);
+      }
       list.appendChild(row);
     }
     this.content.appendChild(list);
