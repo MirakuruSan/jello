@@ -198,11 +198,16 @@ pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         // until a click. Focus the page (or chrome when no tabs).
         focus_main_content_or_chrome(app);
         // Restore full memory/performance after the hidden-mode LOW trim.
+        // MUST NOT be a skippable try_lock: if the pool happened to be busy the
+        // LOW target stayed on every view forever → everything felt sluggish.
+        // Block on the lock from a background thread instead.
         {
             let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>().inner().clone();
-            if let Ok(p) = pool.try_lock() {
-                p.set_memory_target_all(false);
-            };
+            std::thread::spawn(move || {
+                if let Ok(p) = pool.lock() {
+                    p.set_memory_target_all(false);
+                };
+            });
         }
         return app.get_webview_window("main");
     }

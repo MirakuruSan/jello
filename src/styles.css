@@ -280,7 +280,9 @@ body.chrome-hidden .drag-region {
 }
 
 .tab-search {
-  width: 100%;
+  /* width:100% PLUS the 16px side margins overflowed the panel (#1). */
+  width: calc(100% - 32px);
+  box-sizing: border-box;
   padding: 8px 12px;
   background: var(--surface);
   border: 1px solid var(--border);

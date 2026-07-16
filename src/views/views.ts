@@ -365,6 +365,11 @@ export class ViewsController {
     hkNote.textContent = "Format: Ctrl+Alt+K, Ctrl+Shift+Space, … Press Apply to save; conflicts are rejected.";
     hkNote.style.cssText = "color:var(--text-dim);font-size:0.6875rem;margin-bottom:4px;";
     form.appendChild(hkNote);
+    // Rows arrive async — anchor them HERE. Appending straight to `form` inside
+    // the .then() pushed them after every later section, leaving this section
+    // visually empty (#7).
+    const hkWrap = document.createElement("div");
+    form.appendChild(hkWrap);
 
     const hkLabels: Record<string, string> = {
       summon: "Summon / hide Jello",
@@ -406,7 +411,7 @@ export class ViewsController {
             }
           });
           row.append(name, input, apply, status);
-          form.appendChild(row);
+          hkWrap.appendChild(row);
         }
       })
       .catch(() => {});
@@ -545,9 +550,17 @@ export class ViewsController {
     fileBtn.className = "views-btn interactive";
     fileBtn.textContent = "From file…";
     fileBtn.title = "Install an extension from a local .crx or .zip file";
+    const storeBtn = document.createElement("button");
+    storeBtn.className = "views-btn interactive";
+    storeBtn.textContent = "🧩 Get extensions";
+    storeBtn.title = "Browse the Chrome Web Store — the install banner appears on extension pages";
+    storeBtn.addEventListener("click", () => {
+      this.onNavigate("https://chromewebstore.google.com/");
+      this.close();
+    });
     const installStatus = document.createElement("span");
     installStatus.style.cssText = "font-size:0.6875rem;min-width:70px;";
-    installRow.append(input, installBtn, fileBtn, installStatus);
+    installRow.append(input, installBtn, fileBtn, storeBtn, installStatus);
     form.appendChild(installRow);
 
     const dropHint = document.createElement("div");

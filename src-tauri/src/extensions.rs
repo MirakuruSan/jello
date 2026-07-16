@@ -607,6 +607,30 @@ pub async fn extensions_set_enabled(
     Ok(())
 }
 
+/// One-time startup migration: with the full uBlock Origin enabled, ALSO running
+/// uBO Lite and/or AdGuard makes every network request pay 2-3 filter passes —
+/// a major "pages load slowly" cause. Disable (not uninstall — reversible in
+/// Settings) the redundant ones. Returns how many were disabled.
+pub fn dedupe_ad_blockers(db: &DbState) -> usize {
+    let Ok(exts) = db_list_extensions(db) else { return 0 };
+    let full_ubo_on = exts.iter().any(|e| e.enabled && e.name == "uBlock Origin");
+    if !full_ubo_on {
+        return 0;
+    }
+    const REDUNDANT: [&str; 2] = [
+        "ddkjiahejlhfcafbddmgiahcphecmpfh", // uBlock Origin Lite
+        "bgnkhhnnamicmpeenaelnjfhikgbkllg", // AdGuard AdBlocker
+    ];
+    let mut disabled = 0;
+    for ext in exts.iter().filter(|e| e.enabled && REDUNDANT.contains(&e.id.as_str())) {
+        if db_set_extension_enabled(db, ext.id.clone(), false).is_ok() {
+            tracing::info!("disabled redundant ad blocker '{}' (full uBO active)", ext.name);
+            disabled += 1;
+        }
+    }
+    disabled
+}
+
 /// Install the full uBlock Origin (MV2) from its latest GitHub release (#9) —
 /// the wizard/settings now offer this instead of the weaker uBO Lite.
 #[command]

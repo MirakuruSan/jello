@@ -4,6 +4,34 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.5] — 2026-07-16
+
+### Fixed
+- **Pages stay interactive while a panel is open.** The tab list / settings
+  panel no longer blocks clicking the page around it.
+- **Faster browsing.** Redundant stacked ad blockers (uBO Lite, AdGuard) are
+  disabled automatically when the full uBlock Origin is active — every request
+  was paying multiple filter passes. Also fixed a case where the hidden-mode
+  memory trim could stay active after summoning, leaving everything sluggish.
+- **"Restore tabs on startup" works.** With it enabled, Jello reopens on your
+  most recent tab instead of an empty home screen.
+- **Global-hotkeys settings section actually shows the hotkeys** (rows were
+  being appended to the bottom of the settings form).
+- **Tab search field fits the panel.**
+- Unloading the last loaded tab now lands on the home screen instead of waking
+  an unloaded tab.
+
+### Added
+- **Tab state dots**: green = loaded, amber = suspended, grey = unloaded; the
+  right-click "Unload" entry is greyed out for tabs that are already unloaded.
+- **"Get extensions" button** (Settings → Extensions) opens the Chrome Web
+  Store, where the install banner takes it from there.
+
+### Known limitation
+- Per-tab back/forward history cannot be carried across a full restart
+  (WebView2 offers no API to save or restore a tab's navigation stack). Your
+  global History (Ctrl+H) and the tabs themselves do persist.
+
 ## [0.4.4] — 2026-07-15
 
 ### Fixed

@@ -39,10 +39,13 @@ pub fn apply_overlay_region(app: &AppHandle, label: &str) {
             Some(h) => h,
             None => return, // not resolved yet; initial region stays full
         };
-        let panel_open = crate::engine::webview2::PANEL_OPEN.load(std::sync::atomic::Ordering::Relaxed)
-            || OVERLAY_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+        // NOTE: PANEL_OPEN deliberately does NOT force a full region anymore —
+        // that made an open tab/settings panel eat every click on the page (#2).
+        // The open panel's own rect is included in the hit rects instead, so the
+        // page stays interactive around it. PANEL_OPEN still gates Esc handling.
+        let overlay_interactive = OVERLAY_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed);
         let has_content = state.has_content.lock().unwrap().get(label).copied().unwrap_or(false);
-        let full = panel_open || !has_content;
+        let full = overlay_interactive || !has_content;
         let scale = state.scale_factors.lock().unwrap().get(label).copied().unwrap_or(1.0);
         let rects: Vec<(i32, i32, i32, i32)> = if full {
             Vec::new()
@@ -976,6 +979,20 @@ pub fn run() {
             // Build the enabled-extensions staging dir before any content webview
             // is created (they read extensions_path at build time) so uBOL etc.
             // load on the first tab (Phase 4).
+            // Speed: with full uBO enabled, stacked redundant blockers made every
+            // request pay multiple filter passes. Disable them BEFORE staging.
+            let deduped = crate::extensions::dedupe_ad_blockers(&db_state);
+            if deduped > 0 {
+                let app_t = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(6));
+                    let _ = app_t.emit(
+                        "toast:show",
+                        "Disabled redundant ad blockers (full uBlock Origin covers it) — re-enable in Settings if wanted".to_string(),
+                    );
+                });
+            }
+
             let staged = crate::extensions::rebuild_active_extensions(app.handle(), &db_state);
             tracing::info!("staged {} browser extension(s) for loading", staged);
 
@@ -1117,6 +1134,7 @@ pub fn run() {
             crate::tabs::tabs_suspend_all,
             crate::tabs::tabs_reopen_closed,
             crate::tabs::tabs_unload,
+            crate::tabs::tabs_loaded_states,
             crate::extensions::extensions_list,
             crate::extensions::extensions_install,
             crate::extensions::extensions_set_enabled,

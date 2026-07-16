@@ -270,10 +270,29 @@ pub async fn tabs_close(
                 format!("incognito_{}", win_id)
             };
             crate::app::overlay_mark_content(&app, &label, false);
+            // Tell the frontend we landed on the home screen (no live tab) so
+            // the new-tab page shows, and focus the chrome so it's typable.
+            let _ = app.emit("tab:activated", -1);
+            crate::windows::focus_chrome(&app, &label);
         }
     }
 
     Ok(())
+}
+
+/// id → "live" | "suspended" for tabs that currently have a webview (#3/#4:
+/// tab-panel dots + greyed-out Unload).
+#[command]
+pub async fn tabs_loaded_states(
+    pool: State<'_, Arc<Mutex<TabPool>>>,
+) -> Result<std::collections::HashMap<i32, String>, String> {
+    Ok(pool
+        .lock()
+        .unwrap()
+        .loaded_states()
+        .into_iter()
+        .map(|(id, s)| (id, s.to_string()))
+        .collect())
 }
 
 /// Unload (discard) a tab's webview to free memory while keeping the tab, then
@@ -312,10 +331,19 @@ pub async fn tabs_unload(
     let _ = app.emit("tab:updated", &id);
 
     if was_active && win_id != 0 {
-        let remaining: Vec<Tab> = tabs_list_impl(win_id, &db)?.into_iter().filter(|t| t.id != id).collect();
-        if let Some(next) = remaining.last() {
-            tabs_activate_impl(next.id, &db, &pool, &app)?;
-            pool.lock().unwrap().focus_tab(next.id);
+        // Prefer the next LOADED tab; activating an unloaded one would defeat
+        // the point of unloading (#5). None loaded → home screen.
+        let remaining: Vec<Tab> = tabs_list_impl(win_id, &db)?
+            .into_iter()
+            .filter(|t| t.id != id)
+            .collect();
+        let next_loaded = {
+            let pool_guard = pool.lock().unwrap();
+            remaining.iter().rev().find(|t| pool_guard.is_loaded(t.id)).map(|t| t.id)
+        };
+        if let Some(next_id) = next_loaded {
+            tabs_activate_impl(next_id, &db, &pool, &app)?;
+            pool.lock().unwrap().focus_tab(next_id);
         } else {
             // No other tabs → show the new-tab/home screen.
             let mut pool_guard = pool.lock().unwrap();
@@ -329,6 +357,10 @@ pub async fn tabs_unload(
                 format!("incognito_{}", win_id)
             };
             crate::app::overlay_mark_content(&app, &label, false);
+            // Tell the frontend we landed on the home screen (no live tab) so
+            // the new-tab page shows, and focus the chrome so it's typable.
+            let _ = app.emit("tab:activated", -1);
+            crate::windows::focus_chrome(&app, &label);
         }
     }
     Ok(())

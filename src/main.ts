@@ -27,7 +27,12 @@ function updateHitRects(): void {
   // not listed is click-through to the page AND not painted. So: skip faded
   // chrome (it must not eat clicks while invisible), and include transient
   // visuals (toasts, chord HUD) so they stay visible over content.
-  const elements = document.querySelectorAll<HTMLElement>(".interactive, .region-visible");
+  // Open panels contribute their whole rect: the backend no longer forces a
+  // full-window region while a panel is open (that ate every page click — #2),
+  // so the panel itself must claim its area to stay clickable.
+  const elements = document.querySelectorAll<HTMLElement>(
+    ".interactive, .region-visible, .tab-panel.open, .views-panel.open, .find-bar.open"
+  );
   const rects: HitRect[] = [];
   for (const el of Array.from(elements)) {
     if (el.closest(".faded")) continue;
@@ -820,18 +825,25 @@ window.addEventListener("DOMContentLoaded", () => {
     new Wizard().maybeShow();
   }
 
-  // Load initial tabs for main state
+  // Load initial tabs for main state. With "Restore tabs on startup" enabled,
+  // also ACTIVATE the most-recent tab so the user resumes where they left off
+  // (#10 — previously restore only ran when the tab list was empty, which it
+  // never is since tabs persist in the DB, and nothing was ever activated).
   invoke<Tab[]>("tabs_list", { windowId: winId }).then((result) => {
     tabs = result;
     updateTabCountBadge();
-    // On the main window, restore last session if enabled and no tabs exist yet.
-    if (winId === 1 && tabs.length === 0) {
-      invoke<Record<string, unknown>>("settings_get").then((s) => {
-        if (s.restoreSession) {
-          invoke<Tab[]>("session_restore_last").catch(console.error);
-        }
-      }).catch(() => {});
-    }
+    if (winId !== 1) return;
+    invoke<Record<string, unknown>>("settings_get").then(async (s) => {
+      if (!s.restoreSession) return;
+      if (tabs.length === 0) {
+        const restored = await invoke<Tab[]>("session_restore_last").catch(() => [] as Tab[]);
+        tabs = restored;
+        updateTabCountBadge();
+      }
+      const candidates = tabs.filter((t) => t.url && t.url !== "about:blank");
+      const recent = [...candidates].sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0))[0];
+      if (recent) invoke("tabs_activate", { id: recent.id }).catch(console.error);
+    }).catch(() => {});
   }).catch(console.error);
 
   // ===== Button wiring =====

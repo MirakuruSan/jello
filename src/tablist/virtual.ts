@@ -39,15 +39,18 @@ export class VirtualTabList {
   private tabs: Tab[] = [];
   private opts: VirtualTabListOptions;
   private activeId = -1;
+  /** tab id → "live" | "suspended"; absent = unloaded (cold). Drives the dot. */
+  private loadedStates: Record<number, string> = {};
 
   constructor(opts: VirtualTabListOptions) {
     this.opts = opts;
     this.opts.viewport.addEventListener("scroll", () => this.render());
   }
 
-  setTabs(tabs: Tab[], activeId: number): void {
+  setTabs(tabs: Tab[], activeId: number, loadedStates: Record<number, string> = {}): void {
     this.tabs = tabs;
     this.activeId = activeId;
+    this.loadedStates = loadedStates;
     this.opts.spacer.style.height = `${tabs.length * ROW_HEIGHT}px`;
     this.render();
   }
@@ -86,9 +89,11 @@ export class VirtualTabList {
       title.textContent = tab.title || tab.url;
       row.appendChild(title);
 
-      // State dot
+      // State dot: green = live, amber = suspended, grey = unloaded (#3).
       const dot = document.createElement("span");
-      dot.className = "state-dot cold"; // Default cold; updated by caller
+      const state = this.loadedStates[tab.id] ?? "cold";
+      dot.className = `state-dot ${state}`;
+      dot.title = state === "cold" ? "Unloaded" : state === "live" ? "Loaded" : "Suspended";
       row.appendChild(dot);
 
       // Audio icon (if not muted)

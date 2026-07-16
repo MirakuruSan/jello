@@ -16,6 +16,8 @@ export class TabPanelController {
   private activeTabId = -1;
   private filterQuery = "";
   private windowId = 1;
+  /** tab id → "live" | "suspended" (absent = unloaded). */
+  private loadedStates: Record<number, string> = {};
   /** Notifies main.ts so it can sync overlay_set_panel_open + hit rects. */
   private onOpenChanged: (open: boolean) => void;
 
@@ -121,6 +123,7 @@ export class TabPanelController {
     try {
       const tabs = await invoke<Tab[]>("tabs_list", { windowId: this.windowId });
       this.tabs = tabs;
+      this.loadedStates = await invoke<Record<number, string>>("tabs_loaded_states").catch(() => ({}));
       
       // Update Tab Count badge
       const badge = document.getElementById("btn-tab-count");
@@ -151,7 +154,7 @@ export class TabPanelController {
           t.url.toLowerCase().includes(this.filterQuery)
       );
     }
-    this.tabList.setTabs(filtered, this.activeTabId);
+    this.tabList.setTabs(filtered, this.activeTabId, this.loadedStates);
   }
 
   private activateTab(id: number): void {
@@ -181,7 +184,8 @@ export class TabPanelController {
           invoke("tabs_set_pinned", { id: tab.id, pinned: !tab.pinned }).then(reload).catch(console.error) },
       { label: tab.muted ? "Unmute" : "Mute", onClick: () =>
           invoke("tabs_set_muted", { id: tab.id, muted: !tab.muted }).then(reload).catch(console.error) },
-      { label: "Unload", onClick: () =>
+      // Greyed out when the tab has no webview to unload (#4).
+      { label: "Unload", disabled: !(tab.id in this.loadedStates), onClick: () =>
           invoke("tabs_unload", { id: tab.id }).then(reload).catch(console.error) },
       "separator",
       { label: "Close others", disabled: this.tabs.length <= 1, onClick: () => {

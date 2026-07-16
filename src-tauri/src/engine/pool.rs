@@ -479,6 +479,28 @@ impl TabPool {
         }
     }
 
+    /// Which tabs currently have a real webview: id → "live" | "suspended".
+    /// Cold/unloaded tabs are absent. Drives the tab-panel state dots and the
+    /// Unload menu item's enabled state.
+    pub fn loaded_states(&self) -> Vec<(i32, &'static str)> {
+        self.tabs
+            .iter()
+            .filter_map(|(&id, state)| match state {
+                TabState::Live { .. } => Some((id, "live")),
+                TabState::Suspended { .. } => Some((id, "suspended")),
+                TabState::Cold => None,
+            })
+            .collect()
+    }
+
+    /// Is this tab currently loaded (has a webview)?
+    pub fn is_loaded(&self, id: i32) -> bool {
+        matches!(
+            self.tabs.get(&id),
+            Some(TabState::Live { .. } | TabState::Suspended { .. })
+        )
+    }
+
     /// Set the Chromium memory-usage target on every live/suspended view.
     /// LOW while the window is hidden trims caches without freezing JS or
     /// pausing media; NORMAL restores full performance on show.
