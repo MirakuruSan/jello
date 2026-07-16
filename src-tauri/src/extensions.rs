@@ -6,21 +6,19 @@ use std::sync::Mutex;
 use crate::db::DbState;
 use crate::ipc_types::Extension;
 
-// ── Extension load caches (P1.1) ────────────────────────────────────────────
-// The old mechanism mutated the staging dir with remove_dir_all + copy at
-// RUNTIME while Chromium held those very files open (§2 finding #8) → corrupt
-// staging → "Extension isn't loaded". The rebuild now runs ONLY at startup, and
-// extensions are loaded into each content webview's shared profile via explicit
-// per-extension AddBrowserExtension COM calls that yield the REAL runtime id.
+// ── Extension state model ────────────────────────────────────────────────────
+// The WebView2 PROFILE is the single source of truth for what runs: extensions
+// added via AddBrowserExtension persist in it across sessions. Jello mirrors
+// its enabled set onto the profile through sync_profile_extensions (startup +
+// every install/enable/disable/uninstall) and NEVER touches the profile during
+// webview creation — AddBrowserExtension cancels in-flight navigations
+// profile-wide, which is what blanked the session-restore tab. Staging
+// (extensions_active) exists only as the stable on-disk load path; it is
+// rebuilt at startup and additively updated at runtime (never wiped live).
 
-/// Enabled extensions, cached so the content-webview creation path (main thread)
-/// can load them WITHOUT a DB round trip. Refreshed at startup and on
-/// install/enable/disable/uninstall.
+/// Enabled extensions, cached so profile sync needs no DB round trip.
+/// Refreshed at startup and on install/enable/disable/uninstall.
 static ENABLED_EXTS: Mutex<Vec<Extension>> = Mutex::new(Vec::new());
-/// store_ids already AddBrowserExtension'd into the shared profile this session
-/// (the profile is shared across all non-incognito webviews, so one load covers
-/// the session). Optimistically inserted at issue time; removed on failure.
-static LOADED_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// store_id → real runtime chrome-extension:// id, captured from
 /// AddBrowserExtension's completed handler. Replaces path-hash guessing.
 static RUNTIME_IDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -47,34 +45,11 @@ pub fn runtime_id_for(store_id: &str) -> Option<String> {
         .map(|(_, r)| r.clone())
 }
 
-/// Load every enabled extension into this webview's (shared) profile via explicit
-/// per-extension `AddBrowserExtension`. Failures are per-extension and never
-/// affect the others. Reads only the cache + filesystem — no DB. Skips ids
-/// already loaded this session.
-pub fn load_all_enabled(app: &AppHandle, webview: &tauri::Webview<tauri::Wry>) {
-    #[cfg(target_os = "windows")]
-    {
-        let active = active_extensions_dir(app);
-        let exts = ENABLED_EXTS.lock().unwrap().clone();
-        for ext in exts {
-            {
-                let mut loaded = LOADED_IDS.lock().unwrap();
-                if loaded.iter().any(|s| s == &ext.id) {
-                    continue;
-                }
-                loaded.push(ext.id.clone()); // optimistic — removed on failure below
-            }
-            let dir = active.join(&ext.id);
-            if !dir.join("manifest.json").exists() {
-                LOADED_IDS.lock().unwrap().retain(|s| s != &ext.id);
-                continue;
-            }
-            add_browser_extension(webview, ext.id.clone(), dir);
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = (app, webview);
-}
+// NOTE: extensions are deliberately NEVER added per content webview. The
+// profile persists installed extensions across sessions, and AddBrowserExtension
+// cancels in-flight navigations profile-wide — issuing it during tab creation
+// was the "restored tab loads a blank page" bug. All profile mutation goes
+// through sync_profile_extensions (startup + install/enable/disable/uninstall).
 
 /// Remove from the SHARED WebView2 profile every extension that is not in the
 /// enabled set. `AddBrowserExtension` PERSISTS the extension in the profile
@@ -93,12 +68,17 @@ pub fn sync_profile_extensions(app: &AppHandle, webview: &tauri::Webview<tauri::
         // Removal only ever targets ids OUTSIDE this list, so an in-flight
         // AddBrowserExtension of an enabled extension can never be clobbered.
         let active = active_extensions_dir(app);
-        let mut expected: Vec<String> = ENABLED_EXTS
+        // (expected runtime id, store id, staged folder) per enabled extension.
+        let enabled: Vec<(String, String, PathBuf)> = ENABLED_EXTS
             .lock()
             .unwrap()
             .iter()
-            .map(|e| chromium_unpacked_id(&active.join(&e.id)))
+            .map(|e| {
+                let dir = active.join(&e.id);
+                (chromium_unpacked_id(&dir), e.id.clone(), dir)
+            })
             .collect();
+        let mut expected: Vec<String> = enabled.iter().map(|(rid, _, _)| rid.clone()).collect();
         expected.extend(RUNTIME_IDS.lock().unwrap().iter().map(|(_, r)| r.clone()));
         let _ = webview.with_webview(move |w| unsafe {
             use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -122,6 +102,7 @@ pub fn sync_profile_extensions(app: &AppHandle, webview: &tauri::Webview<tauri::
                     return;
                 }
             };
+            let profile7_add = profile7.clone();
             let handler = ProfileGetBrowserExtensionsCompletedHandler::create(Box::new(
                 move |result: windows::core::Result<()>,
                       list: Option<ICoreWebView2BrowserExtensionList>| {
@@ -132,6 +113,7 @@ pub fn sync_profile_extensions(app: &AppHandle, webview: &tauri::Webview<tauri::
                             return Ok(());
                         }
                     };
+                    let mut found: Vec<String> = Vec::new();
                     let mut count = 0u32;
                     let _ = list.Count(&mut count);
                     for i in 0..count {
@@ -144,7 +126,18 @@ pub fn sync_profile_extensions(app: &AppHandle, webview: &tauri::Webview<tauri::
                             continue;
                         }
                         let rid = idp.to_string().unwrap_or_default();
-                        if rid.is_empty() || expected.iter().any(|e| e == &rid) {
+                        if rid.is_empty() {
+                            continue;
+                        }
+                        found.push(rid.clone());
+                        if expected.iter().any(|e| e == &rid) {
+                            // Record the real runtime id for the options page.
+                            if let Some((_, store, _)) = enabled.iter().find(|(r, _, _)| r == &rid) {
+                                let mut map = RUNTIME_IDS.lock().unwrap();
+                                if !map.iter().any(|(s, _)| s == store) {
+                                    map.push((store.clone(), rid.clone()));
+                                }
+                            }
                             continue;
                         }
                         // Edge/WebView2 BUILT-IN extensions (PDF viewer, clipboard,
@@ -185,6 +178,52 @@ pub fn sync_profile_extensions(app: &AppHandle, webview: &tauri::Webview<tauri::
                             );
                         }
                     }
+                    // Install enabled extensions MISSING from the profile (fresh
+                    // profile, or an install/enable done while the app was
+                    // closed). Normally this adds NOTHING — the profile persists
+                    // — which matters: AddBrowserExtension cancels in-flight
+                    // navigations profile-wide (the "restored tab loads blank"
+                    // root cause), so it must stay off the per-tab hot path.
+                    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2BrowserExtension;
+                    use webview2_com::ProfileAddBrowserExtensionCompletedHandler;
+                    use windows::core::{HSTRING, PCWSTR};
+                    for (rid, store, dir) in &enabled {
+                        if found.iter().any(|f| f == rid) || !dir.join("manifest.json").exists() {
+                            continue;
+                        }
+                        let store_cb = store.clone();
+                        let ah = ProfileAddBrowserExtensionCompletedHandler::create(Box::new(
+                            move |result: windows::core::Result<()>,
+                                  ext: Option<ICoreWebView2BrowserExtension>| {
+                                if result.is_ok() {
+                                    if let Some(ext) = ext {
+                                        let mut idp = PWSTR::null();
+                                        if ext.Id(&mut idp).is_ok() && !idp.is_null() {
+                                            let real = idp.to_string().unwrap_or_default();
+                                            if !real.is_empty() {
+                                                let mut map = RUNTIME_IDS.lock().unwrap();
+                                                match map.iter_mut().find(|(s, _)| s == &store_cb) {
+                                                    Some(e) => e.1 = real,
+                                                    None => map.push((store_cb.clone(), real)),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    tracing::info!("extensions: installed {} into profile", store_cb);
+                                } else {
+                                    tracing::warn!(
+                                        "extensions: profile install of {} failed: {:?}",
+                                        store_cb, result.err()
+                                    );
+                                }
+                                Ok(())
+                            },
+                        ));
+                        let folder = HSTRING::from(dir.to_string_lossy().to_string());
+                        if let Err(e) = profile7_add.AddBrowserExtension(PCWSTR(folder.as_ptr()), &ah) {
+                            tracing::error!("extensions: AddBrowserExtension call failed for {}: {:?}", store, e);
+                        }
+                    }
                     Ok(())
                 },
             ));
@@ -209,80 +248,6 @@ pub fn sync_profile_now(app: &AppHandle) {
     if let Some(wv) = wv {
         sync_profile_extensions(app, wv);
     }
-}
-
-/// Issue a single `AddBrowserExtension` on the webview's profile and record the
-/// real runtime id when it completes. Runs the COM work on the webview UI thread
-/// via with_webview (marshals correctly).
-#[cfg(target_os = "windows")]
-fn add_browser_extension(webview: &tauri::Webview<tauri::Wry>, store_id: String, dir: PathBuf) {
-    let path_str = dir.to_string_lossy().to_string();
-    let _ = webview.with_webview(move |w| unsafe {
-        use webview2_com::Microsoft::Web::WebView2::Win32::{
-            ICoreWebView2BrowserExtension, ICoreWebView2Profile7, ICoreWebView2_13,
-        };
-        use webview2_com::ProfileAddBrowserExtensionCompletedHandler;
-        use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
-
-        let core = match w.controller().CoreWebView2() {
-            Ok(c) => c,
-            Err(_) => {
-                LOADED_IDS.lock().unwrap().retain(|s| s != &store_id);
-                return;
-            }
-        };
-        let profile = match core.cast::<ICoreWebView2_13>().and_then(|c| c.Profile()) {
-            Ok(p) => p,
-            Err(_) => {
-                LOADED_IDS.lock().unwrap().retain(|s| s != &store_id);
-                return;
-            }
-        };
-        let profile7 = match profile.cast::<ICoreWebView2Profile7>() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("extensions: ICoreWebView2Profile7 unavailable: {:?}", e);
-                LOADED_IDS.lock().unwrap().retain(|s| s != &store_id);
-                return;
-            }
-        };
-
-        let store_cb = store_id.clone();
-        let handler = ProfileAddBrowserExtensionCompletedHandler::create(Box::new(
-            move |result: windows::core::Result<()>, ext: Option<ICoreWebView2BrowserExtension>| {
-                if result.is_ok() {
-                    if let Some(ext) = ext {
-                        let mut idp = PWSTR::null();
-                        if ext.Id(&mut idp).is_ok() && !idp.is_null() {
-                            let rid = idp.to_string().unwrap_or_default();
-                            if !rid.is_empty() {
-                                let mut map = RUNTIME_IDS.lock().unwrap();
-                                match map.iter_mut().find(|(s, _)| s == &store_cb) {
-                                    Some(e) => e.1 = rid,
-                                    None => map.push((store_cb.clone(), rid)),
-                                }
-                            }
-                        }
-                    }
-                    tracing::info!("extensions: AddBrowserExtension ok for {}", store_cb);
-                } else {
-                    // The common failure is the shared profile already having this
-                    // extension registered (0x80004005) — the extension still
-                    // works and options resolves via the path-hash fallback. Keep
-                    // it marked loaded (don't retry on every new tab → no error
-                    // spam) and log at warn, not error.
-                    tracing::warn!("extensions: AddBrowserExtension for {} returned {:?} (likely already loaded)", store_cb, result.err());
-                }
-                Ok(())
-            },
-        ));
-
-        let folder = HSTRING::from(path_str.as_str());
-        if let Err(e) = profile7.AddBrowserExtension(PCWSTR(folder.as_ptr()), &handler) {
-            tracing::error!("extensions: AddBrowserExtension call failed for {}: {:?}", store_id, e);
-            LOADED_IDS.lock().unwrap().retain(|s| s != &store_id);
-        }
-    });
 }
 
 /// Copy ONE extension's versioned source into the active staging dir without
@@ -658,6 +623,8 @@ pub async fn extensions_install(
     // (§2 finding #8). The extension loads into newly opened tabs immediately.
     stage_one_additive(&app, &ext);
     refresh_enabled_cache(&db);
+    // Install into the live profile now (extensions load without a restart).
+    sync_profile_now(&app);
     Ok(ext)
 }
 
@@ -696,6 +663,8 @@ pub async fn extensions_install_file(
     let ext = install_from_zip_bytes(zip_bytes, id, true, &db, &app).await?;
     stage_one_additive(&app, &ext);
     refresh_enabled_cache(&db);
+    // Install into the live profile now (extensions load without a restart).
+    sync_profile_now(&app);
     Ok(ext)
 }
 
@@ -739,12 +708,10 @@ pub async fn extensions_set_enabled(
         }
     }
     refresh_enabled_cache(&db);
-    // Mirror the change onto the live WebView2 profile: without this, a
-    // disabled extension keeps RUNNING until the profile is synced (the profile
-    // persists AddBrowserExtension across sessions).
-    if !enabled {
-        sync_profile_now(&app);
-    }
+    // Mirror the change onto the live WebView2 profile immediately: the profile
+    // persists extensions across sessions, so enable adds it now (no restart)
+    // and disable removes it now (it would otherwise keep running).
+    sync_profile_now(&app);
     Ok(())
 }
 
@@ -816,6 +783,8 @@ pub async fn extensions_install_ubo(
     let ext = install_from_zip_bytes(bytes, id, false, &db, &app).await?;
     stage_one_additive(&app, &ext);
     refresh_enabled_cache(&db);
+    // Install into the live profile now (extensions load without a restart).
+    sync_profile_now(&app);
     Ok(ext)
 }
 
@@ -934,10 +903,10 @@ pub async fn extensions_open_options(
         .build()
         .map_err(|e| e.to_string())?;
 
-    // Load every enabled extension into this window's (shared) profile so the
-    // page resolves even if no content tab has loaded it yet — per-extension COM
-    // load, no destructive extensions_path staging.
-    load_all_enabled(&app, win.as_ref());
+    // The shared profile already holds every enabled extension (persisted;
+    // sync_profile_extensions keeps it true), so no per-window load is needed —
+    // and issuing AddBrowserExtension here would cancel this window's own
+    // initial navigation to the extension page.
 
     // The window's INITIAL document load can render a non-web-accessible
     // extension page (e.g. uBOL's dashboard). A later programmatic navigate()

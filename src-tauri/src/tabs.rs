@@ -56,6 +56,24 @@ pub fn tabs_activate_impl(
         }
     }
 
+    // Self-heal a lost initial navigation: if the freshly activated view is
+    // still on about:blank shortly after activation while a real URL was meant
+    // to load (a canceled navigation — e.g. something touched the profile while
+    // the restore was in flight), re-issue it. No-op in the healthy case.
+    {
+        let pool = pool.clone();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            let Some(url) = crate::engine::pool::TabPool::stored_url_pub(&db, id) else { return };
+            if let Ok(p) = pool.lock() {
+                if p.get_active_tab_id() == Some(id) {
+                    p.heal_blank_tab(id, &url);
+                }
+            }
+        });
+    }
+
     Ok(())
 }
 

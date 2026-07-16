@@ -512,7 +512,7 @@ pub fn window_new_incognito_impl(app: &AppHandle) -> Result<(), String> {
             .incognito(true)
             // Match the other app windows' extensions setting so WebView2 doesn't
             // refuse to create the environment (the capture-window constraint);
-            // incognito still loads no extensions (we skip load_all_enabled).
+            // the InPrivate profile holds no installed extensions, so none load.
             .browser_extensions_enabled(true)
             .build()
             .map_err(|e| e.to_string())?;

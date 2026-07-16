@@ -7,7 +7,7 @@ glass and gets out of your way, uses global hotkeys and shortcuts to summun and 
 
 I mainly build this for my own use, I wanted something lightweight that I can summon instantly using a hotkey from anywhere everytime I wanted to look up or research something. I was annoyed by the time it took to launch other browsers and the memory resources they were using.
 
-> Status: **v0.4.6** — active development.
+> Status: **v0.4.7** — active development.
 
 ## Features
 

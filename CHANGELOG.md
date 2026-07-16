@@ -4,6 +4,20 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.7] — 2026-07-17
+
+### Fixed
+- **Restored tabs load reliably on startup.** Loading extensions during tab
+  creation was cancelling the tab's own first navigation — the restored tab sat
+  on a blank page that even Reload couldn't fix. Extensions are now applied to
+  the browser profile once at startup (and on install/enable/disable), never
+  while a page is loading; as a safety net, a tab that still ends up blank is
+  detected and re-navigated automatically, and Reload recovers it too.
+- **Incognito works again.** Incognito content webviews were created with a
+  mismatched browser-environment setting, so they came up dead — opening any
+  website in an incognito window did nothing. New incognito tabs now load
+  normally (still with an isolated, extension-free, non-recording session).
+
 ## [0.4.6] — 2026-07-16
 
 ### Fixed

@@ -292,27 +292,29 @@ impl TabPool {
             let label = label.clone();
             let pos = LogicalPosition::new(rect.x as f64, rect.y as f64);
             let size = LogicalSize::new(rect.width as f64, rect.height as f64);
-            let app_for_ext = app.clone();
             app.run_on_main_thread(move || {
                 let webview_url = WebviewUrl::External(
                     url.parse().unwrap_or_else(|_| "about:blank".parse().unwrap())
                 );
                 let mut webview_builder = WebviewBuilder::new(&label, webview_url);
                 if is_incognito {
-                    webview_builder = webview_builder.incognito(true);
+                    // browser_extensions_enabled MUST match the parent incognito
+                    // window's setting: WebView2 webviews sharing an app-data dir
+                    // must agree on environment options or creation silently
+                    // fails (the 0.4.1 capture-window lesson). Without this the
+                    // incognito content webview was born dead — "open a website
+                    // in incognito does nothing". The InPrivate profile holds no
+                    // installed extensions, so none actually load.
+                    webview_builder = webview_builder.incognito(true).browser_extensions_enabled(true);
                 } else {
-                    // Enable extensions on the shared profile; the actual loading
-                    // is done per-extension via explicit AddBrowserExtension COM
-                    // calls after add_child (P1.1) — NOT the destructive
-                    // extensions_path staging that corrupted under a live session.
+                    // Enable extensions on the shared profile. The profile
+                    // already holds every enabled extension (persisted, kept in
+                    // sync at startup/install) — do NOT AddBrowserExtension
+                    // here: it cancels this webview's own initial navigation
+                    // (the "restored tab loads a blank page" root cause).
                     webview_builder = webview_builder.browser_extensions_enabled(true);
                 }
                 let res = window.add_child(webview_builder, pos, size).map_err(|e| e.to_string());
-                if let Ok(ref wv) = res {
-                    if !is_incognito {
-                        crate::extensions::load_all_enabled(&app_for_ext, wv);
-                    }
-                }
                 let _ = tx.send(res);
             }).map_err(|e| e.to_string())?;
         }
@@ -549,19 +551,66 @@ impl TabPool {
         self.with_active_view(|v| v.reload())
     }
 
-    /// Reload the active tab; if it is COLD (e.g. its startup activation failed
-    /// and left a blank page), a plain Reload has no webview to act on — silent
-    /// no-op, which is why "refresh does nothing" on a failed restore. Fall back
-    /// to re-activating, which (re)creates the webview and loads the URL.
+    /// If tab `id` has a live view whose document is still about:blank even
+    /// though `url` was supposed to load, re-issue the navigation. This is the
+    /// signature of a CANCELED initial navigation (WebView2 aborts in-flight
+    /// navigations profile-wide when an extension is added, among other causes):
+    /// the tab looks open but shows nothing, and Reload would only reload the
+    /// blank document. Returns true when a heal was issued.
+    pub fn heal_blank_tab(&self, id: i32, url: &str) -> bool {
+        if url.is_empty() || url == "about:blank" {
+            return false;
+        }
+        if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.get(&id) {
+            let cur = view.snapshot().url;
+            if cur.is_empty() || cur == "about:blank" {
+                tracing::warn!(
+                    "tab {}: initial navigation was lost (blank document, expected {}) — re-navigating",
+                    id, url
+                );
+                view.navigate(url);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Public wrapper for the post-activation heal check (tabs.rs).
+    pub fn stored_url_pub(db: &crate::db::DbState, id: i32) -> Option<String> {
+        Self::stored_url(db, id)
+    }
+
+    /// The DB/incognito-store URL for a tab (what the tab is SUPPOSED to show).
+    fn stored_url(db: &crate::db::DbState, id: i32) -> Option<String> {
+        if id < 0 {
+            return crate::incognito::get_incognito_tab(id).map(|t| t.url);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db = db.clone();
+        db.execute(move |conn| {
+            let _ = tx.send(tabs_repo::get_tab(conn, id).ok().flatten().map(|t| t.url));
+        });
+        rx.recv().ok().flatten()
+    }
+
+    /// Reload the active tab, recovering the two broken states a plain Reload
+    /// can't: a COLD tab (failed activation — nothing to reload) is re-activated,
+    /// and a live view stuck on about:blank (canceled initial navigation) is
+    /// re-navigated to its stored URL.
     pub fn reload_or_reactivate(
         &mut self,
         db: &crate::db::DbState,
         app: &AppHandle,
     ) -> Result<(), String> {
+        let id = self.active_tab_id.ok_or_else(|| "No active tab".to_string())?;
+        if let Some(url) = Self::stored_url(db, id) {
+            if self.heal_blank_tab(id, &url) {
+                return Ok(());
+            }
+        }
         if self.nav_reload().is_ok() {
             return Ok(());
         }
-        let id = self.active_tab_id.ok_or_else(|| "No active tab".to_string())?;
         tracing::warn!("nav_reload: active tab {} has no live view — re-activating", id);
         self.activate_tab(db, id, app)
     }

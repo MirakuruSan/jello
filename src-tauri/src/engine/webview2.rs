@@ -408,7 +408,12 @@ impl WebView2ContentView {
                         // so the overlay can show a top progress bar (Phase 8).
                         use webview2_com::{NavigationStartingEventHandler, NavigationCompletedEventHandler};
                         let ns_app = meta_app.clone();
-                        let ns_handler = NavigationStartingEventHandler::create(Box::new(move |_s, _a| {
+                        let ns_handler = NavigationStartingEventHandler::create(Box::new(move |_s, a| {
+                            if let Some(a) = a {
+                                let mut urip = windows::core::PWSTR::null();
+                                let url = unsafe { a.Uri(&mut urip).ok().and_then(|_| urip.to_string().ok()) }.unwrap_or_default();
+                                tracing::info!("nav starting tab {}: {}", meta_view_id, url);
+                            }
                             let _ = ns_app.emit("nav:loading", serde_json::json!({"tabId": meta_view_id, "loading": true}));
                             Ok(())
                         }));
@@ -416,7 +421,16 @@ impl WebView2ContentView {
                         let _ = core.add_NavigationStarting(&ns_handler, &mut tok4 as *mut i64);
 
                         let nc_app = meta_app.clone();
-                        let nc_handler = NavigationCompletedEventHandler::create(Box::new(move |_s, _a| {
+                        let nc_handler = NavigationCompletedEventHandler::create(Box::new(move |_s, a| {
+                            if let Some(a) = a {
+                                let mut ok = windows::core::BOOL::default();
+                                let mut status = webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_ERROR_STATUS::default();
+                                unsafe {
+                                    let _ = a.IsSuccess(&mut ok);
+                                    let _ = a.WebErrorStatus(&mut status);
+                                }
+                                tracing::info!("nav completed tab {}: success={:?} status={:?}", meta_view_id, ok.as_bool(), status);
+                            }
                             let _ = nc_app.emit("nav:loading", serde_json::json!({"tabId": meta_view_id, "loading": false}));
                             Ok(())
                         }));
