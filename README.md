@@ -3,7 +3,7 @@
 A fast, chromeless web browser for Windows built on [Tauri](https://tauri.app/)
 and WebView2. Jello puts the page first — the entire window is the web page, and
 all browser chrome (tabs, address bar, controls) floats above it as translucent
-glass and gets out of your way, uses global hotkeys and shortcuts to summun and navigate it quickly. It has Zero telemetry, zero bloat, no nonsense, built for privacy.
+glass and gets out of your way, uses global hotkeys and shortcuts to summon and navigate quickly. It has Zero telemetry, zero bloat, no nonsense, built for privacy. Jello have built-in seach from screenshot and can exract text from them as well using ocr. Chrome extensions are supported.
 
 I mainly build this for my own use, I wanted something lightweight that I can summon instantly using a hotkey from anywhere everytime I wanted to look up or research something. I was annoyed by the time it took to launch other browsers and the memory resources they were using.
 
