@@ -549,6 +549,23 @@ impl TabPool {
         self.with_active_view(|v| v.reload())
     }
 
+    /// Reload the active tab; if it is COLD (e.g. its startup activation failed
+    /// and left a blank page), a plain Reload has no webview to act on — silent
+    /// no-op, which is why "refresh does nothing" on a failed restore. Fall back
+    /// to re-activating, which (re)creates the webview and loads the URL.
+    pub fn reload_or_reactivate(
+        &mut self,
+        db: &crate::db::DbState,
+        app: &AppHandle,
+    ) -> Result<(), String> {
+        if self.nav_reload().is_ok() {
+            return Ok(());
+        }
+        let id = self.active_tab_id.ok_or_else(|| "No active tab".to_string())?;
+        tracing::warn!("nav_reload: active tab {} has no live view — re-activating", id);
+        self.activate_tab(db, id, app)
+    }
+
     pub fn nav_stop(&self) -> Result<(), String> {
         self.with_active_view(|v| v.stop())
     }

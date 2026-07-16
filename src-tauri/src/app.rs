@@ -225,8 +225,12 @@ pub async fn nav_forward(pool: State<'_, Arc<Mutex<crate::engine::pool::TabPool>
 }
 
 #[tauri::command]
-pub async fn nav_reload(pool: State<'_, Arc<Mutex<crate::engine::pool::TabPool>>>) -> Result<(), String> {
-    pool.lock().unwrap().nav_reload()
+pub async fn nav_reload(
+    pool: State<'_, Arc<Mutex<crate::engine::pool::TabPool>>>,
+    db: State<'_, crate::db::DbState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    pool.lock().unwrap().reload_or_reactivate(&db, &app)
 }
 
 #[tauri::command]
@@ -995,6 +999,21 @@ pub fn run() {
 
             let staged = crate::extensions::rebuild_active_extensions(app.handle(), &db_state);
             tracing::info!("staged {} browser extension(s) for loading", staged);
+
+            // Purge stale PROFILE extensions: AddBrowserExtension persists in the
+            // shared WebView2 profile across sessions, so disable/uninstall/dedupe
+            // that only touched the DB + staging left every previously-added
+            // extension running forever (stacked ad blockers → slow page loads).
+            // The chrome webview shares the profile, so sync on it at startup.
+            if let Some(wv) = app.webviews().get("main") {
+                crate::extensions::sync_profile_extensions(app.handle(), wv);
+                // Engine-death recovery (sleep/resume bug): if the WebView2
+                // browser process dies, every webview — chrome included — goes
+                // permanently dead while the event loop lives on. Watch for it
+                // and self-restart (session persists in the DB).
+                crate::windows::register_engine_watch(app.handle(), wv);
+            }
+            crate::windows::register_resume_watch(app.handle());
 
             // Deeplink registry registration
             crate::deeplink::register_jello_protocol();

@@ -171,7 +171,20 @@ pub async fn tabs_activate(
     pool: State<'_, Arc<Mutex<TabPool>>>,
     app: AppHandle,
 ) -> Result<(), String> {
-    tabs_activate_impl(id, &db, &pool, &app)
+    match tabs_activate_impl(id, &db, &pool, &app) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            // Startup restore can hit a transient failure (webview creation
+            // while the main thread is still in its launch burst) that left the
+            // restored tab blank with no error surfaced. Log and retry once.
+            tracing::warn!("tabs_activate({}) failed: {} — retrying once", id, first);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            tabs_activate_impl(id, &db, &pool, &app).map_err(|e| {
+                tracing::error!("tabs_activate({}) retry failed: {}", id, e);
+                e
+            })
+        }
+    }
 }
 
 #[command]

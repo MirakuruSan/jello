@@ -62,6 +62,152 @@ pub fn force_hide_main() {
     }
 }
 
+// ── Engine health: sleep/resume + browser-process-death recovery (bug: after
+// the PC sleeps with Jello in the tray, Jello neither works nor shows until a
+// full manual restart — the WebView2 browser process can die across a sleep,
+// leaving EVERY webview, including the chrome overlay, permanently dead while
+// the tao event loop keeps running). Two independent detectors, one recovery:
+// restart the process (session/tabs persist in the DB).
+
+/// The WebView2 browser process id, captured at startup from the main webview.
+static BROWSER_PID: AtomicIsize = AtomicIsize::new(0);
+
+/// Restart Jello to recover from a dead WebView2 engine. Saves the session
+/// first; tabs/history persist in the DB, so this is a clean self-heal.
+fn restart_after_engine_death(app: &AppHandle) {
+    tracing::error!("WebView2 engine is dead — restarting Jello to recover");
+    crate::sessions::on_exit(app);
+    app.restart();
+}
+
+/// Detector 1: the official `ProcessFailed` event. Registered on the main
+/// chrome webview (the browser process is shared, so one registration sees a
+/// browser-process exit). Renderer crashes are left to WebView2's own sad-tab
+/// handling; only an engine-level death triggers the restart.
+pub fn register_engine_watch(app: &AppHandle, webview: &tauri::Webview<tauri::Wry>) {
+    #[cfg(target_os = "windows")]
+    {
+        let app_h = app.clone();
+        let _ = webview.with_webview(move |w| unsafe {
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                COREWEBVIEW2_PROCESS_FAILED_KIND, COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+            };
+            use webview2_com::ProcessFailedEventHandler;
+            let core = match w.controller().CoreWebView2() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("engine watch: CoreWebView2 unavailable: {:?}", e);
+                    return;
+                }
+            };
+            let mut pid = 0u32;
+            if core.BrowserProcessId(&mut pid).is_ok() && pid != 0 {
+                BROWSER_PID.store(pid as isize, Ordering::SeqCst);
+            }
+            let handler = ProcessFailedEventHandler::create(Box::new(move |_sender, args| {
+                if let Some(args) = args {
+                    let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                    let _ = args.ProcessFailedKind(&mut kind);
+                    tracing::error!("webview2 ProcessFailed: kind={:?}", kind);
+                    if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
+                        let app_r = app_h.clone();
+                        // Never restart from inside the COM event handler.
+                        std::thread::spawn(move || restart_after_engine_death(&app_r));
+                    }
+                }
+                Ok(())
+            }));
+            let mut token: i64 = 0;
+            if let Err(e) = core.add_ProcessFailed(&handler, &mut token as *mut i64) {
+                tracing::warn!("engine watch: add_ProcessFailed failed: {:?}", e);
+            }
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (app, webview);
+}
+
+#[cfg(target_os = "windows")]
+fn process_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => {
+                let mut code = 0u32;
+                let alive = GetExitCodeProcess(h, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+                let _ = CloseHandle(h);
+                alive
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+static RESUME_APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+/// Detector 2: system resume. If the browser process was killed while the PC
+/// slept (ProcessFailed can be missed/undelivered across a suspend), verify it
+/// is still alive shortly after resume and restart if not. Also re-register the
+/// global hotkeys immediately — the OS can silently drop them across a sleep
+/// (the watchdog would catch it, but only within a minute).
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn on_power_event(
+    _context: *const core::ffi::c_void,
+    event_type: u32,
+    _setting: *const core::ffi::c_void,
+) -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::{PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND};
+    if event_type == PBT_APMRESUMEAUTOMATIC || event_type == PBT_APMRESUMESUSPEND {
+        if let Some(app) = RESUME_APP.get() {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                tracing::info!("system resumed from sleep — re-registering hotkeys, checking engine");
+                if let Err(e) = crate::app::reregister_all_shortcuts(&app) {
+                    tracing::warn!("resume: hotkey re-registration failed: {}", e);
+                }
+                let pid = BROWSER_PID.load(Ordering::SeqCst);
+                if pid != 0 && !process_alive(pid as u32) {
+                    restart_after_engine_death(&app);
+                }
+            });
+        }
+    }
+    0
+}
+
+/// Subscribe to suspend/resume notifications (works for a tray app with no
+/// visible window — no WM_POWERBROADCAST needed).
+pub fn register_resume_watch(app: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Power::{
+            RegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_CALLBACK;
+        let _ = RESUME_APP.set(app.clone());
+        // Leaked on purpose: the subscription lives for the process lifetime.
+        let params = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+            Callback: Some(on_power_event),
+            Context: std::ptr::null_mut(),
+        }));
+        unsafe {
+            match RegisterSuspendResumeNotification(
+                HANDLE(params as *mut _ as *mut core::ffi::c_void),
+                DEVICE_NOTIFY_CALLBACK,
+            ) {
+                Ok(_) => tracing::info!("suspend/resume notifications registered"),
+                Err(e) => tracing::warn!("RegisterSuspendResumeNotification failed: {:?}", e),
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = app;
+}
+
 /// OS-level truth: is the main window actually visible right now? Reads
 /// `IsWindowVisible` on the stored HWND rather than trusting tauri's
 /// `is_visible()` (which can report true while the window is hidden — see §2).

@@ -4,6 +4,22 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.6] — 2026-07-16
+
+### Fixed
+- **Pages load much faster.** Extensions removed or disabled in the past kept
+  silently running in the browser profile — two copies of uBlock Origin plus
+  several stale extensions were filtering every single request. The profile is
+  now kept in sync with your extension list, at startup and immediately on
+  disable/uninstall.
+- **"Restore tabs on startup" no longer lands on a stuck blank page.** A failed
+  restore is retried automatically, and Reload now recovers a tab whose page
+  never loaded (it previously did nothing on such a tab).
+- **Jello recovers after PC sleep.** If Windows kills the browser engine while
+  the PC sleeps (or it dies at any other time), Jello detects it and restarts
+  itself automatically — no more dead, invisible window until a manual restart.
+  Global hotkeys are also re-registered immediately on resume.
+
 ## [0.4.5] — 2026-07-16
 
 ### Fixed

@@ -76,6 +76,141 @@ pub fn load_all_enabled(app: &AppHandle, webview: &tauri::Webview<tauri::Wry>) {
     let _ = (app, webview);
 }
 
+/// Remove from the SHARED WebView2 profile every extension that is not in the
+/// enabled set. `AddBrowserExtension` PERSISTS the extension in the profile
+/// across sessions, so disable / uninstall / dedupe that only touched the DB
+/// and staging left every previously-added extension silently running forever.
+/// (Observed live on 0.4.5: SIX extensions active — two full uBlock Origins
+/// among them — while the DB said one; every request paid the stacked filter
+/// passes → "everything loads slow".) Runs once per session after the first
+/// content webview loads its extensions, and again on disable/uninstall.
+pub fn sync_profile_extensions(app: &AppHandle, webview: &tauri::Webview<tauri::Wry>) {
+    #[cfg(target_os = "windows")]
+    {
+        // Expected runtime ids for the ENABLED set: Chromium derives an unpacked
+        // extension's id deterministically from its staging path, so compute
+        // them synchronously; also trust any real ids captured this session.
+        // Removal only ever targets ids OUTSIDE this list, so an in-flight
+        // AddBrowserExtension of an enabled extension can never be clobbered.
+        let active = active_extensions_dir(app);
+        let mut expected: Vec<String> = ENABLED_EXTS
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| chromium_unpacked_id(&active.join(&e.id)))
+            .collect();
+        expected.extend(RUNTIME_IDS.lock().unwrap().iter().map(|(_, r)| r.clone()));
+        let _ = webview.with_webview(move |w| unsafe {
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2BrowserExtensionList, ICoreWebView2Profile7, ICoreWebView2_13,
+            };
+            use webview2_com::{
+                BrowserExtensionRemoveCompletedHandler, ProfileGetBrowserExtensionsCompletedHandler,
+            };
+            use windows::core::{Interface, PWSTR};
+
+            let profile7 = match w
+                .controller()
+                .CoreWebView2()
+                .and_then(|c| c.cast::<ICoreWebView2_13>())
+                .and_then(|c| c.Profile())
+                .and_then(|p| p.cast::<ICoreWebView2Profile7>())
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("extensions: profile unavailable for sync: {:?}", e);
+                    return;
+                }
+            };
+            let handler = ProfileGetBrowserExtensionsCompletedHandler::create(Box::new(
+                move |result: windows::core::Result<()>,
+                      list: Option<ICoreWebView2BrowserExtensionList>| {
+                    let list = match (result, list) {
+                        (Ok(()), Some(l)) => l,
+                        (r, _) => {
+                            tracing::warn!("extensions: GetBrowserExtensions failed: {:?}", r.err());
+                            return Ok(());
+                        }
+                    };
+                    let mut count = 0u32;
+                    let _ = list.Count(&mut count);
+                    for i in 0..count {
+                        let ext = match list.GetValueAtIndex(i) {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+                        let mut idp = PWSTR::null();
+                        if ext.Id(&mut idp).is_err() || idp.is_null() {
+                            continue;
+                        }
+                        let rid = idp.to_string().unwrap_or_default();
+                        if rid.is_empty() || expected.iter().any(|e| e == &rid) {
+                            continue;
+                        }
+                        // Edge/WebView2 BUILT-IN extensions (PDF viewer, clipboard,
+                        // …) — not ours, not removable (E_FAIL), and the PDF viewer
+                        // is load-bearing. Never touch them.
+                        const EDGE_BUILTINS: [&str; 3] = [
+                            "mhjfbmdgcfjbbpaeojofohoefgiehjai", // Microsoft Edge PDF Viewer
+                            "dgiklkfkllikcanfonkcabmbdfmgleag", // Microsoft Clipboard Extension
+                            "jmjflgjpcpepeafmmgdpfkogkghcpiha", // Edge relevant text changes
+                        ];
+                        if EDGE_BUILTINS.contains(&rid.as_str()) {
+                            continue;
+                        }
+                        let mut namep = PWSTR::null();
+                        let name = if ext.Name(&mut namep).is_ok() && !namep.is_null() {
+                            namep.to_string().unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let rid_cb = rid.clone();
+                        let rh = BrowserExtensionRemoveCompletedHandler::create(Box::new(
+                            move |r: windows::core::Result<()>| {
+                                match r {
+                                    Ok(()) => tracing::info!(
+                                        "extensions: removed stale profile extension {}", rid_cb
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        "extensions: failed to remove stale profile extension {}: {:?}",
+                                        rid_cb, e
+                                    ),
+                                }
+                                Ok(())
+                            },
+                        ));
+                        if ext.Remove(&rh).is_ok() {
+                            tracing::info!(
+                                "extensions: removing stale profile extension {} ({})", rid, name
+                            );
+                        }
+                    }
+                    Ok(())
+                },
+            ));
+            let _ = profile7.GetBrowserExtensions(&handler);
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (app, webview);
+}
+
+/// Run [`sync_profile_extensions`] on any live non-incognito webview (they all
+/// share the default profile). Used after disable/uninstall so the change takes
+/// effect immediately instead of only after a restart.
+pub fn sync_profile_now(app: &AppHandle) {
+    let webviews = app.webviews();
+    let wv = webviews.get("main").or_else(|| {
+        webviews.iter().find_map(|(label, wv)| {
+            let id: Option<i32> = label.strip_prefix("content_tab_").and_then(|s| s.parse().ok());
+            (id.map_or(false, |i| i > 0)).then_some(wv)
+        })
+    });
+    if let Some(wv) = wv {
+        sync_profile_extensions(app, wv);
+    }
+}
+
 /// Issue a single `AddBrowserExtension` on the webview's profile and record the
 /// real runtime id when it completes. Runs the COM work on the webview UI thread
 /// via with_webview (marshals correctly).
@@ -604,6 +739,12 @@ pub async fn extensions_set_enabled(
         }
     }
     refresh_enabled_cache(&db);
+    // Mirror the change onto the live WebView2 profile: without this, a
+    // disabled extension keeps RUNNING until the profile is synced (the profile
+    // persists AddBrowserExtension across sessions).
+    if !enabled {
+        sync_profile_now(&app);
+    }
     Ok(())
 }
 
@@ -697,6 +838,9 @@ pub async fn extensions_uninstall(
     });
     rx.recv().unwrap_or(Ok(0)).map(|_| ()).map_err(|e| e.to_string())?;
     refresh_enabled_cache(&db);
+    // Remove it from the live WebView2 profile too — the profile persists
+    // AddBrowserExtension across sessions, so a DB-only uninstall kept running.
+    sync_profile_now(&app);
     Ok(())
 }
 
