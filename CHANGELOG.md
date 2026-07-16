@@ -7,6 +7,18 @@ All notable changes to Jello are documented here. This project adheres to
 ## [0.4.4] — 2026-07-15
 
 ### Fixed
+- **Keyboard focus follows you everywhere.** Summoning the window, Ctrl+Alt+L,
+  Ctrl+T, address-bar navigation, and tab switching now put the keyboard where
+  you expect (page or search pill) — no more clicking first before you can type.
+- **Settings and tab panels are readable.** Panels get a solid background so
+  page text no longer bleeds through the glass.
+
+### Changed
+- **Lighter when hidden.** Hiding Jello immediately trims Chromium memory (media
+  and downloads keep running), and after a minute hidden, background tabs are
+  suspended — playing audio and the active tab are never touched. Memory returns
+  to full performance on summon.
+- Removed unused code and an unused dependency.
 - **The main window can no longer get permanently stuck hidden.** Summon, tray
   click, and relaunch now verify visibility at the OS level and fall back to a
   raw Win32 show/hide, so a degraded runtime state (where the window plumbing
