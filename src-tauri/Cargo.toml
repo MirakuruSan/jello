@@ -2,7 +2,7 @@
 name = "jello"
 version = "0.4.5"
 description = "A Jello Browser"
-authors = ["you"]
+authors = ["MirakuruSan"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

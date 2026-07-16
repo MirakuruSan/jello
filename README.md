@@ -5,7 +5,7 @@ and WebView2. Jello puts the page first — the entire window is the web page, a
 all browser chrome (tabs, address bar, controls) floats above it as translucent
 glass and gets out of your way.
 
-> Status: **v0.4.0** — active development.
+> Status: **v0.4.5** — active development.
 
 ## Features
 
@@ -14,9 +14,9 @@ glass and gets out of your way.
 - **Quick palette** (Alt+Space style) for search, history, bookmarks, and tabs,
   plus an in-window address bar (Ctrl+L).
 - **Browser extensions that actually run.** Install Chrome extensions (e.g.
-  uBlock Origin Lite) by Web Store URL or ID — they load into content webviews
-  and block ads/trackers. Manage them in Settings; a banner offers one-click
-  install when you visit the Chrome Web Store.
+  uBlock Origin) by Web Store or Edge Add-ons URL, from a local .crx/.zip file,
+  or by drag-and-drop — they load into content webviews and block ads/trackers.
+  Manage them in Settings; a banner offers one-click install on store pages.
 - **Native context menus** on pages, tabs, and the address bar.
 - **Screenshot & OCR capture** with copy / save / search / Ask-AI actions.
 - **Tab management** — virtualized tab panel, MRU switching (Ctrl+Tab),
