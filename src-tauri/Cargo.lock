@@ -2232,7 +2232,6 @@ name = "jello"
 version = "0.4.4"
 dependencies = [
  "arboard",
- "global-hotkey",
  "image",
  "nucleo-matcher",
  "reqwest 0.12.28",

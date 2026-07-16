@@ -230,6 +230,10 @@ impl TabPool {
             self.tabs.insert(id, TabState::Cold);
             // Chrome layer IS the page now — overlay must take input everywhere.
             crate::app::overlay_mark_content(app, &window_label, false);
+            // Give the chrome overlay keyboard focus so the new-tab search pill
+            // is typable immediately (Ctrl+T from a focused page otherwise left
+            // focus in the old content webview).
+            crate::windows::focus_chrome(app, &window_label);
             return Ok(());
         }
 
@@ -240,6 +244,9 @@ impl TabPool {
             *last_active = Instant::now();
             view.set_bounds(rect);
             view.set_visible(true);
+            // Activation = the user is switching to this page: move keyboard
+            // focus into it so accelerators/typing work without a click.
+            view.focus();
             raise_overlay(app, &window_label);
             crate::app::overlay_mark_content(app, &window_label, true);
             return Ok(());
@@ -251,6 +258,7 @@ impl TabPool {
                 view.resume();
                 view.set_bounds(rect);
                 view.set_visible(true);
+                view.focus();
                 self.tabs.insert(id, TabState::Live {
                     view,
                     last_active: Instant::now(),
@@ -323,6 +331,7 @@ impl TabPool {
         let view = Box::new(WebView2ContentView::new(ViewId(id as u32), webview, is_incognito));
         view.set_bounds(rect);
         view.set_visible(true);
+        view.focus();
 
         // Restore scroll position after DOMContentLoaded
         if db_tab.scroll_y > 0.0 {
@@ -470,6 +479,17 @@ impl TabPool {
         }
     }
 
+    /// Set the Chromium memory-usage target on every live/suspended view.
+    /// LOW while the window is hidden trims caches without freezing JS or
+    /// pausing media; NORMAL restores full performance on show.
+    pub fn set_memory_target_all(&self, low: bool) {
+        for state in self.tabs.values() {
+            if let TabState::Live { view, .. } | TabState::Suspended { view, .. } = state {
+                view.set_memory_target(low);
+            }
+        }
+    }
+
     /// Discard a tab's live webview (free memory) while keeping the tab row, and
     /// clear it as the active tab. The tab goes Cold and reloads on next
     /// activation (#10 "unload tab").
@@ -536,6 +556,9 @@ impl TabPool {
             } else {
                 if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.get(&id) {
                     view.navigate(url);
+                    // Address-bar Enter lands here: hand keyboard focus to the
+                    // page so scrolling/shortcuts work without a click.
+                    view.focus();
                 }
                 Ok(())
             }

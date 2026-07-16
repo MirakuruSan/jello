@@ -607,19 +607,6 @@ pub async fn extensions_set_enabled(
     Ok(())
 }
 
-#[command]
-pub async fn extensions_install_ubol(
-    db: State<'_, DbState>,
-    app: AppHandle,
-) -> Result<Extension, String> {
-    // uBlock Origin Lite Web Store ID: ddkjiahejlhfcafbddmgiahcphecmpfh.
-    // No prompt: the first-run wizard checkbox is the user's consent.
-    let ext = install_ext("ddkjiahejlhfcafbddmgiahcphecmpfh".to_string(), false, false, &db, &app).await?;
-    stage_one_additive(&app, &ext);
-    refresh_enabled_cache(&db);
-    Ok(ext)
-}
-
 /// Install the full uBlock Origin (MV2) from its latest GitHub release (#9) —
 /// the wizard/settings now offer this instead of the weaker uBO Lite.
 #[command]

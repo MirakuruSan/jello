@@ -41,6 +41,9 @@ pub trait ContentView {
     /// activated webview has no focus, so its in-page accelerators (Alt+←/→,
     /// Ctrl+±, …) don't fire until the user clicks (#3).
     fn focus(&self) {}
+    /// Hint Chromium to trim memory (true = LOW target, false = NORMAL). Unlike
+    /// TrySuspend this does NOT freeze JS/media — safe while hidden.
+    fn set_memory_target(&self, _low: bool) {}
     fn close(self: Box<Self>);
     fn is_audio_playing(&self) -> bool { false }
 }

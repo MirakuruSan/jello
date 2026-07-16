@@ -168,6 +168,7 @@ pub async fn window_controls(action: String, window: Window, app: AppHandle) -> 
                     // Follow tauri's hide with the raw fallback so tao's flag and
                     // on-screen reality can't diverge (P0.1 step 6).
                     crate::windows::force_hide_main();
+                    crate::windows::on_main_hidden(&app);
                     Ok(())
                 } else {
                     crate::sessions::on_exit(&app);
@@ -524,6 +525,7 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                         let _ = win.hide();
                     }
                     crate::windows::force_hide_main();
+                    crate::windows::on_main_hidden(&scale_app);
                 } else {
                     // Full quit: no zombie tray process left behind.
                     scale_app.exit(0);
@@ -880,6 +882,7 @@ pub fn run() {
                                             let _ = win.hide();
                                         }
                                         crate::windows::force_hide_main();
+                                        crate::windows::on_main_hidden(&app_h);
                                     } else {
                                         crate::windows::ensure_main_window(&app_h);
                                     }
@@ -899,6 +902,10 @@ pub fn run() {
                                     // fallback, so the address bar reliably surfaces
                                     // even from the degraded hidden state.
                                     crate::windows::ensure_main_window(&app_h);
+                                    // Focus the CHROME overlay first: input.focus()
+                                    // inside an unfocused webview is a no-op, which
+                                    // is why the address bar opened without a caret.
+                                    crate::windows::focus_main_chrome(&app_h);
                                     let _ = app_h.emit("window:shortcut", "Ctrl+L");
                                 });
                             }
@@ -1113,7 +1120,6 @@ pub fn run() {
             crate::extensions::extensions_list,
             crate::extensions::extensions_install,
             crate::extensions::extensions_set_enabled,
-            crate::extensions::extensions_install_ubol,
             crate::extensions::extensions_install_ubo,
             crate::extensions::extensions_uninstall,
             crate::extensions::extensions_open_options,

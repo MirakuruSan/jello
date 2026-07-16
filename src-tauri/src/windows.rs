@@ -96,6 +96,70 @@ pub fn main_is_foreground() -> bool {
     false
 }
 
+/// Move keyboard focus into the main window's CHROME overlay webview. Bringing
+/// the Win32 window to the foreground does NOT focus any WebView2 controller,
+/// so after summon the user could see the window but typing went nowhere until
+/// a click. `input.focus()` in an unfocused webview is likewise a no-op — the
+/// addressbar hotkey needs this before emitting Ctrl+L.
+pub fn focus_main_chrome(app: &AppHandle) {
+    focus_chrome(app, "main");
+}
+
+/// Focus any window's chrome overlay webview by label (works for secondary and
+/// incognito windows too).
+pub fn focus_chrome(app: &AppHandle, label: &str) {
+    #[cfg(target_os = "windows")]
+    if let Some(overlay) = app.get_webview(label) {
+        let _ = overlay.with_webview(|w| {
+            use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
+            unsafe {
+                let _ = w.controller().MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (app, label);
+}
+
+/// Focus the active content tab's webview if one exists, else the chrome
+/// overlay — so a summoned window is immediately usable with the keyboard.
+pub fn focus_main_content_or_chrome(app: &AppHandle) {
+    let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>();
+    let focused_content = pool
+        .try_lock()
+        .ok()
+        .and_then(|p| p.get_active_tab_id().map(|id| { p.focus_tab(id); true }))
+        .unwrap_or(false);
+    if !focused_content {
+        focus_main_chrome(app);
+    }
+}
+
+/// Called whenever the main window hides (close-to-tray, summon-hide). Two-stage
+/// memory trim: immediately hint Chromium to a LOW memory target on all views
+/// (does NOT freeze JS or pause media — safe for playing audio, downloads, and
+/// in-page tasks), and after 60s still-hidden, TrySuspend background tabs (the
+/// same freeze the 5-minute idle path already applies; active + audio-playing
+/// tabs are skipped by suspend_all).
+pub fn on_main_hidden(app: &AppHandle) {
+    let pool_state = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>();
+    if let Ok(pool) = pool_state.try_lock() {
+        pool.set_memory_target_all(true);
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        if main_is_visible() {
+            return; // was shown again — leave everything running
+        }
+        let db = app.state::<crate::db::DbState>().inner().clone();
+        let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>().inner().clone();
+        if let Ok(mut p) = pool.lock() {
+            p.suspend_all(&db, 1);
+        };
+    });
+}
+
 /// The full logical client rect of a window — content webviews fill the whole
 /// window (chromeless: all UI floats above the page). SPEC §F.
 pub fn content_rect(window: &tauri::Window) -> crate::engine::Rect {
@@ -129,6 +193,17 @@ pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         let _ = win.show();
         let _ = win.set_focus();
         force_show_main();
+        // Window foreground ≠ webview keyboard focus: without MoveFocus the
+        // summoned/tray-restored window looked focused but typing went nowhere
+        // until a click. Focus the page (or chrome when no tabs).
+        focus_main_content_or_chrome(app);
+        // Restore full memory/performance after the hidden-mode LOW trim.
+        {
+            let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>().inner().clone();
+            if let Ok(p) = pool.try_lock() {
+                p.set_memory_target_all(false);
+            };
+        }
         return app.get_webview_window("main");
     }
     // Defensive recreate (mirrors tauri.conf.json "main" window options).

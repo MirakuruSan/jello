@@ -24,7 +24,6 @@ tauri-plugin-dialog = "2.7.1"
 tauri-plugin-autostart = "2.2.0"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 webview2-com = "0.38.2"
-global-hotkey = "0.8.0"
 image = "0.25.10"
 arboard = "3.6.1"
 nucleo-matcher = "0.3.1"

@@ -254,6 +254,11 @@ body.chrome-hidden .drag-region {
   transform: translateX(340px);
   transition: transform var(--anim);
   z-index: 90;
+  /* Near-opaque for the same reason as .views-panel: the content webview
+     underneath can't be blurred, so translucency = illegible text. */
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.01) 40%),
+    var(--bg-solid);
 }
 
 .tab-panel.open {
@@ -821,6 +826,12 @@ body.capture-mode .capture-overlay { display: block; }
   padding: 0;
   opacity: 0;
   transition: opacity var(--anim), transform var(--anim);
+  /* Near-opaque: backdrop-filter can NOT blur the content webview (it is a
+     separate native window under this transparent overlay), so a translucent
+     panel let page text bleed through and made settings unreadable. */
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.01) 40%),
+    var(--bg-solid);
 }
 /* #overlay-ui is pointer-events:none — the panel must opt back in or every
    control inside it (settings checkboxes, history rows) is unclickable. */

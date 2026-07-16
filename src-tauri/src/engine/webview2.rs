@@ -691,6 +691,32 @@ impl ContentView for WebView2ContentView {
             });
         }
     }
+    fn set_memory_target(&self, low: bool) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = self.webview.with_webview(move |w| {
+                use webview2_com::Microsoft::Web::WebView2::Win32::{
+                    ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+                    COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+                };
+                use windows::core::Interface;
+                unsafe {
+                    if let Ok(core) = w.controller().CoreWebView2() {
+                        if let Ok(c19) = core.cast::<ICoreWebView2_19>() {
+                            let level = if low {
+                                COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+                            } else {
+                                COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+                            };
+                            let _ = c19.SetMemoryUsageTargetLevel(level);
+                        }
+                    }
+                }
+            });
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = low;
+    }
     fn close(self: Box<Self>) {
         self.alive.store(false, Ordering::Relaxed);
         let _ = self.webview.close();
