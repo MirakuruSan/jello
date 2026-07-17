@@ -357,6 +357,11 @@ pub async fn palette_open(
         "new-tab-background" => {
             crate::tabs::tabs_create_impl(Some(target_url), Some(true), None, &db, &pool, &app)?;
         }
+        // Multi-window is beta-gated (see windows::FEATURE_MULTIWINDOW): open
+        // as a foreground tab instead so the user's intent still lands.
+        "new-window" if !crate::windows::FEATURE_MULTIWINDOW => {
+            crate::tabs::tabs_create_impl(Some(target_url), Some(false), None, &db, &pool, &app)?;
+        }
         "new-window" => {
             // Mask the id the same way window_new_impl/incognito do (Phase 8
             // item 2): the label id must equal the value parsed back by the

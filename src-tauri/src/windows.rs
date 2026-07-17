@@ -411,6 +411,10 @@ pub fn create_palette_window(app: &AppHandle) -> Result<tauri::WebviewWindow, Bo
 }
 
 pub fn window_new_impl(app: &AppHandle) -> Result<(), String> {
+    if !FEATURE_MULTIWINDOW {
+        feature_gated_toast(app, "New windows");
+        return Ok(());
+    }
     let app = app.clone();
     let id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() & 0x7FFFFFFF) as i32;
     let label = format!("main_{}", id);
@@ -479,6 +483,25 @@ pub fn window_new_impl(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ── Feature gates ────────────────────────────────────────────────────────────
+/// Multi-window and incognito are DISABLED in stable builds: TabPool keeps ONE
+/// global active tab, so activating a tab in a second window hides every other
+/// window's content ("opening a new window resets all windows"), and incognito
+/// needs the same per-window state to be trustworthy. Both stay beta-gated
+/// until per-window active-tab tracking lands. Every entry point funnels
+/// through the two impls below, so gating here covers hotkeys, palette,
+/// quick-launch, and keyboard shortcuts alike.
+pub const FEATURE_MULTIWINDOW: bool = false;
+pub const FEATURE_INCOGNITO: bool = false;
+
+fn feature_gated_toast(app: &AppHandle, what: &str) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "toast:show",
+        format!("{} is disabled in this release while we finish it — coming back soon", what),
+    );
+}
+
 /// Async command: window creation must not run synchronously inside the
 /// WebView2 IPC event handler on the main thread (deadlocks — see tabs.rs).
 #[tauri::command]
@@ -487,6 +510,10 @@ pub async fn window_new(app: AppHandle) -> Result<(), String> {
 }
 
 pub fn window_new_incognito_impl(app: &AppHandle) -> Result<(), String> {
+    if !FEATURE_INCOGNITO {
+        feature_gated_toast(app, "Incognito");
+        return Ok(());
+    }
     let app = app.clone();
     let id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() & 0x7FFFFFFF) as i32;
     let label = format!("incognito_{}", id);

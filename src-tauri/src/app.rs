@@ -595,16 +595,19 @@ static QUICKLAUNCH_CACHE: Mutex<Vec<crate::ipc_types::QuickLaunchItem>> = Mutex:
 static REREGISTER_LOCK: Mutex<()> = Mutex::new(());
 
 fn default_hotkeys() -> Vec<HotkeyItem> {
-    vec![
+    let mut v = vec![
         HotkeyItem { action: "summon".to_string(), shortcut: "Ctrl+Shift+Space".to_string() },
         HotkeyItem { action: "palette".to_string(), shortcut: "Ctrl+Alt+Space".to_string() },
         HotkeyItem { action: "screenshot".to_string(), shortcut: "Ctrl+Alt+S".to_string() },
         HotkeyItem { action: "ocr".to_string(), shortcut: "Ctrl+Alt+T".to_string() },
-        HotkeyItem { action: "incognito".to_string(), shortcut: "Ctrl+Alt+N".to_string() },
         HotkeyItem { action: "addressbar".to_string(), shortcut: "Ctrl+Alt+L".to_string() },
         HotkeyItem { action: "aichat".to_string(), shortcut: "Ctrl+Alt+A".to_string() },
         HotkeyItem { action: "leader".to_string(), shortcut: "Ctrl+Space".to_string() },
-    ]
+    ];
+    if crate::windows::FEATURE_INCOGNITO {
+        v.push(HotkeyItem { action: "incognito".to_string(), shortcut: "Ctrl+Alt+N".to_string() });
+    }
+    v
 }
 
 /// The AI chatbot URL to open for the aichat hotkey / new-tab AI button (#7,#13),
@@ -640,6 +643,11 @@ fn get_hotkeys_sync(db: &crate::db::DbState) -> Vec<HotkeyItem> {
                         }
                     }
                 }
+            }
+            // Drop rows for beta-gated actions a user saved before the gate
+            // (they'd otherwise still show in Settings and register globally).
+            if !crate::windows::FEATURE_INCOGNITO {
+                merged.retain(|h| h.action != "incognito");
             }
             Ok(merged)
         })();

@@ -4,6 +4,15 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.8] — 2026-07-17
+
+### Changed
+- **New windows and incognito are temporarily disabled.** Both need per-window
+  tab state to work correctly — opening a new window could blank every other
+  window, and incognito was unreliable. They are gated out of stable builds
+  until rebuilt: the shortcuts and settings entries are hidden, attempts show a
+  notice, and anything that used to open a new window opens a tab instead.
+
 ## [0.4.7] — 2026-07-17
 
 ### Fixed

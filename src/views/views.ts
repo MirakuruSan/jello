@@ -432,8 +432,8 @@ export class ViewsController {
       ["New tab", "Ctrl+T"],
       ["Reopen closed tab", "Ctrl+Shift+T"],
       ["Close tab", "Ctrl+W"],
-      ["New window", "Ctrl+N"],
-      ["New incognito window", "Ctrl+Shift+N"],
+      // "New window" (Ctrl+N) and "New incognito window" (Ctrl+Shift+N) are
+      // beta-gated — see windows.rs FEATURE_MULTIWINDOW / FEATURE_INCOGNITO.
       ["Next / previous tab (MRU)", "Ctrl+Tab  /  Ctrl+Shift+Tab"],
       ["Switch between tabs", "Alt+←  /  Alt+→"],
       ["Jump to tab 1–9", "Ctrl+1 … Ctrl+9"],

@@ -362,6 +362,19 @@ fn execute_quick_launch(app: AppHandle, item: QuickLaunchItem) -> Result<(), Str
                 &app,
             )?;
         }
+        // Multi-window is beta-gated (see windows::FEATURE_MULTIWINDOW): honor
+        // the quick-launch by opening a foreground tab in the main window.
+        "new_window" if !crate::windows::FEATURE_MULTIWINDOW => {
+            crate::windows::ensure_main_window(&app);
+            let _ = crate::tabs::tabs_create_impl(
+                Some(item.target_url),
+                Some(false),
+                Some(1),
+                &db,
+                &pool,
+                &app,
+            )?;
+        }
         "new_window" => {
             let win_id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() & 0x7FFFFFFF) as i32;
             let label = format!("main_{}", win_id);

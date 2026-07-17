@@ -7,7 +7,7 @@ glass and gets out of your way, uses global hotkeys and shortcuts to summon and 
 
 I mainly build this for my own use, I wanted something lightweight that I can summon instantly using a hotkey from anywhere everytime I wanted to look up or research something. I was annoyed by the time it took to launch other browsers and the memory resources they were using.
 
-> Status: **v0.4.7** — active development.
+> Status: **v0.4.8** — active development.
 
 ## Features
 
@@ -23,10 +23,10 @@ I mainly build this for my own use, I wanted something lightweight that I can su
 - **Screenshot & OCR capture** with copy / save / search / Ask-AI actions.
 - **Tab management** — virtualized tab panel, MRU switching (Ctrl+Tab),
   reopen-closed (Ctrl+Shift+T), pin, mute, drag-reorder, suspend-on-idle.
-- **Incognito windows** with an isolated, non-recording session.
+
 - **Per-host zoom** (Ctrl+scroll and Ctrl +/-/0), **always-on-top pin**, and
   **minimize-to-tray**.
-- **Global hotkeys** — summon, palette, address bar, screenshot, OCR, incognito
+- **Global hotkeys** — summon, palette, address bar, screenshot, OCR
   — all rebindable in Settings.
 - **Secure auto-updater** via signed GitHub Releases.
 
