@@ -24,6 +24,7 @@ dist-ssr
 *.sw?
 
 # Internal planning & design docs — kept local, never published
+/ULTRAPLAN.md
 /FINALPLAN.md
 /CONTINUATION.md
 /FIXPLAN.md
