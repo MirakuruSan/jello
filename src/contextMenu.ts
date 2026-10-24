@@ -1,4 +1,4 @@
-// Lightweight overlay context menu (Phase 5). Pure DOM — no COM. The menu div
+// Lightweight overlay context menu. Pure DOM — no COM. The menu div
 // carries `.interactive` so the overlay's hit-rect region includes it (clicks
 // land instead of passing through to the page); opening/closing dispatches
 // `overlay:layout` so main.ts recomputes the region.

@@ -1,6 +1,6 @@
-use crate::engine::{ContentView, Rect, TabRuntimeState};
+use crate::engine::{ContentView, PipRequest, Rect, TabRuntimeState};
 use crate::ipc_types::ViewId;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// True while a Jello overlay panel (find bar / tab panel / in-window palette)
@@ -52,13 +52,13 @@ fn persist_tab_meta(
     is_incognito: bool,
 ) {
     use tauri::{Manager, Emitter};
-    // Chrome Web Store intercept (Phase 4): the store's own "Add to Chrome" can
+    // Chrome Web Store intercept: the store's own "Add to Chrome" can
     // never work in WebView2, so when a content tab lands on a detail page we
     // offer Jello's working sideload path via an overlay banner instead.
     if let Some(u) = &url {
         if u.contains("chromewebstore.google.com/detail/")
             || u.contains("chrome.google.com/webstore/detail/")
-            // Edge Add-ons detail pages (P1.4) — same "Install to Jello" banner.
+            // Edge Add-ons detail pages — same "Install to Jello" banner.
             || u.contains("microsoftedge.microsoft.com/addons/detail/")
         {
             let _ = app.emit("webstore:detected", u.clone());
@@ -102,6 +102,9 @@ fn persist_tab_meta(
 
 pub struct WebView2ContentView {
     id: ViewId,
+    /// Unique per webview ever created (tab ids are reused by SQLite, and a
+    /// parked view can outlive its tab). Keys the active-download count.
+    serial: u64,
     webview: tauri::Webview<tauri::Wry>,
     bounds: std::sync::Mutex<Rect>,
     visible: Arc<AtomicBool>,
@@ -109,7 +112,37 @@ pub struct WebView2ContentView {
     /// and by refresh_snapshot(); read synchronously (never blocks) by snapshot().
     cache: Arc<Mutex<TabRuntimeState>>,
     alive: Arc<AtomicBool>,
+    /// Millis timestamp of the navigation in flight (0 = none). Seeded at
+    /// creation: the initial navigation starts before our handlers exist.
+    nav_pending_since: Arc<AtomicU64>,
+    /// A navigation in this view turned into a download.
+    download_seen: Arc<AtomicBool>,
+    /// A video from this view is in picture-in-picture, and whether Jello (not
+    /// the user) put it there.
+    pip_active: Arc<AtomicBool>,
+    pip_auto: Arc<AtomicBool>,
 }
+
+/// Picks the video to float and enters/leaves picture-in-picture. Runs through
+/// CDP Runtime.evaluate with userGesture, because requestPictureInPicture()
+/// needs transient user activation that a plain ExecuteScript doesn't carry.
+const PIP_JS: &str = r#"(async (mode) => {
+  const cur = document.pictureInPictureElement;
+  if (cur) {
+    if (mode === "auto") return "already";
+    await document.exitPictureInPicture();
+    return "exited";
+  }
+  if (mode === "exit") return "none";
+  if (!document.pictureInPictureEnabled) return "unsupported";
+  const vids = [...document.querySelectorAll("video")].filter((v) => v.readyState >= 2 && !v.disablePictureInPicture);
+  const playing = vids.filter((v) => !v.paused && !v.ended);
+  const pool = mode === "auto" ? playing : (playing.length ? playing : vids);
+  if (!pool.length) return "novideo";
+  pool.sort((a, b) => b.videoWidth * b.videoHeight - a.videoWidth * a.videoHeight);
+  await pool[0].requestPictureInPicture();
+  return "entered";
+})"#;
 
 impl WebView2ContentView {
     /// Fire a non-blocking cache refresh: reads title/favicon/scroll (async eval)
@@ -152,7 +185,7 @@ impl WebView2ContentView {
         }
     }
 
-    pub fn new(id: ViewId, webview: tauri::Webview<tauri::Wry>, is_incognito: bool) -> Self {
+    pub fn new(id: ViewId, serial: u64, webview: tauri::Webview<tauri::Wry>, is_incognito: bool) -> Self {
         use tauri::Manager;
         // Bound before the windows-only handler block below: the event-driven
         // title/URL handlers capture it, and it also backs the ContentView.
@@ -164,6 +197,8 @@ impl WebView2ContentView {
             can_go_back: false,
             can_go_forward: false,
         }));
+        let nav_pending_since = Arc::new(AtomicU64::new(now_millis()));
+        let download_seen = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "windows")]
         {
             let app_handle = webview.app_handle().clone();
@@ -193,9 +228,11 @@ impl WebView2ContentView {
                 }
             });
 
-            // Enable built-in password autosave + general autofill (SPEC §8).
-            // Defaults on; a settings toggle change applies on next launch.
-            let _ = webview.with_webview(|w| {
+            // Built-in password saving and form autofill follow the Privacy
+            // settings; a change applies to tabs loaded after it.
+            let save_passwords = crate::prefs::password_autosave();
+            let autofill = crate::prefs::general_autofill();
+            let _ = webview.with_webview(move |w| {
                 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings4;
                 use windows::core::Interface;
                 unsafe {
@@ -204,20 +241,17 @@ impl WebView2ContentView {
                             // Ctrl+scroll and Ctrl+± zoom (default on; force it so
                             // wry can't leave it disabled).
                             let _ = settings.SetIsZoomControlEnabled(true);
-                            // Native right-click context menus (Phase 5). This
-                            // restores the full default menu (Back/Reload/Copy/
-                            // Copy link/Save image/Inspect) — the user-reported
-                            // "no right-click options" fix. SPEC-GAP: adding
-                            // custom Jello items (Open link in new tab, Search
-                            // selection) needs ICoreWebView2Environment9::
-                            // CreateContextMenuItem, and the environment isn't
-                            // cleanly reachable through wry's webview handle —
-                            // deferred. Overlay chrome (tab rows / domain pill)
-                            // gets custom menus via the frontend instead.
+                            // Native right-click context menus: the full default
+                            // menu (Back/Reload/Copy/Copy link/Save image/
+                            // Inspect). Custom page items would need
+                            // ICoreWebView2Environment9::CreateContextMenuItem,
+                            // which wry's webview handle doesn't expose; overlay
+                            // chrome (tab rows / domain pill) gets custom menus
+                            // from the frontend instead.
                             let _ = settings.SetAreDefaultContextMenusEnabled(true);
                             if let Ok(s4) = settings.cast::<ICoreWebView2Settings4>() {
-                                let _ = s4.SetIsPasswordAutosaveEnabled(true);
-                                let _ = s4.SetIsGeneralAutofillEnabled(true);
+                                let _ = s4.SetIsPasswordAutosaveEnabled(save_passwords);
+                                let _ = s4.SetIsGeneralAutofillEnabled(autofill);
                             }
                         }
                     }
@@ -248,17 +282,36 @@ impl WebView2ContentView {
             });
 
             // Register a DownloadStarting handler that tracks the operation so it
-            // can be paused/resumed/cancelled, and streams progress (P3.1).
+            // can be paused/resumed/cancelled, and streams progress.
             let dl_app = webview.app_handle().clone();
+            let dl_seen = download_seen.clone();
+            let dl_tab = id.0 as i32;
             let _ = webview.with_webview(move |w| {
                 use webview2_com::DownloadStartingEventHandler;
-                use windows::core::Interface;
+                use windows::core::{Interface, PWSTR};
                 unsafe {
                     if let Ok(core) = w.controller().CoreWebView2() {
-                        let handler = DownloadStartingEventHandler::create(Box::new(move |_sender, args| {
+                        let handler = DownloadStartingEventHandler::create(Box::new(move |sender, args| {
                             if let Some(args) = args {
                                 if let Ok(op) = args.DownloadOperation() {
-                                    register_download(&dl_app, op);
+                                    dl_seen.store(true, Ordering::Relaxed);
+                                    register_download(&dl_app, op, serial, dl_tab);
+                                    // No committed page behind the download (a tab
+                                    // opened just to fetch a file): it would sit
+                                    // there as an empty view and re-download on
+                                    // every restore, since its stored URL is the
+                                    // file. Retire the tab, Chrome-style.
+                                    let blank = sender.map_or(false, |core| {
+                                        let mut src = PWSTR::null();
+                                        core.Source(&mut src).is_ok() && !src.is_null() && {
+                                            let u = src.to_string().unwrap_or_default();
+                                            u.is_empty() || u == "about:blank"
+                                        }
+                                    });
+                                    if blank {
+                                        let app = dl_app.clone();
+                                        std::thread::spawn(move || crate::tabs::retire_download_only_tab(&app, dl_tab));
+                                    }
                                 }
                             }
                             Ok(())
@@ -272,7 +325,7 @@ impl WebView2ContentView {
             });
 
             // Middle-click / target=_blank / window.open → open in a BACKGROUND
-            // tab in the same window instead of a popup (#15). WebView2 fires
+            // tab in the same window instead of a popup. WebView2 fires
             // NewWindowRequested; we take the Uri, mark it handled (no popup), and
             // create the tab off the COM thread.
             let nw_app = webview.app_handle().clone();
@@ -337,6 +390,7 @@ impl WebView2ContentView {
             let meta_view_id = id.0 as i32;
             let meta_incog = is_incognito;
             let meta_cache = cache.clone();
+            let meta_nav_pending = nav_pending_since.clone();
             let _ = webview.with_webview(move |w| {
                 use webview2_com::{DocumentTitleChangedEventHandler, SourceChangedEventHandler, FaviconChangedEventHandler};
                 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_15;
@@ -404,14 +458,38 @@ impl WebView2ContentView {
                             let _ = core15.add_FaviconChanged(&fav_handler, &mut tok3 as *mut i64);
                         }
 
+                        // Audio state → tab:audio {tabId, playing}: drives the
+                        // picture-in-picture button without polling the page.
+                        if let Ok(core8) = core.cast::<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_8>() {
+                            use webview2_com::IsDocumentPlayingAudioChangedEventHandler;
+                            let a_app = meta_app.clone();
+                            let audio_handler = IsDocumentPlayingAudioChangedEventHandler::create(Box::new(move |sender, _args| {
+                                if let Some(core) = sender {
+                                    if let Ok(c8) = core.cast::<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_8>() {
+                                        let mut playing = windows::core::BOOL::default();
+                                        if c8.IsDocumentPlayingAudio(&mut playing).is_ok() {
+                                            let _ = a_app.emit("tab:audio", serde_json::json!({
+                                                "tabId": meta_view_id, "playing": playing.as_bool(),
+                                            }));
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            }));
+                            let mut tok6: i64 = 0;
+                            let _ = core8.add_IsDocumentPlayingAudioChanged(&audio_handler, &mut tok6);
+                        }
+
                         // Navigation loading state → nav:loading {tabId, loading}
-                        // so the overlay can show a top progress bar (Phase 8).
+                        // so the overlay can show a top progress bar.
                         use webview2_com::{NavigationStartingEventHandler, NavigationCompletedEventHandler};
                         let ns_app = meta_app.clone();
+                        let ns_pending = meta_nav_pending.clone();
                         let ns_handler = NavigationStartingEventHandler::create(Box::new(move |_s, a| {
+                            ns_pending.store(now_millis(), Ordering::Relaxed);
                             if let Some(a) = a {
                                 let mut urip = windows::core::PWSTR::null();
-                                let url = unsafe { a.Uri(&mut urip).ok().and_then(|_| urip.to_string().ok()) }.unwrap_or_default();
+                                let url = a.Uri(&mut urip).ok().and_then(|_| urip.to_string().ok()).unwrap_or_default();
                                 tracing::info!("nav starting tab {}: {}", meta_view_id, url);
                             }
                             let _ = ns_app.emit("nav:loading", serde_json::json!({"tabId": meta_view_id, "loading": true}));
@@ -421,14 +499,14 @@ impl WebView2ContentView {
                         let _ = core.add_NavigationStarting(&ns_handler, &mut tok4 as *mut i64);
 
                         let nc_app = meta_app.clone();
+                        let nc_pending = meta_nav_pending.clone();
                         let nc_handler = NavigationCompletedEventHandler::create(Box::new(move |_s, a| {
+                            nc_pending.store(0, Ordering::Relaxed);
                             if let Some(a) = a {
                                 let mut ok = windows::core::BOOL::default();
                                 let mut status = webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_ERROR_STATUS::default();
-                                unsafe {
-                                    let _ = a.IsSuccess(&mut ok);
-                                    let _ = a.WebErrorStatus(&mut status);
-                                }
+                                let _ = a.IsSuccess(&mut ok);
+                                let _ = a.WebErrorStatus(&mut status);
                                 tracing::info!("nav completed tab {}: success={:?} status={:?}", meta_view_id, ok.as_bool(), status);
                             }
                             let _ = nc_app.emit("nav:loading", serde_json::json!({"tabId": meta_view_id, "loading": false}));
@@ -446,18 +524,23 @@ impl WebView2ContentView {
 
         let view = Self {
             id,
+            serial,
             webview,
             bounds: std::sync::Mutex::new(Rect { x: 0, y: 0, width: 800, height: 600 }),
             visible: visible.clone(),
             cache: cache.clone(),
             alive: alive.clone(),
+            nav_pending_since,
+            download_seen,
+            pip_active: Arc::new(AtomicBool::new(false)),
+            pip_auto: Arc::new(AtomicBool::new(false)),
         };
 
         // Lightweight scroll poller. Title/URL are event-driven now; the only
         // page state without an event is scroll position, captured every 1.5s
         // for the *visible* tab so eviction can restore it. Critically it uses
-        // try_lock on the TabPool — it can NEVER block on the pool (the old
-        // 250ms blocking poller was a freeze + sluggishness root cause).
+        // try_lock on the TabPool — it must never block on the pool, or a busy
+        // pool would stall every tab's poller and freeze the UI.
         let webview_poll = view.webview.clone();
         let poll_app = view.webview.app_handle().clone();
         let visible_poll = visible.clone();
@@ -763,14 +846,107 @@ impl ContentView for WebView2ContentView {
             false
         }
     }
+    fn has_active_downloads(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            active_download_count(self.serial) > 0
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+    fn blank_heal_allowed(&self) -> bool {
+        // A navigation stuck "in flight" for this long is treated as lost.
+        const STALE_NAV_MS: u64 = 15_000;
+        if self.download_seen.load(Ordering::Relaxed) {
+            return false;
+        }
+        let since = self.nav_pending_since.load(Ordering::Relaxed);
+        since == 0 || now_millis().saturating_sub(since) > STALE_NAV_MS
+    }
+    fn picture_in_picture(&self, req: PipRequest) {
+        let mode = match req {
+            PipRequest::Toggle => "toggle",
+            PipRequest::Auto => "auto",
+            PipRequest::ExitAuto => {
+                if !self.pip_auto.load(Ordering::Relaxed) {
+                    return;
+                }
+                "exit"
+            }
+        };
+        #[cfg(target_os = "windows")]
+        {
+            use tauri::Manager;
+            let params = serde_json::json!({
+                "expression": format!("{}({})", PIP_JS, serde_json::to_string(mode).unwrap_or_default()),
+                "userGesture": true,
+                "awaitPromise": true,
+                "returnByValue": true,
+            })
+            .to_string();
+            let pip_active = self.pip_active.clone();
+            let pip_auto = self.pip_auto.clone();
+            let app = self.webview.app_handle().clone();
+            let _ = self.webview.with_webview(move |w| {
+                use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+                use windows::core::HSTRING;
+                unsafe {
+                    let Ok(core) = w.controller().CoreWebView2() else { return };
+                    let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                        move |_hr, json: String| {
+                            let outcome = serde_json::from_str::<serde_json::Value>(&json)
+                                .ok()
+                                .and_then(|v| v.pointer("/result/value").and_then(|r| r.as_str()).map(str::to_string))
+                                .unwrap_or_default();
+                            match outcome.as_str() {
+                                "entered" => {
+                                    pip_active.store(true, Ordering::Relaxed);
+                                    pip_auto.store(mode == "auto", Ordering::Relaxed);
+                                }
+                                "exited" | "none" => {
+                                    pip_active.store(false, Ordering::Relaxed);
+                                    pip_auto.store(false, Ordering::Relaxed);
+                                }
+                                _ => {}
+                            }
+                            if mode == "toggle" {
+                                use tauri::Emitter;
+                                let msg = match outcome.as_str() {
+                                    "novideo" => Some("No video on this page"),
+                                    "unsupported" => Some("Picture-in-picture isn't available here"),
+                                    "" => Some("Picture-in-picture failed"),
+                                    _ => None,
+                                };
+                                if let Some(m) = msg {
+                                    let _ = app.emit("toast:show", m.to_string());
+                                }
+                            }
+                            Ok(())
+                        },
+                    ));
+                    let _ = core.CallDevToolsProtocolMethod(
+                        &HSTRING::from("Runtime.evaluate"),
+                        &HSTRING::from(params.as_str()),
+                        &handler,
+                    );
+                }
+            });
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = mode;
+    }
+    fn in_picture_in_picture(&self) -> bool {
+        self.pip_active.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn is_in_window_shortcut(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<&'static str> {
     match (vk, ctrl, shift, alt) {
         // Dedicated browser back/forward keys (media keys, mouse thumb buttons
-        // that synthesize them) — history navigation, per the user's muscle
-        // memory. Work regardless of modifiers.
+        // that synthesize them) — history navigation, regardless of modifiers.
         (0xA6, ..) => Some("Nav+Back"),    // VK_BROWSER_BACK
         (0xA7, ..) => Some("Nav+Forward"), // VK_BROWSER_FORWARD
         // Toggle the chrome overlay UI
@@ -836,6 +1012,8 @@ fn is_in_window_shortcut(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<
         // Alt+Left / Alt+Right — switch between tabs (prev/next)
         (0x25, false, false, true) => Some("Tab+Prev"),
         (0x27, false, false, true) => Some("Tab+Next"),
+        // Alt+P — toggle picture-in-picture for the page's video
+        (0x50, false, false, true) => Some("Alt+P"),
         // F11
         (0x7A, false, false, false) => Some("F11"),
         // Esc
@@ -972,9 +1150,9 @@ unsafe extern "system" fn raw_invoke(
     windows::core::HRESULT(0) // S_OK
 }
 
-// ── Download management (P3.1) ───────────────────────────────────────────────
-// The DownloadStarting handler used to drop the DownloadOperation; now we retain
-// it so the download can be paused/resumed/cancelled and its progress streamed.
+// ── Download management ───────────────────────────────────────────────
+// The DownloadStarting handler retains each DownloadOperation so the download
+// can be paused/resumed/cancelled and its progress streamed.
 
 #[cfg(target_os = "windows")]
 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2DownloadOperation;
@@ -990,10 +1168,34 @@ unsafe impl Send for SendDownloadOp {}
 
 #[cfg(target_os = "windows")]
 static DOWNLOADS: Mutex<Vec<(String, SendDownloadOp)>> = Mutex::new(Vec::new());
+
+/// Unfinished downloads (running, paused, or resumable after an error) per
+/// webview serial. WebView2 cancels a download when the webview that started it
+/// closes — leaving a truncated file under its final name — so the pool parks
+/// a closed tab's view while its count here is non-zero.
 #[cfg(target_os = "windows")]
-static LAST_DL_EMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACTIVE_DOWNLOADS: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
 
 #[cfg(target_os = "windows")]
+fn active_download_count(serial: u64) -> u32 {
+    ACTIVE_DOWNLOADS.lock().unwrap().iter().find(|(s, _)| *s == serial).map_or(0, |(_, n)| *n)
+}
+
+/// Adjust a view's unfinished-download count; entries that reach zero are dropped.
+#[cfg(target_os = "windows")]
+fn bump_active_downloads(serial: u64, up: bool) {
+    let mut map = ACTIVE_DOWNLOADS.lock().unwrap();
+    match map.iter_mut().find(|(s, _)| *s == serial) {
+        Some((_, n)) if up => *n += 1,
+        Some((_, n)) => *n = n.saturating_sub(1),
+        None if up => map.push((serial, 1)),
+        None => {}
+    }
+    map.retain(|(_, n)| *n > 0);
+}
+
+static DOWNLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1001,16 +1203,87 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// What a download's state change means to the UI and to the view keeping it alive.
 #[cfg(target_os = "windows")]
-fn register_download(app: &tauri::AppHandle, op: ICoreWebView2DownloadOperation) {
-    use tauri::Emitter;
+struct DownloadStatus {
+    /// "inprogress" | "paused" | "interrupted" (resumable) | "completed" | "cancelled" | "failed"
+    state: &'static str,
+    finished: bool,
+    reason: String,
+}
+
+/// Human-readable WebView2 download interrupt reason (shown in Downloads).
+#[cfg(target_os = "windows")]
+fn interrupt_reason_text(
+    r: webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON,
+) -> &'static str {
+    use webview2_com::Microsoft::Web::WebView2::Win32::*;
+    match r {
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_PAUSED => "paused",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED => "cancelled",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_SHUTDOWN => "Jello closed",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_ACCESS_DENIED => "access denied writing the file",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_NO_SPACE => "disk full",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_NAME_TOO_LONG => "file name too long",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_TOO_LARGE => "file too large",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_MALICIOUS
+        | COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_SECURITY_CHECK_FAILED
+        | COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_BLOCKED_BY_POLICY => "blocked as unsafe",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NETWORK_FAILED
+        | COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NETWORK_DISCONNECTED => "network error",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NETWORK_TIMEOUT => "network timeout",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_FORBIDDEN
+        | COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_UNAUTHORIZED => "server refused the download",
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_FAILED
+        | COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_BAD_CONTENT
+        | COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_UNEXPECTED_RESPONSE => "server error",
+        _ => "download error",
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn classify_download(op: &ICoreWebView2DownloadOperation) -> DownloadStatus {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
-        COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON, COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED,
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_PAUSED, COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+        COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED, COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS,
     };
+    unsafe {
+        let mut st = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+        let _ = op.State(&mut st);
+        if st == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+            return DownloadStatus { state: "completed", finished: true, reason: String::new() };
+        }
+        if st != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+            return DownloadStatus { state: "inprogress", finished: false, reason: String::new() };
+        }
+        let mut why = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON::default();
+        let _ = op.InterruptReason(&mut why);
+        let reason = interrupt_reason_text(why).to_string();
+        // Pausing reports INTERRUPTED/USER_PAUSED — it is not an ending.
+        if why == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_PAUSED {
+            return DownloadStatus { state: "paused", finished: false, reason };
+        }
+        if why == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED {
+            return DownloadStatus { state: "cancelled", finished: true, reason };
+        }
+        let mut can_resume = windows::core::BOOL::default();
+        let _ = op.CanResume(&mut can_resume);
+        if can_resume.as_bool() {
+            DownloadStatus { state: "interrupted", finished: false, reason }
+        } else {
+            DownloadStatus { state: "failed", finished: true, reason }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn register_download(app: &tauri::AppHandle, op: ICoreWebView2DownloadOperation, serial: u64, tab_id: i32) {
+    use tauri::Emitter;
     use webview2_com::{BytesReceivedChangedEventHandler, StateChangedEventHandler};
     use windows::core::PWSTR;
     unsafe {
-        let id = now_millis().to_string();
+        let id = format!("{}-{}", now_millis(), DOWNLOAD_SEQ.fetch_add(1, Ordering::Relaxed));
 
         let mut url = String::new();
         let mut uri = PWSTR::null();
@@ -1026,21 +1299,23 @@ fn register_download(app: &tauri::AppHandle, op: ICoreWebView2DownloadOperation)
         let mut total: i64 = 0;
         let _ = op.TotalBytesToReceive(&mut total);
 
-        tracing::info!("download started id={} file={} total={}", id, file_name, total);
+        tracing::info!("download started id={} tab={} file={} total={}", id, tab_id, file_name, total);
+        bump_active_downloads(serial, true);
         let _ = app.emit("download:started", serde_json::json!({
-            "id": id, "fileName": file_name, "url": url, "state": "started",
-            "total": total, "path": path,
+            "id": id, "fileName": file_name, "url": url, "state": "inprogress",
+            "total": total, "path": path, "tabId": tab_id,
         }));
 
-        // Progress (throttled ~4/s).
+        // Progress, throttled to ~4 events/s per download (a shared throttle
+        // starved concurrent downloads of updates).
         let prog_app = app.clone();
         let prog_id = id.clone();
+        let last_emit = AtomicU64::new(0);
         let bytes_handler = BytesReceivedChangedEventHandler::create(Box::new(move |sender, _args| {
             if let Some(op) = sender {
                 let now = now_millis();
-                let last = LAST_DL_EMIT.load(std::sync::atomic::Ordering::Relaxed);
-                if now.saturating_sub(last) >= 250 {
-                    LAST_DL_EMIT.store(now, std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last_emit.load(Ordering::Relaxed)) >= 250 {
+                    last_emit.store(now, Ordering::Relaxed);
                     let mut received: i64 = 0;
                     let _ = op.BytesReceived(&mut received);
                     let mut tot: i64 = 0;
@@ -1055,32 +1330,30 @@ fn register_download(app: &tauri::AppHandle, op: ICoreWebView2DownloadOperation)
         let mut tok: i64 = 0;
         let _ = op.add_BytesReceivedChanged(&bytes_handler, &mut tok);
 
-        // Terminal state → download:done + drop from the map.
+        // State changes → download:state for the UI. Pause and resumable errors
+        // keep the operation (and its view) alive; a real ending drops it and
+        // lets the pool close the view if its tab is already gone.
         let state_app = app.clone();
         let state_id = id.clone();
+        let ended = AtomicBool::new(false);
         let state_handler = StateChangedEventHandler::create(Box::new(move |sender, _args| {
             if let Some(op) = sender {
-                let mut st = COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED;
-                let _ = op.State(&mut st);
+                let status = classify_download(&op);
                 let mut rp = PWSTR::null();
                 let mut result_path = String::new();
                 if op.ResultFilePath(&mut rp).is_ok() && !rp.is_null() {
                     result_path = rp.to_string().unwrap_or_default();
                 }
-                let state_str = if st == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
-                    "completed"
-                } else if st == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
-                    "interrupted"
-                } else {
-                    "inprogress"
-                };
-                let _ = state_app.emit("download:done", serde_json::json!({
-                    "id": state_id, "state": state_str, "path": result_path,
+                tracing::info!("download {} -> {} {}", state_id, status.state, status.reason);
+                let _ = state_app.emit("download:state", serde_json::json!({
+                    "id": state_id, "state": status.state, "path": result_path,
+                    "reason": status.reason,
                 }));
-                if st == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
-                    || st == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
-                {
+                if status.finished && !ended.swap(true, Ordering::Relaxed) {
                     DOWNLOADS.lock().unwrap().retain(|(k, _)| k != &state_id);
+                    bump_active_downloads(serial, false);
+                    let app = state_app.clone();
+                    std::thread::spawn(move || crate::engine::pool::reap_parked_views(&app));
                 }
             }
             Ok(())
@@ -1135,6 +1408,24 @@ pub async fn download_cancel(id: String, app: tauri::AppHandle) -> Result<(), St
     { download_action(&app, id, 2) }
     #[cfg(not(target_os = "windows"))]
     { let _ = (id, app); Ok(()) }
+}
+
+/// Open a completed download with its default application.
+#[tauri::command]
+pub async fn download_open(path: String) -> Result<(), String> {
+    if !std::path::Path::new(&path).is_file() {
+        return Err("file no longer exists".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer")
+            .creation_flags(0x08000000)
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Reveal a completed download in the OS file manager (selecting the file).

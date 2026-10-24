@@ -1,4 +1,4 @@
-// M6.4: session save on exit + restore-last-session on launch.
+// Session save on exit + restore-last-session on launch.
 use tauri::{command, AppHandle, State, Manager, Emitter};
 use std::sync::{Arc, Mutex};
 use crate::db::{DbState, tabs_repo};
@@ -71,8 +71,19 @@ pub async fn session_restore_last(
     Ok(restored)
 }
 
-/// Save the session when the app is exiting. Wired from the RunEvent handler.
+/// Save the session when the app is exiting, and wipe browsing history when
+/// "Clear history on exit" is on. Wired from the RunEvent handler.
 pub fn on_exit(app: &AppHandle) {
     let db = app.state::<DbState>();
     save_session(&db);
+    if crate::prefs::clear_history_on_exit() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        db.execute(move |conn| {
+            let _ = tx.send(crate::db::history::delete_history_all(conn));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(Ok(())) => tracing::info!("history cleared on exit"),
+            other => tracing::warn!("clearing history on exit failed: {:?}", other.map(|r| r.err())),
+        }
+    }
 }

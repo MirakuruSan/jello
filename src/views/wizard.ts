@@ -1,4 +1,4 @@
-// M6.5: first-run setup wizard (condensed single-screen form).
+// First-run setup wizard (condensed single-screen form).
 import { invoke } from "@tauri-apps/api/core";
 
 export class Wizard {
@@ -41,14 +41,13 @@ export class Wizard {
         defaultChatbot: this.val("wiz-chatbot"),
         theme: this.val("wiz-theme"),
         adblock,
-        searchSuggestions: this.checked("wiz-suggest"),
         restoreSession: this.checked("wiz-restore"),
         updateCheck: this.checked("wiz-update"),
       };
       await invoke("settings_set", { patch }).catch(console.error);
       applyTheme(this.val("wiz-theme"));
       if (adblock) {
-        // Full uBlock Origin (MV2) — far more effective than uBO Lite (#9).
+        // Full uBlock Origin (MV2) — far more effective than uBO Lite.
         invoke("extensions_install_ubo").catch(console.error);
       }
     } else {

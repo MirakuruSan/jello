@@ -27,7 +27,7 @@ pub struct ChordManager {
     sequence: Vec<String>,
     app_handle: Option<AppHandle>,
     timer_cancel_tx: Option<std::sync::mpsc::Sender<()>>,
-    /// Quick-launch slots cached ONCE at arm time (P0.3.1). The low-level
+    /// Quick-launch slots cached ONCE at arm time. The low-level
     /// keyboard hook must never touch the DB — a slow round trip inside
     /// `low_level_keyboard_proc` stalls every keystroke system-wide and gets the
     /// hook killed by Windows.
@@ -102,7 +102,7 @@ pub fn arm_chords(app: AppHandle) {
     // Install the low-level keyboard hook on the MAIN thread. A WH_KEYBOARD_LL
     // hook only fires reliably when installed from a thread that pumps messages;
     // arm_chords is called from the poller thread (no message loop), so
-    // marshaling to the main thread is required (P0.3.2). The hook callback then
+    // marshaling to the main thread is required. The hook callback then
     // also runs on the main thread.
     let _ = app.run_on_main_thread(move || unsafe {
         use windows::Win32::Foundation::HINSTANCE;
@@ -196,7 +196,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
             if let Some(key_str) = vk_to_string(vk) {
                 // Swallow ONLY if this key extends a valid chord prefix; otherwise
                 // handle_chord_key disarms and returns false → we pass it through
-                // so we never eat unrelated keystrokes system-wide (P0.3.3).
+                // so we never eat unrelated keystrokes system-wide.
                 if handle_chord_key(key_str) {
                     return LRESULT(1);
                 }

@@ -1,4 +1,4 @@
-/* Jello Design System — Tokyo-Night glass aesthetic (SPEC §F) */
+/* Jello Design System — Tokyo-Night glass aesthetic */
 
 :root {
   --bg: rgba(16, 18, 24, 0.62);
@@ -199,7 +199,7 @@ body.chrome-hidden .drag-region {
   color: var(--accent);
 }
 
-/* === Chrome pill translucency (Phase 8.6) ===
+/* === Chrome pill translucency ===
    The top-bar pills must stay legible over both bright and dark pages. Give the
    three pill containers a denser translucent fill + blur than the base --bg so
    buttons don't wash out on white pages, in both themes. */
@@ -280,7 +280,7 @@ body.chrome-hidden .drag-region {
 }
 
 .tab-search {
-  /* width:100% PLUS the 16px side margins overflowed the panel (#1). */
+  /* width:100% PLUS the 16px side margins overflowed the panel. */
   width: calc(100% - 32px);
   box-sizing: border-box;
   padding: 8px 12px;
@@ -331,7 +331,8 @@ body.chrome-hidden .drag-region {
 }
 
 .tab-row:hover { background: var(--surface); }
-.tab-row.active { background: rgba(122, 162, 247, 0.1); border-left: 2px solid var(--accent); }
+.tab-row.active { background: rgba(122, 162, 247, 0.16); }
+.tab-row.active .tab-title { font-weight: 600; }
 
 .tab-row .favicon { width: 16px; height: 16px; border-radius: 3px; flex-shrink: 0; }
 .tab-row .tab-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
@@ -414,6 +415,9 @@ body.chrome-hidden .drag-region {
   justify-content: center;
   gap: 24px;
   z-index: 50;
+  /* No page sits under the new-tab page, and the window itself is
+     transparent, so it needs its own backdrop to be readable. */
+  background: var(--bg-solid);
 }
 
 .newtab-page.visible { display: flex; }
@@ -423,10 +427,7 @@ body.chrome-hidden .drag-region {
   font-weight: 200;
   letter-spacing: -2px;
   font-variant-numeric: tabular-nums;
-  background: linear-gradient(135deg, var(--text) 30%, var(--accent));
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: var(--text);
   opacity: 0.9;
 }
 
@@ -471,7 +472,9 @@ body.chrome-hidden .drag-region {
   color: var(--text-dim);
 }
 
+.top-site { border: none; background: transparent; font: inherit; color: var(--text-dim); }
 .top-site:hover { background: var(--surface); }
+.top-site .site-label { max-width: 64px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .top-site .site-icon { width: 32px; height: 32px; border-radius: 8px; background: var(--surface); display: flex; align-items: center; justify-content: center; font-size: 1rem; }
 
 /* === Window drag region ===
@@ -997,7 +1000,7 @@ body.pin-mode .pin-image-container { display: flex; }
 .pin-image-container:hover .pin-close-btn { opacity: 1; }
 .pin-close-btn:hover { background: var(--danger); }
 
-/* === Context menu (Phase 5) — glass popup for overlay chrome === */
+/* === Context menu — glass popup for overlay chrome === */
 .context-menu {
   position: fixed;
   z-index: 9999;
@@ -1033,7 +1036,7 @@ body.pin-mode .pin-image-container { display: flex; }
 .context-menu-item.danger { color: var(--danger); }
 .context-menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
 
-/* === Web Store install banner (Phase 4) === */
+/* === Web Store install banner === */
 .webstore-banner {
   position: fixed;
   top: 52px;
@@ -1054,13 +1057,15 @@ body.pin-mode .pin-image-container { display: flex; }
   animation: ctx-in var(--anim);
 }
 
-/* === Top navigation loading bar (Phase 8) === */
+/* === Top navigation loading bar === */
 .nav-progress {
   position: fixed;
   top: 0;
   left: 0;
   height: 2px;
-  width: 0;
+  width: 100%;
+  transform: scaleX(0);
+  transform-origin: left;
   background: var(--accent);
   box-shadow: 0 0 6px var(--accent);
   z-index: 10000;
@@ -1069,16 +1074,16 @@ body.pin-mode .pin-image-container { display: flex; }
 }
 .nav-progress.loading {
   opacity: 1;
-  width: 85%;
-  transition: width 8s cubic-bezier(0.1, 0.7, 0.3, 1);
+  transform: scaleX(0.85);
+  transition: transform 8s cubic-bezier(0.1, 0.7, 0.3, 1);
 }
 .nav-progress.done {
   opacity: 0;
-  width: 100%;
-  transition: width 0.15s ease, opacity 0.3s ease 0.1s;
+  transform: scaleX(1);
+  transition: transform 0.15s ease, opacity 0.3s ease 0.1s;
 }
 
-/* === Settings section headers (v0.4.1 reorg) === */
+/* === Settings section headers === */
 .views-section-header {
   margin: 22px 0 2px;
   padding-bottom: 6px;

@@ -25,6 +25,34 @@ pub struct TabPool {
     active_tab_id: Option<i32>,
     /// Most-recently-used tab ids, front = most recent. Drives Ctrl+Tab switching.
     mru: Vec<i32>,
+    /// Views whose tab was closed/unloaded while a download they started is
+    /// unfinished. WebView2 cancels a download when its view closes, so these
+    /// stay alive, hidden, until reap_parked() finds them idle.
+    parked: Vec<Box<dyn ContentView + Send + Sync>>,
+}
+
+/// Unique suffix for content webview labels: tab ids are reused by SQLite, and
+/// a parked view can outlive its tab, so `content_tab_{id}` alone can collide.
+static VIEW_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Close parked views whose downloads have ended (called when one finishes).
+pub fn reap_parked_views(app: &AppHandle) {
+    let pool = app.state::<Arc<std::sync::Mutex<TabPool>>>();
+    let lock = pool.lock();
+    if let Ok(mut p) = lock {
+        p.reap_parked();
+    }
+}
+
+/// Outcome of a blank-document check on a tab (see heal_blank_tab).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlankHeal {
+    /// Showing a real document, or nothing to heal.
+    NotNeeded,
+    /// Blank, but a navigation is still in flight — check again later.
+    Wait,
+    /// Blank with nothing loading: the navigation was re-issued.
+    Healed,
 }
 
 fn raise_overlay(app: &AppHandle, window_label: &str) {
@@ -62,12 +90,53 @@ impl TabPool {
 
     pub fn remove_tab(&mut self, id: i32) {
         if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.remove(&id) {
-            view.close();
+            self.retire(view);
         }
         if self.active_tab_id == Some(id) {
             self.active_tab_id = None;
         }
         self.mru.retain(|&x| x != id);
+    }
+
+    /// Dispose of a view whose tab no longer shows it: close it, or park it
+    /// hidden while a download it started is unfinished.
+    fn retire(&mut self, view: Box<dyn ContentView + Send + Sync>) {
+        if view.has_active_downloads() {
+            tracing::info!("keeping webview of tab {} alive until its download ends", view.id().0);
+            view.set_visible(false);
+            view.set_memory_target(true);
+            self.parked.push(view);
+        } else {
+            view.close();
+        }
+    }
+
+    pub fn reap_parked(&mut self) {
+        let (busy, idle): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.parked).into_iter().partition(|v| v.has_active_downloads());
+        self.parked = busy;
+        for view in idle {
+            view.close();
+        }
+    }
+
+    /// Where to land after tab `closing` goes away: the most recently used tab
+    /// that still has a webview, among `candidates` (the closing tab's window,
+    /// in strip order). Never a cold tab — reloading one is exactly the work
+    /// closing a tab shouldn't cause. None → show the new-tab page.
+    pub fn next_loaded_tab(&self, closing: i32, candidates: &[i32]) -> Option<i32> {
+        let eligible = |id: i32| id != closing && candidates.contains(&id) && self.is_loaded(id);
+        self.mru
+            .iter()
+            .copied()
+            .find(|&id| eligible(id))
+            .or_else(|| candidates.iter().copied().find(|&id| eligible(id)))
+    }
+
+    /// Views that must keep running in the background: audio, a running
+    /// download, or a video floating in picture-in-picture.
+    fn is_busy(view: &(dyn ContentView + Send + Sync)) -> bool {
+        view.has_active_downloads() || view.in_picture_in_picture() || view.is_audio_playing()
     }
 
     fn touch_mru(&mut self, id: i32) {
@@ -109,10 +178,10 @@ impl TabPool {
 
             match state {
                 TabState::Live { view, last_active } | TabState::Suspended { view, last_active } => {
-                    if view.is_audio_playing() {
+                    if Self::is_busy(view.as_ref()) {
                         continue;
                     }
-                    
+
                     let is_pinned = if id < 0 {
                         crate::incognito::get_incognito_tab(id)
                             .map(|t| t.pinned)
@@ -142,31 +211,36 @@ impl TabPool {
         }
 
         if let Some(id) = candidate_id {
-            if let Some(state) = self.tabs.remove(&id) {
-                match state {
-                    TabState::Live { view, .. } | TabState::Suspended { view, .. } => {
-                        let snapshot = view.snapshot();
-                        if id < 0 {
-                            crate::incognito::update_incognito_tab(id, snapshot.url, Some(snapshot.title), snapshot.scroll_y);
-                        } else {
-                            db.execute(move |conn| {
-                                if let Ok(Some(mut db_tab)) = tabs_repo::get_tab(conn, id) {
-                                    db_tab.url = snapshot.url;
-                                    db_tab.title = Some(snapshot.title);
-                                    db_tab.scroll_y = snapshot.scroll_y;
-                                    let _ = tabs_repo::update_tab(conn, &db_tab);
-                                }
-                            });
-                        }
-                        view.close();
-                    }
-                    _ => {}
-                }
-                self.tabs.insert(id, TabState::Cold);
-                return true;
-            }
+            self.unload_to_cold(db, id);
+            return true;
         }
         false
+    }
+
+    /// Save a loaded tab's URL/title/scroll and close its webview, leaving it
+    /// Cold (it reloads from the saved state on next activation).
+    fn unload_to_cold(&mut self, db: &crate::db::DbState, id: i32) {
+        if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.remove(&id) {
+            let snapshot = view.snapshot();
+            // A view still on about:blank never committed its page; keep the
+            // stored URL rather than overwriting it with the blank document.
+            if !snapshot.url.is_empty() && snapshot.url != "about:blank" {
+                if id < 0 {
+                    crate::incognito::update_incognito_tab(id, snapshot.url, Some(snapshot.title), snapshot.scroll_y);
+                } else {
+                    db.execute(move |conn| {
+                        if let Ok(Some(mut db_tab)) = tabs_repo::get_tab(conn, id) {
+                            db_tab.url = snapshot.url;
+                            db_tab.title = Some(snapshot.title);
+                            db_tab.scroll_y = snapshot.scroll_y;
+                            let _ = tabs_repo::update_tab(conn, &db_tab);
+                        }
+                    });
+                }
+            }
+            self.retire(view);
+        }
+        self.tabs.insert(id, TabState::Cold);
     }
 
     pub fn activate_tab(&mut self, db: &crate::db::DbState, id: i32, app: &AppHandle) -> Result<(), String> {
@@ -177,13 +251,19 @@ impl TabPool {
         // Hide all other views. Titles/URLs are now event-driven (COM handlers),
         // so only the tab we're switching *away from* needs a scroll-position
         // capture — not every live tab. This removes the N-async-eval fan-out
-        // that ran under the pool lock on every switch (Phase 3 new-tab perf).
+        // that ran under the pool lock on every switch.
         for (&other_id, other_state) in &self.tabs {
             if other_id != id {
                 match other_state {
                     TabState::Live { view, .. } | TabState::Suspended { view, .. } => {
                         if Some(other_id) == prev_active {
                             view.refresh_snapshot();
+                            // Leaving a tab with a playing video: float it.
+                            if crate::prefs::auto_pip() {
+                                view.picture_in_picture(crate::engine::PipRequest::Auto);
+                            }
+                            // Background tabs trim caches; JS and media keep running.
+                            view.set_memory_target(true);
                         }
                         view.set_visible(false);
                     }
@@ -244,6 +324,8 @@ impl TabPool {
             *last_active = Instant::now();
             view.set_bounds(rect);
             view.set_visible(true);
+            view.set_memory_target(false);
+            view.picture_in_picture(crate::engine::PipRequest::ExitAuto);
             // Activation = the user is switching to this page: move keyboard
             // focus into it so accelerators/typing work without a click.
             view.focus();
@@ -258,6 +340,8 @@ impl TabPool {
                 view.resume();
                 view.set_bounds(rect);
                 view.set_visible(true);
+                view.set_memory_target(false);
+                view.picture_in_picture(crate::engine::PipRequest::ExitAuto);
                 view.focus();
                 self.tabs.insert(id, TabState::Live {
                     view,
@@ -270,14 +354,15 @@ impl TabPool {
             self.tabs.insert(id, state);
         }
 
-        // It is Cold. Evict LRU if active count >= 5
-        while self.get_active_count() >= 5 {
+        // It is Cold. Unload least-recently-used tabs to stay under the limit.
+        while self.get_active_count() >= crate::prefs::max_loaded_tabs() {
             if !self.evict_lru(db) {
                 break;
             }
         }
 
-        let label = format!("content_tab_{}", id);
+        let serial = VIEW_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let label = format!("content_tab_{}_{}", id, serial);
         let is_incognito = crate::incognito::is_incognito_window(db_tab.window_id);
 
         // Webview creation MUST happen on the main thread — add_child from a
@@ -301,10 +386,9 @@ impl TabPool {
                     // browser_extensions_enabled MUST match the parent incognito
                     // window's setting: WebView2 webviews sharing an app-data dir
                     // must agree on environment options or creation silently
-                    // fails (the 0.4.1 capture-window lesson). Without this the
-                    // incognito content webview was born dead — "open a website
-                    // in incognito does nothing". The InPrivate profile holds no
-                    // installed extensions, so none actually load.
+                    // fails and the incognito content webview never loads. The
+                    // InPrivate profile holds no installed extensions, so none
+                    // actually load.
                     webview_builder = webview_builder.incognito(true).browser_extensions_enabled(true);
                 } else {
                     // Enable extensions on the shared profile. The profile
@@ -319,7 +403,7 @@ impl TabPool {
             }).map_err(|e| e.to_string())?;
         }
         // Bounded wait: if the main thread is wedged, fail the activation
-        // instead of holding the pool lock forever (past freeze root cause).
+        // instead of holding the pool lock forever and freezing the app.
         let webview = rx.recv_timeout(Duration::from_secs(15))
             .map_err(|_| "webview creation timed out on main thread".to_string())??;
 
@@ -330,7 +414,7 @@ impl TabPool {
         // add_child had just created at a larger (e.g. maximized) size. Seed the
         // real creation rect FIRST so a page opened while the window is already
         // maximized fills it (no Resized event fires afterward to correct it).
-        let view = Box::new(WebView2ContentView::new(ViewId(id as u32), webview, is_incognito));
+        let view = Box::new(WebView2ContentView::new(ViewId(id as u32), serial, webview, is_incognito));
         view.set_bounds(rect);
         view.set_visible(true);
         view.focus();
@@ -354,46 +438,65 @@ impl TabPool {
         Ok(())
     }
 
+    fn is_pinned(db: &crate::db::DbState, id: i32) -> bool {
+        if id < 0 {
+            return crate::incognito::get_incognito_tab(id).map(|t| t.pinned).unwrap_or(false);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        db.execute(move |conn| {
+            let pinned = tabs_repo::get_tab(conn, id)
+                .map(|opt| opt.map(|t| t.pinned).unwrap_or(false))
+                .unwrap_or(false);
+            let _ = tx.send(pinned);
+        });
+        rx.recv().unwrap_or(false)
+    }
+
+    /// The 30s background sweep: freeze tabs idle past the suspend threshold
+    /// and (memory saver) unload unpinned ones idle past the discard threshold.
+    /// Busy views (audio, downloads, picture-in-picture) are never touched.
     pub fn suspend_idle(&mut self, db: &crate::db::DbState) {
         let now = Instant::now();
         let mut keys_to_suspend = Vec::new();
+        let mut keys_to_discard = Vec::new();
+        let suspend_after = crate::prefs::suspend_after();
+        let discard_after = crate::prefs::discard_after();
 
         for (&id, state) in &self.tabs {
             if Some(id) == self.active_tab_id {
                 continue;
             }
-
-            if let TabState::Live { view, last_active } = state {
-                if view.is_audio_playing() {
-                    continue;
-                }
-
-                let is_pinned = if id < 0 {
-                    crate::incognito::get_incognito_tab(id)
-                        .map(|t| t.pinned)
-                        .unwrap_or(false)
-                } else {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    db.execute(move |conn| {
-                        let is_pinned = tabs_repo::get_tab(conn, id)
-                            .map(|opt| opt.map(|t| t.pinned).unwrap_or(false))
-                            .unwrap_or(false);
-                        let _ = tx.send(is_pinned);
-                    });
-                    rx.recv().unwrap_or(false)
-                };
-
-                let idle_threshold = if is_pinned {
-                    Duration::from_secs(30 * 60) // Pinned: 30 mins
-                } else {
-                    Duration::from_secs(5 * 60) // Unpinned: 5 mins
-                };
-
-                if now.duration_since(*last_active) > idle_threshold {
+            let (view, last_active, live) = match state {
+                TabState::Live { view, last_active } => (view, last_active, true),
+                TabState::Suspended { view, last_active } => (view, last_active, false),
+                TabState::Cold => continue,
+            };
+            let idle = now.duration_since(*last_active);
+            let wants_suspend = live && suspend_after.map_or(false, |t| idle > t);
+            let wants_discard = discard_after.map_or(false, |t| idle > t);
+            if !wants_suspend && !wants_discard {
+                continue;
+            }
+            if Self::is_busy(view.as_ref()) {
+                continue;
+            }
+            let pinned = Self::is_pinned(db, id);
+            if wants_discard && !pinned {
+                keys_to_discard.push(id);
+            } else if wants_suspend {
+                // Pinned tabs stay live longer before freezing.
+                let threshold = if pinned { Duration::from_secs(30 * 60) } else { Duration::ZERO };
+                if idle > threshold {
                     keys_to_suspend.push(id);
                 }
             }
         }
+
+        for id in keys_to_discard {
+            tracing::info!("memory saver: unloading idle tab {}", id);
+            self.unload_to_cold(db, id);
+        }
+        self.reap_parked();
 
         for id in keys_to_suspend {
             if let Some(TabState::Live { view, last_active }) = self.tabs.remove(&id) {
@@ -428,7 +531,7 @@ impl TabPool {
                 continue;
             }
             if let TabState::Live { view, .. } = state {
-                if view.is_audio_playing() {
+                if Self::is_busy(view.as_ref()) {
                     continue;
                 }
                 let win = if id < 0 {
@@ -474,7 +577,7 @@ impl TabPool {
     }
 
     /// Give a tab's webview keyboard focus (used after closing a tab so page
-    /// accelerators keep working without a click — #3).
+    /// accelerators keep working without a click).
     pub fn focus_tab(&self, id: i32) {
         if let Some(TabState::Live { view, .. }) = self.tabs.get(&id) {
             view.focus();
@@ -505,7 +608,7 @@ impl TabPool {
 
     /// Set the Chromium memory-usage target on every live/suspended view.
     /// LOW while the window is hidden trims caches without freezing JS or
-    /// pausing media; NORMAL restores full performance on show.
+    /// pausing media.
     pub fn set_memory_target_all(&self, low: bool) {
         for state in self.tabs.values() {
             if let TabState::Live { view, .. } | TabState::Suspended { view, .. } = state {
@@ -514,12 +617,27 @@ impl TabPool {
         }
     }
 
+    /// Window shown again: only the visible tab goes back to NORMAL; background
+    /// tabs keep the LOW target they get when left.
+    pub fn restore_active_memory_target(&self) {
+        if let Some(id) = self.active_tab_id {
+            if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.get(&id) {
+                view.set_memory_target(false);
+            }
+        }
+    }
+
+    /// Picture-in-picture request for the active tab's page.
+    pub fn pip_active(&self, req: crate::engine::PipRequest) -> Result<(), String> {
+        self.with_active_view(|v| v.picture_in_picture(req))
+    }
+
     /// Discard a tab's live webview (free memory) while keeping the tab row, and
     /// clear it as the active tab. The tab goes Cold and reloads on next
-    /// activation (#10 "unload tab").
+    /// activation ("Unload tab").
     pub fn discard_tab(&mut self, id: i32) {
         if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.remove(&id) {
-            view.close();
+            self.retire(view);
         }
         self.tabs.insert(id, TabState::Cold);
         if self.active_tab_id == Some(id) {
@@ -556,23 +674,29 @@ impl TabPool {
     /// signature of a CANCELED initial navigation (WebView2 aborts in-flight
     /// navigations profile-wide when an extension is added, among other causes):
     /// the tab looks open but shows nothing, and Reload would only reload the
-    /// blank document. Returns true when a heal was issued.
-    pub fn heal_blank_tab(&self, id: i32, url: &str) -> bool {
+    /// blank document. A blank document is expected while a slow page is still
+    /// loading and after a navigation turned into a download — re-navigating
+    /// then restarts the load or downloads the file twice — so those wait,
+    /// unless `user_reload` (the user asked to retry the load).
+    pub fn heal_blank_tab(&self, id: i32, url: &str, user_reload: bool) -> BlankHeal {
         if url.is_empty() || url == "about:blank" {
-            return false;
+            return BlankHeal::NotNeeded;
         }
         if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.get(&id) {
             let cur = view.snapshot().url;
             if cur.is_empty() || cur == "about:blank" {
+                if !view.blank_heal_allowed() && !user_reload {
+                    return BlankHeal::Wait;
+                }
                 tracing::warn!(
                     "tab {}: initial navigation was lost (blank document, expected {}) — re-navigating",
                     id, url
                 );
                 view.navigate(url);
-                return true;
+                return BlankHeal::Healed;
             }
         }
-        false
+        BlankHeal::NotNeeded
     }
 
     /// Public wrapper for the post-activation heal check (tabs.rs).
@@ -604,7 +728,7 @@ impl TabPool {
     ) -> Result<(), String> {
         let id = self.active_tab_id.ok_or_else(|| "No active tab".to_string())?;
         if let Some(url) = Self::stored_url(db, id) {
-            if self.heal_blank_tab(id, &url) {
+            if self.heal_blank_tab(id, &url, true) == BlankHeal::Healed {
                 return Ok(());
             }
         }
@@ -612,6 +736,37 @@ impl TabPool {
             return Ok(());
         }
         tracing::warn!("nav_reload: active tab {} has no live view — re-activating", id);
+        self.activate_tab(db, id, app)
+    }
+
+    /// Return tab `id` to the new-tab page: its view is retired (parked if still
+    /// downloading) and its stored URL cleared, so neither activation nor a
+    /// session restore reloads what it was showing.
+    pub fn reset_to_new_tab(
+        &mut self,
+        db: &crate::db::DbState,
+        app: &AppHandle,
+        id: i32,
+    ) -> Result<(), String> {
+        if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.remove(&id) {
+            self.retire(view);
+        }
+        self.tabs.insert(id, TabState::Cold);
+        if id < 0 {
+            crate::incognito::update_incognito_tab(id, "about:blank".to_string(), None, 0.0);
+        } else {
+            let (tx, rx) = std::sync::mpsc::channel();
+            db.execute(move |conn| {
+                if let Ok(Some(mut db_tab)) = tabs_repo::get_tab(conn, id) {
+                    db_tab.url = "about:blank".to_string();
+                    db_tab.title = None;
+                    db_tab.scroll_y = 0.0;
+                    let _ = tabs_repo::update_tab(conn, &db_tab);
+                }
+                let _ = tx.send(());
+            });
+            let _ = rx.recv();
+        }
         self.activate_tab(db, id, app)
     }
 
@@ -636,11 +791,7 @@ impl TabPool {
 
         if state_is_live {
             if is_blank {
-                if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.remove(&id) {
-                    view.close();
-                }
-                self.tabs.insert(id, TabState::Cold);
-                self.activate_tab(db, id, app)
+                self.reset_to_new_tab(db, app, id)
             } else {
                 if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.get(&id) {
                     view.navigate(url);
@@ -668,5 +819,59 @@ impl TabPool {
             }
             self.activate_tab(db, id, app)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{Rect, TabRuntimeState};
+
+    struct FakeView;
+    impl ContentView for FakeView {
+        fn id(&self) -> ViewId { ViewId(0) }
+        fn navigate(&self, _url: &str) {}
+        fn back(&self) {}
+        fn forward(&self) {}
+        fn reload(&self) {}
+        fn stop(&self) {}
+        fn set_bounds(&self, _rect: Rect) {}
+        fn set_visible(&self, _v: bool) {}
+        fn try_suspend(&self, done: Box<dyn FnOnce(bool) + Send>) { done(false) }
+        fn resume(&self) {}
+        fn snapshot(&self) -> TabRuntimeState {
+            TabRuntimeState {
+                url: String::new(), title: String::new(), favicon_url: String::new(),
+                scroll_y: 0.0, can_go_back: false, can_go_forward: false,
+            }
+        }
+        fn mute(&self, _m: bool) {}
+        fn find(&self, _text: &str, _forward: bool) {}
+        fn zoom(&self, _factor: f64) {}
+        fn close(self: Box<Self>) {}
+    }
+
+    fn live() -> TabState {
+        TabState::Live { view: Box::new(FakeView), last_active: Instant::now() }
+    }
+
+    #[test]
+    fn closing_lands_on_most_recent_loaded_tab_never_a_cold_one() {
+        let mut p = TabPool::new();
+        p.tabs.insert(1, TabState::Cold);
+        p.tabs.insert(2, live());
+        p.tabs.insert(4, live());
+        p.tabs.insert(5, TabState::Cold);
+        // Closing 3; most recent before it was 1 (cold), then 4, then 2.
+        p.mru = vec![3, 1, 4, 2];
+        assert_eq!(p.next_loaded_tab(3, &[1, 2, 4, 5]), Some(4));
+
+        // A loaded tab that was never activated (opened in the background) is
+        // still preferred over a cold neighbour.
+        p.mru = vec![3, 1];
+        assert_eq!(p.next_loaded_tab(3, &[1, 2, 4, 5]), Some(2));
+
+        // Only cold tabs left → None, i.e. the new-tab page.
+        assert_eq!(p.next_loaded_tab(3, &[1, 5]), None);
     }
 }

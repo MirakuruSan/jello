@@ -14,7 +14,7 @@
     <div class="drag-region interactive" data-tauri-drag-region></div>
 
     <div id="overlay-ui">
-      <!-- Top navigation loading bar (Phase 8) -->
+      <!-- Top navigation loading bar -->
       <div class="nav-progress region-visible" id="nav-progress"></div>
       <!-- ===== Top bar: floating pills ===== -->
       <div class="top-bar interactive" id="top-bar" data-tauri-drag-region>
@@ -35,6 +35,8 @@
 
         <!-- Controls pill (top-right) -->
         <div class="controls-pill glass interactive no-drag" id="controls-pill">
+          <button class="pill-btn interactive" id="btn-pip" title="Picture-in-picture (Alt+P)" hidden>⧉</button>
+          <button class="pill-btn dl-btn interactive" id="btn-downloads" title="Downloads (Ctrl+J)" hidden>↓</button>
           <button class="pill-btn interactive" id="btn-pin" title="Pin window on top" aria-pressed="false"></button>
           <button class="pill-btn interactive" id="btn-bookmark" title="Bookmark this page (Ctrl+D)" aria-pressed="false">☆</button>
           <button class="pill-btn interactive" id="btn-new-tab" title="New tab (Ctrl+T)">+</button>
@@ -139,7 +141,6 @@
         </label>
 
         <label class="wizard-check"><input type="checkbox" id="wiz-adblock" class="interactive" checked /> Block ads &amp; trackers (installs uBlock Origin)</label>
-        <label class="wizard-check"><input type="checkbox" id="wiz-suggest" class="interactive" /> Search suggestions (sends keystrokes to the engine)</label>
         <label class="wizard-check"><input type="checkbox" id="wiz-restore" class="interactive" /> Restore tabs on startup</label>
         <label class="wizard-check"><input type="checkbox" id="wiz-update" class="interactive" /> Automatically check for updates</label>
 

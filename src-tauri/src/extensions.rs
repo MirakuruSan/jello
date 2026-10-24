@@ -53,12 +53,10 @@ pub fn runtime_id_for(store_id: &str) -> Option<String> {
 
 /// Remove from the SHARED WebView2 profile every extension that is not in the
 /// enabled set. `AddBrowserExtension` PERSISTS the extension in the profile
-/// across sessions, so disable / uninstall / dedupe that only touched the DB
-/// and staging left every previously-added extension silently running forever.
-/// (Observed live on 0.4.5: SIX extensions active — two full uBlock Origins
-/// among them — while the DB said one; every request paid the stacked filter
-/// passes → "everything loads slow".) Runs once per session after the first
-/// content webview loads its extensions, and again on disable/uninstall.
+/// across sessions, so a disable / uninstall / dedupe that only touched the DB
+/// and staging would leave the extension running — stacked ad blockers make
+/// every request pay several filter passes. Runs once per session after the
+/// first content webview loads its extensions, and again on disable/uninstall.
 pub fn sync_profile_extensions(app: &AppHandle, webview: &tauri::Webview<tauri::Wry>) {
     #[cfg(target_os = "windows")]
     {
@@ -182,8 +180,8 @@ pub fn sync_profile_extensions(app: &AppHandle, webview: &tauri::Webview<tauri::
                     // profile, or an install/enable done while the app was
                     // closed). Normally this adds NOTHING — the profile persists
                     // — which matters: AddBrowserExtension cancels in-flight
-                    // navigations profile-wide (the "restored tab loads blank"
-                    // root cause), so it must stay off the per-tab hot path.
+                    // navigations profile-wide (a restored tab would load blank),
+                    // so it must stay off the per-tab hot path.
                     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2BrowserExtension;
                     use webview2_com::ProfileAddBrowserExtensionCompletedHandler;
                     use windows::core::{HSTRING, PCWSTR};
@@ -241,7 +239,11 @@ pub fn sync_profile_now(app: &AppHandle) {
     let webviews = app.webviews();
     let wv = webviews.get("main").or_else(|| {
         webviews.iter().find_map(|(label, wv)| {
-            let id: Option<i32> = label.strip_prefix("content_tab_").and_then(|s| s.parse().ok());
+            // Labels are content_tab_{tabId}_{serial}.
+            let id: Option<i32> = label
+                .strip_prefix("content_tab_")
+                .and_then(|s| s.split('_').next())
+                .and_then(|s| s.parse().ok());
             (id.map_or(false, |i| i > 0)).then_some(wv)
         })
     });
@@ -400,7 +402,7 @@ async fn download_google(ext_id: &str) -> Result<Vec<u8>, String> {
     fetch_crx_bytes(&url).await
 }
 
-/// Microsoft Edge Add-ons CRX endpoint (P1.4). Response is CRX3 — same strip.
+/// Microsoft Edge Add-ons CRX endpoint. Response is CRX3 — same strip.
 async fn download_edge(ext_id: &str) -> Result<Vec<u8>, String> {
     let url = format!(
         "https://edge.microsoft.com/extensionwebstorebase/v1/crx?response=redirect&x=id%3D{}%26installsource%3Dondemand%26uc",
@@ -409,7 +411,7 @@ async fn download_edge(ext_id: &str) -> Result<Vec<u8>, String> {
     fetch_crx_bytes(&url).await
 }
 
-/// Source-aware CRX download (P1.4): Google first for Chrome Web Store ids; Edge
+/// Source-aware CRX download: Google first for Chrome Web Store ids; Edge
 /// first for Edge Add-ons URLs. Falls back to the other store so an id that only
 /// exists in one store still resolves. Async — never on the IPC handler thread.
 async fn download_crx(ext_id: &str, prefer_edge: bool) -> Result<Vec<u8>, String> {
@@ -438,7 +440,7 @@ struct Manifest {
 
 /// Chrome extensions localize their name as `__MSG_key__`; the real string lives
 /// in `_locales/<default_locale>/messages.json` under `key.message`. Resolve it
-/// so the UI shows "uBlock Origin Lite" instead of the raw id (Phase 4.2.4).
+/// so the UI shows "uBlock Origin Lite" instead of the raw id.
 fn resolve_localized_name(dir: &Path, raw_name: &str, default_locale: &Option<String>) -> Option<String> {
     let key = raw_name.strip_prefix("__MSG_")?.strip_suffix("__")?;
     let locale = default_locale.as_deref()?;
@@ -478,7 +480,7 @@ fn extract_and_read_manifest(zip_bytes: &[u8], dest: &Path) -> Result<Manifest, 
     }
     // GitHub release zips (e.g. uBlock Origin's uBlock0_x.chromium.zip) nest
     // everything under a single root dir. Flatten it so manifest.json is at the
-    // top (P1.3.3).
+    // top.
     flatten_single_root(dest);
     let manifest_path = dest.join("manifest.json");
     if !manifest_path.exists() {
@@ -515,8 +517,9 @@ fn flatten_single_root(dest: &Path) {
 }
 
 /// Core install. `prompt` = show a consent dialog (false for the wizard's
-/// auto-install, where the checkbox already gave consent). Async per threading
-/// rule #1 — this creates dirs, hits the network, and may show a dialog.
+/// auto-install, where the checkbox already gave consent). Async because it
+/// creates directories, hits the network, and may show a dialog — none of
+/// which may block the IPC handler on the main thread.
 async fn install_ext(
     ext_id: String,
     prompt: bool,
@@ -529,7 +532,7 @@ async fn install_ext(
     install_from_zip_bytes(zip_bytes, ext_id, prompt, db, app).await
 }
 
-/// Shared install tail (P1.3): extract → consent → move into place → DB. Used by
+/// Shared install tail: extract → consent → move into place → DB. Used by
 /// both store installs (download_crx→strip) and file/drag installs.
 async fn install_from_zip_bytes(
     zip_bytes: Vec<u8>,
@@ -616,11 +619,11 @@ pub async fn extensions_install(
     app: AppHandle,
 ) -> Result<Extension, String> {
     let ext_id = resolve_ext_id(&crx_id_or_url)?;
-    // Edge Add-ons URLs → hit the Edge CRX endpoint first (P1.4).
+    // Edge Add-ons URLs → hit the Edge CRX endpoint first.
     let prefer_edge = crx_id_or_url.contains("microsoftedge.microsoft.com");
     let ext = install_ext(ext_id, true, prefer_edge, &db, &app).await?;
-    // Additive staging + cache refresh — NEVER the destructive runtime rebuild
-    // (§2 finding #8). The extension loads into newly opened tabs immediately.
+    // Additive staging + cache refresh — never the destructive runtime rebuild.
+    // The extension loads into newly opened tabs immediately.
     stage_one_additive(&app, &ext);
     refresh_enabled_cache(&db);
     // Install into the live profile now (extensions load without a restart).
@@ -639,7 +642,7 @@ fn slug_id_from(seed: &str) -> String {
         .collect()
 }
 
-/// Install an extension from a local .crx or .zip file (P1.3). Reads the bytes,
+/// Install an extension from a local .crx or .zip file. Reads the bytes,
 /// strips a CRX3 header if present (else treats it as a plain zip), then runs the
 /// shared consent+install tail.
 #[command]
@@ -668,7 +671,7 @@ pub async fn extensions_install_file(
     Ok(ext)
 }
 
-/// Open a native file picker and install the chosen .crx/.zip (P1.3.2).
+/// Open a native file picker and install the chosen .crx/.zip.
 #[command]
 pub async fn extensions_install_file_dialog(
     db: State<'_, DbState>,
@@ -739,7 +742,7 @@ pub fn dedupe_ad_blockers(db: &DbState) -> usize {
     disabled
 }
 
-/// Install the full uBlock Origin (MV2) from its latest GitHub release (#9) —
+/// Install the full uBlock Origin (MV2) from its latest GitHub release —
 /// the wizard/settings now offer this instead of the weaker uBO Lite.
 #[command]
 pub async fn extensions_install_ubo(
@@ -813,7 +816,7 @@ pub async fn extensions_uninstall(
     Ok(())
 }
 
-/// Real restart (P1.1.4): the close button only hides to tray and a relaunch
+/// Real restart: the close button only hides to tray and a relaunch
 /// hits single-instance, so the process never actually restarts and users could
 /// be stuck on stale staging. This performs a true restart.
 #[command]
@@ -856,7 +859,7 @@ fn read_options_page(dir: &Path) -> Option<String> {
 
 /// Open an installed extension's options/settings page in a dedicated window.
 /// Uses the REAL runtime chrome-extension:// id captured from
-/// `AddBrowserExtension` (P1.2); falls back to the deterministic path hash only
+/// `AddBrowserExtension`; falls back to the deterministic path hash only
 /// when the extension hasn't been loaded into a live profile yet.
 #[command]
 pub async fn extensions_open_options(
@@ -869,7 +872,7 @@ pub async fn extensions_open_options(
     if !staging.join("manifest.json").exists() {
         // Staging can be stale/missing (disable, a mid-session rebuild, etc.).
         // Re-stage from the installed source on demand instead of failing with
-        // "Extension isn't loaded" (#11) — that error was firing far too often.
+        // "Extension isn't loaded" — that error was firing far too often.
         if let Ok(exts) = db_list_extensions(&db) {
             if let Some(ext) = exts.iter().find(|e| e.id == id) {
                 stage_one_additive(&app, ext);
@@ -887,8 +890,8 @@ pub async fn extensions_open_options(
     let url = format!("chrome-extension://{}/{}", runtime_id, options.trim_start_matches('/'));
     let _ = (&db, &pool);
 
-    // Open in a dedicated top-level window (the user's suggestion). A separate
-    // window may host the extension page where a content tab can't.
+    // Open in a dedicated top-level window: it may host the extension page
+    // where a content tab can't.
     use tauri::{WebviewUrl, WebviewWindowBuilder};
     let parsed: tauri::Url = url.parse().map_err(|e| format!("bad extension url: {e}"))?;
     let label = format!("ext_{}", &runtime_id[..8]);
@@ -902,6 +905,24 @@ pub async fn extensions_open_options(
         .browser_extensions_enabled(true)
         .build()
         .map_err(|e| e.to_string())?;
+
+    // Extension pages close themselves with window.close(); WebView2 only
+    // raises a request for that, which left an empty window behind.
+    #[cfg(target_os = "windows")]
+    {
+        let close_win = win.clone();
+        let _ = win.with_webview(move |w| unsafe {
+            use webview2_com::WindowCloseRequestedEventHandler;
+            if let Ok(core) = w.controller().CoreWebView2() {
+                let handler = WindowCloseRequestedEventHandler::create(Box::new(move |_s, _a| {
+                    let _ = close_win.close();
+                    Ok(())
+                }));
+                let mut token: i64 = 0;
+                let _ = core.add_WindowCloseRequested(&handler, &mut token);
+            }
+        });
+    }
 
     // The shared profile already holds every enabled extension (persisted;
     // sync_profile_extensions keeps it true), so no per-window load is needed —
@@ -967,4 +988,108 @@ pub fn rebuild_active_extensions(app: &AppHandle, db: &DbState) -> usize {
     // Seed the enabled cache so the content-webview load path needs no DB.
     set_enabled_cache(exts.into_iter().filter(|e| e.enabled).collect());
     staged
+}
+
+// ── uBlock Origin user filters ──────────────────────────────────────────────
+// uBO's default lists block Google's async AI Overview request
+// (google.com/async/folsrch), which leaves results pages saying "Can't
+// generate an AI overview right now". These exceptions re-allow exactly that
+// request; ads and trackers stay blocked.
+const UBO_USER_FILTERS: &[&str] = &["@@||www.google.com/async/folsrch^"];
+/// Bump when UBO_USER_FILTERS changes so existing installs get the new set.
+const UBO_FILTERS_REV: u32 = 1;
+
+/// Runs inside uBO's own "My filters" page and appends missing exceptions via
+/// the same messages its Apply button sends. Leaves the outcome in
+/// window.__jelloUboPatch for the host to poll.
+const UBO_PATCH_JS: &str = r#"(async (rules) => {
+  const done = (v) => { window.__jelloUboPatch = v; };
+  try {
+    for (let i = 0; i < 50 && !(self.vAPI && vAPI.messaging); i++) await new Promise((r) => setTimeout(r, 100));
+    const cur = await vAPI.messaging.send('dashboard', { what: 'readUserFilters' });
+    const text = cur.content || '';
+    const lines = text.split('\n').map((l) => l.trim());
+    const missing = rules.filter((r) => !lines.includes(r));
+    if (!missing.length) return done('present');
+    const content = (text.trim() ? text.replace(/\s*$/, '\n') : '') + missing.join('\n') + '\n';
+    await vAPI.messaging.send('dashboard', { what: 'writeUserFilters', content, enabled: true, trusted: cur.trusted });
+    await vAPI.messaging.send('dashboard', { what: 'reloadAllFilters' });
+    done('added');
+  } catch (e) {
+    done('error: ' + e);
+  }
+})"#;
+
+/// Make sure uBlock Origin carries Jello's user-filter exceptions. Runs once
+/// per uBO version (and per UBO_FILTERS_REV), in a hidden window on uBO's
+/// "My filters" page — extension pages can't be scripted from content tabs.
+pub fn ensure_ubo_user_filters(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // Let startup (extension sync, session restore) settle first.
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        let db = app.state::<DbState>();
+        let Ok(exts) = db_list_extensions(&db) else { return };
+        let Some(ubo) = exts.into_iter().find(|e| {
+            e.enabled && active_extensions_dir(&app).join(&e.id).join("js").join("1p-filters.js").exists()
+        }) else {
+            return;
+        };
+        let stamp = format!("{}|{}", ubo.version, UBO_FILTERS_REV);
+        if crate::capture::screenshot::get_setting(&app, "uboUserFiltersApplied").as_deref() == Some(stamp.as_str()) {
+            return;
+        }
+        let staging = active_extensions_dir(&app).join(&ubo.id);
+        let runtime_id = runtime_id_for(&ubo.id).unwrap_or_else(|| chromium_unpacked_id(&staging));
+        let Ok(url) = format!("chrome-extension://{}/1p-filters.html", runtime_id).parse::<tauri::Url>() else { return };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app_m = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            // browser_extensions_enabled must match every other webview (they
+            // share the app-data dir) or WebView2 refuses to create this one.
+            let res = tauri::WebviewWindowBuilder::new(&app_m, "ubo_filters", tauri::WebviewUrl::External(url))
+                .visible(false)
+                .skip_taskbar(true)
+                .browser_extensions_enabled(true)
+                .build();
+            let _ = tx.send(res.map_err(|e| e.to_string()));
+        });
+        let win = match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(Ok(w)) => w,
+            other => {
+                tracing::warn!("uBO filter patch: window creation failed: {:?}", other.err());
+                return;
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let rules = serde_json::to_string(UBO_USER_FILTERS).unwrap_or_else(|_| "[]".into());
+        let _ = win.eval(format!("{}({})", UBO_PATCH_JS, rules));
+
+        let outcome = std::sync::Arc::new(Mutex::new(String::new()));
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let slot = outcome.clone();
+            let _ = win.eval_with_callback("window.__jelloUboPatch || ''", move |res| {
+                *slot.lock().unwrap() = res.trim().trim_matches('"').to_string();
+            });
+            if !outcome.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        let result = outcome.lock().unwrap().clone();
+        let _ = win.close();
+        tracing::info!("uBO filter patch: {}", if result.is_empty() { "no answer" } else { &result });
+        if result == "added" || result == "present" {
+            let (tx, rx) = std::sync::mpsc::channel();
+            db.execute(move |conn| {
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value_json) VALUES ('uboUserFiltersApplied', ?1)",
+                    [stamp],
+                );
+                let _ = tx.send(());
+            });
+            let _ = rx.recv();
+        }
+    });
 }

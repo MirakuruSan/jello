@@ -1,5 +1,5 @@
 // Shared IPC types (TS mirror of src-tauri/src/ipc_types.rs)
-// Field names must be byte-identical (camelCase) per SPEC §B.4
+// Field names must be byte-identical (camelCase)
 
 export interface Tab {
   id: number;

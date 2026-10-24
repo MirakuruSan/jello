@@ -1,4 +1,4 @@
-// M6: query/mutation commands backing the history, bookmarks, and settings views.
+// Query/mutation commands backing the history, bookmarks, and settings views.
 use tauri::{command, State};
 use crate::db::DbState;
 use crate::ipc_types::{HistoryEntry, Bookmark};
@@ -31,6 +31,51 @@ pub async fn history_delete(mode: String, ids: Option<Vec<i32>>, db: State<'_, D
             _ => Ok(()),
         }
     })
+}
+
+#[derive(serde::Serialize)]
+pub struct TopSite {
+    url: String,
+    title: String,
+}
+
+/// Short tile label for a host: "youtube.com" → "youtube", "music.youtube.com"
+/// → "music.youtube"; IP addresses and single-label hosts stay as they are.
+fn site_label(host: &str) -> String {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_string();
+    }
+    match host.rsplit_once('.') {
+        Some((rest, _tld)) if !rest.is_empty() => rest.to_string(),
+        _ => host.to_string(),
+    }
+}
+
+/// Most-visited sites for the new-tab page: the highest-frecency history
+/// collapsed to one tile per host, each opening the site's front page (the
+/// top entry for a host is often a search or a deep link).
+#[command]
+pub async fn top_sites(limit: Option<usize>, db: State<'_, DbState>) -> Result<Vec<TopSite>, String> {
+    let limit = limit.unwrap_or(10).min(20);
+    let entries = db_call(&db, |conn| crate::db::history::get_top_history_by_frecency(conn, 300))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut sites = Vec::new();
+    for entry in entries {
+        let Ok(url) = tauri::Url::parse(&entry.url) else { continue };
+        if !matches!(url.scheme(), "http" | "https") {
+            continue;
+        }
+        let Some(host) = url.host_str() else { continue };
+        let site = host.trim_start_matches("www.").to_string();
+        if !seen.insert(site.clone()) {
+            continue;
+        }
+        sites.push(TopSite { url: format!("{}://{}/", url.scheme(), host), title: site_label(&site) });
+        if sites.len() == limit {
+            break;
+        }
+    }
+    Ok(sites)
 }
 
 #[command]
@@ -79,6 +124,9 @@ pub async fn settings_get(db: State<'_, DbState>) -> Result<serde_json::Value, S
 #[command]
 pub async fn settings_set(patch: serde_json::Value, db: State<'_, DbState>) -> Result<(), String> {
     let obj = patch.as_object().cloned().ok_or_else(|| "patch must be an object".to_string())?;
+    for (k, v) in &obj {
+        crate::prefs::apply(k, v);
+    }
     db_call(&db, move |conn| {
         let tx = conn.transaction()?;
         for (k, v) in obj {
@@ -94,4 +142,17 @@ pub async fn settings_set(patch: serde_json::Value, db: State<'_, DbState>) -> R
         tx.commit()?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::site_label;
+
+    #[test]
+    fn site_labels_drop_the_tld_only() {
+        assert_eq!(site_label("youtube.com"), "youtube");
+        assert_eq!(site_label("music.youtube.com"), "music.youtube");
+        assert_eq!(site_label("127.0.0.1"), "127.0.0.1");
+        assert_eq!(site_label("localhost"), "localhost");
+    }
 }

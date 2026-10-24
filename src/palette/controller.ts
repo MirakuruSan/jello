@@ -126,15 +126,15 @@ export class PaletteController {
       // Add history
       this.items.push(...results.history);
 
-      // Add search engine fallback if query is not empty
-      if (this.currentQuery.trim().length > 0) {
-        this.items.push({
-          id: "search:duckduckgo",
-          itemType: "search",
-          title: `Search DuckDuckGo for "${this.currentQuery.trim()}"`,
-          url: this.currentQuery.trim(),
-          matchedRanges: [],
-        });
+      // Web search with the user's engine, then straight-to-AI-answer rows.
+      const q = this.currentQuery.trim();
+      if (q.length > 0) {
+        const enc = encodeURIComponent(q);
+        this.items.push(
+          { id: "search:default", itemType: "search", title: `Search the web for "${q}"`, url: q, matchedRanges: [] },
+          { id: "ai:google", itemType: "search", title: `Ask Google AI Mode: "${q}"`, url: `https://www.google.com/search?udm=50&q=${enc}`, matchedRanges: [] },
+          { id: "ai:duck", itemType: "search", title: `Ask Duck.ai: "${q}"`, url: `https://duckduckgo.com/?q=${enc}&ia=chat`, matchedRanges: [] },
+        );
       }
 
       // Constrain selectedIndex
@@ -226,10 +226,9 @@ export class PaletteController {
     renderSection("Bookmarks", results.bookmarks);
     renderSection("History", results.history);
 
-    // Render search fallback if query is not empty
-    if (this.currentQuery.trim().length > 0) {
-      const rowIdx = flatIndex;
-      
+    // Search + AI rows (everything after the result sections).
+    for (let rowIdx = flatIndex; rowIdx < this.items.length; rowIdx++) {
+      const item = this.items[rowIdx];
       const row = document.createElement("div");
       row.className = "palette-row search-fallback interactive" + (rowIdx === this.selectedIndex ? " active" : "");
       row.setAttribute("data-index", String(rowIdx));
@@ -244,7 +243,7 @@ export class PaletteController {
 
       const itemTitle = document.createElement("div");
       itemTitle.className = "palette-row-title";
-      itemTitle.textContent = `Search DuckDuckGo for "${this.currentQuery.trim()}"`;
+      itemTitle.textContent = item.title;
       details.appendChild(itemTitle);
 
       row.appendChild(details);

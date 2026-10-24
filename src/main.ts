@@ -22,13 +22,16 @@ let pinnedOnTop = false;
 let topBarFadeTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ===== Hit-rect tracking =====
+// Last rect set sent to the backend: the 250ms layout tick only crosses IPC
+// (and re-applies the window region) when something actually moved.
+let lastHitRectsKey = "";
 function updateHitRects(): void {
   // The backend turns these rects into the overlay's window REGION — anything
   // not listed is click-through to the page AND not painted. So: skip faded
   // chrome (it must not eat clicks while invisible), and include transient
   // visuals (toasts, chord HUD) so they stay visible over content.
   // Open panels contribute their whole rect: the backend no longer forces a
-  // full-window region while a panel is open (that ate every page click — #2),
+  // full-window region while a panel is open (that ate every page click),
   // so the panel itself must claim its area to stay clickable.
   const elements = document.querySelectorAll<HTMLElement>(
     ".interactive, .region-visible, .tab-panel.open, .views-panel.open, .find-bar.open"
@@ -45,7 +48,10 @@ function updateHitRects(): void {
       height: Math.round(r.height),
     });
   }
-  invoke("overlay_set_hit_rects", { rects }).catch(() => {});
+  const key = JSON.stringify(rects);
+  if (key === lastHitRectsKey) return;
+  lastHitRectsKey = key;
+  invoke("overlay_set_hit_rects", { rects }).catch(() => { lastHitRectsKey = ""; });
 }
 
 // ===== Hover-fade system =====
@@ -56,7 +62,7 @@ function resetTopBarFade(): void {
   if (topBarFadeTimer) clearTimeout(topBarFadeTimer);
   topBarFadeTimer = setTimeout(() => {
     // Don't fade away the address bar while it's open/focused — it hid what the
-    // user was typing (#6). Reschedule instead so it fades once editing ends.
+    // user was typing. Reschedule instead so it fades once editing ends.
     if (document.getElementById("domain-pill")?.classList.contains("editing")) {
       resetTopBarFade();
       return;
@@ -73,7 +79,7 @@ function handleMouseMove(e: MouseEvent): void {
 }
 
 // Tell the backend whether any overlay panel is open, so the accelerator
-// handler only swallows Esc while a panel is showing (M5R.8).
+// handler only swallows Esc while a panel is showing.
 function syncPanelOpen(): void {
   const panelOpen = (tabPanel?.isOpen() ?? false) || (views?.isOpen() ?? false);
   invoke("overlay_set_panel_open", { open: panelOpen || findBarOpen }).catch(() => {});
@@ -135,7 +141,7 @@ function showToast(message: string): void {
   }, 3000);
 }
 
-// Web Store install banner (Phase 4). A glass bar with .interactive so clicks
+// Web Store install banner. A glass bar with .interactive so clicks
 // land (hit-rect region); dispatches overlay:layout so the region updates.
 function showWebstoreBanner(url: string): void {
   document.getElementById("webstore-banner")?.remove();
@@ -193,7 +199,7 @@ function getWindowId(): number {
 }
 
 // Navigate from THIS window: pass our own active tab + window id so the backend
-// targets the calling window, not the pool's single global active tab (#1).
+// targets the calling window, not the pool's single global active tab.
 function navTo(input: string): void {
   invoke("nav_to", { input, tabId: activeTabId, windowId: getWindowId() }).catch(console.error);
 }
@@ -212,11 +218,38 @@ function updateNewtabVisibility(tab: Tab | undefined): void {
   const wasVisible = newtab.classList.contains("visible");
   newtab.classList.toggle("visible", show);
   // Auto-focus the search/URL pill when a blank tab appears (e.g. Ctrl+T) so
-  // the user can type immediately without clicking (#4).
+  // typing works immediately without a click.
   if (show && !wasVisible) {
     const s = document.getElementById("newtab-search") as HTMLInputElement | null;
     requestAnimationFrame(() => { s?.focus(); });
+    renderTopSites();
   }
+}
+
+// Most-visited site tiles on the new-tab page (backend: top_sites).
+function renderTopSites(): void {
+  const grid = document.getElementById("top-sites");
+  if (!grid) return;
+  invoke<{ url: string; title: string }[]>("top_sites", { limit: 10 })
+    .then((sites) => {
+      grid.replaceChildren(
+        ...sites.map((site) => {
+          const tile = document.createElement("button");
+          tile.className = "top-site interactive";
+          tile.title = site.url;
+          const icon = document.createElement("span");
+          icon.className = "site-icon";
+          icon.textContent = site.title.charAt(0).toUpperCase();
+          const label = document.createElement("span");
+          label.className = "site-label";
+          label.textContent = site.title;
+          tile.append(icon, label);
+          tile.addEventListener("click", () => navTo(site.url));
+          return tile;
+        })
+      );
+    })
+    .catch(() => {});
 }
 function activeHost(): string {
   try {
@@ -227,6 +260,8 @@ function activeHost(): string {
 }
 let views: ViewsController | null = null;
 let zoomFactor = 1.0;
+// Shows/hides the picture-in-picture pill for the active tab; wired in init.
+let syncPipButton: () => void = () => {};
 // Bookmark star: maps the current bookmark set (url -> id) so the star button
 // can toggle and reflect whether the active page is bookmarked. Wired in init.
 let bookmarkMap = new Map<string, number>();
@@ -237,7 +272,7 @@ function applyZoom(f: number): void {
   showZoomHud(zoomFactor);
 }
 
-// Transient zoom pill (P2.3): shows e.g. "120%" for ~1.2s while adjusting.
+// Transient zoom pill: shows e.g. "120%" for ~1.2s while adjusting.
 let zoomHudTimer = 0;
 function showZoomHud(f: number): void {
   let hud = document.getElementById("zoom-hud");
@@ -260,7 +295,7 @@ function showZoomHud(f: number): void {
   }, 1200);
 }
 
-// Per-site zoom restore (P2.3): when the active host changes, apply its saved
+// Per-site zoom restore: when the active host changes, apply its saved
 // zoom (or 100% if none). Guarded by lastZoomHost so same-host navigations and
 // repeated tab:updated events don't re-apply.
 let lastZoomHost = "";
@@ -321,7 +356,7 @@ function openAddressBar(): void {
   if (!pill || !input) return;
   input.value = activeTab()?.url || "";
   pill.classList.add("editing");
-  resetTopBarFade(); // ensure the bar is un-faded and stays put while editing (#6)
+  resetTopBarFade(); // ensure the bar is un-faded and stays put while editing
   updateHitRects();
   requestAnimationFrame(() => {
     input.focus();
@@ -358,6 +393,7 @@ function keyEventToAction(e: KeyboardEvent): string | null {
   if (a && !c && !s) {
     if (code === "ArrowLeft") return "Tab+Prev";
     if (code === "ArrowRight") return "Tab+Next";
+    if (code === "KeyP") return "Alt+P";
     return null;
   }
   if (!c && !s && !a) {
@@ -434,7 +470,7 @@ function handleShortcut(action: string): void {
       if (activeTabId !== -1) invoke("tabs_close", { id: activeTabId }).catch(console.error);
       break;
     case "Ctrl+Shift+W":
-      // Unload (discard) the current tab and move to the next one (#10).
+      // Unload (discard) the current tab and move to the next one.
       if (activeTabId !== -1) invoke("tabs_unload", { id: activeTabId }).catch(console.error);
       break;
     case "Ctrl+Shift+T":
@@ -532,6 +568,9 @@ function handleShortcut(action: string): void {
       break;
     case "Ctrl+Q":
       invoke("window_controls", { action: "close" }).catch(console.error);
+      break;
+    case "Alt+P":
+      invoke("pip_toggle").catch(() => showToast("No page to float"));
       break;
     case "Esc":
       if (findBarOpen) toggleFindBar();
@@ -826,9 +865,8 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   // Load initial tabs for main state. With "Restore tabs on startup" enabled,
-  // also ACTIVATE the most-recent tab so the user resumes where they left off
-  // (#10 — previously restore only ran when the tab list was empty, which it
-  // never is since tabs persist in the DB, and nothing was ever activated).
+  // also activate the most-recent tab so the user resumes where they left off.
+  // Tabs persist in the DB, so the list is rarely empty at launch.
   invoke<Tab[]>("tabs_list", { windowId: winId }).then((result) => {
     tabs = result;
     updateTabCountBadge();
@@ -856,7 +894,7 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-menu")?.addEventListener("click", () => {
     views?.open("settings");
   });
-  // '+' new-tab button (#5).
+  // '+' new-tab button.
   document.getElementById("btn-new-tab")?.addEventListener("click", () =>
     invoke("tabs_create", { windowId: getWindowId() }).catch(console.error));
 
@@ -966,7 +1004,7 @@ window.addEventListener("DOMContentLoaded", () => {
     if (input?.value) invoke("find_in_page", { text: input.value, forward: true }).catch(console.error);
   });
   document.getElementById("find-close")?.addEventListener("click", () => toggleFindBar());
-  // Enter = find next, Shift+Enter = find previous, Escape = close (Phase 8 item 8).
+  // Enter = find next, Shift+Enter = find previous, Escape = close.
   document.getElementById("find-input")?.addEventListener("keydown", (e) => {
     const ev = e as KeyboardEvent;
     const input = e.target as HTMLInputElement;
@@ -1016,9 +1054,10 @@ window.addEventListener("DOMContentLoaded", () => {
   }, { passive: false });
   resetTopBarFade();
 
-  // ===== Clock =====
+  // ===== Clock + top sites (the new-tab page starts out visible) =====
   updateClock();
   setInterval(updateClock, 1000);
+  renderTopSites();
 
   // ===== Tauri events =====
   listen<Tab>("tab:created", (event) => {
@@ -1051,6 +1090,7 @@ window.addEventListener("DOMContentLoaded", () => {
     const tab = tabs.find((t) => t.id === activeTabId);
     updateDomainPill(tab);
     updateNewtabVisibility(tab);
+    syncPipButton();
     // Force a re-check on activation even if the host string matches the last
     // one applied (switching tabs can land on the same host at a different zoom).
     lastZoomHost = "";
@@ -1078,7 +1118,7 @@ window.addEventListener("DOMContentLoaded", () => {
     views?.open(event.payload as any);
   });
 
-  // Top loading bar driven by NavigationStarting/Completed (Phase 8).
+  // Top loading bar driven by NavigationStarting/Completed.
   listen<{ tabId: number; loading: boolean }>("nav:loading", (event) => {
     if (event.payload.tabId !== activeTabId) return;
     const bar = document.getElementById("nav-progress");
@@ -1094,7 +1134,7 @@ window.addEventListener("DOMContentLoaded", () => {
     updateHitRects();
   });
 
-  // Chrome Web Store intercept banner (Phase 4): the store's "Add to Chrome"
+  // Chrome Web Store intercept banner: the store's "Add to Chrome"
   // can't work in WebView2, so offer Jello's working sideload path.
   let webstoreBannerUrl = "";
   listen<string>("webstore:detected", (event) => {
@@ -1104,25 +1144,64 @@ window.addEventListener("DOMContentLoaded", () => {
     showWebstoreBanner(url);
   });
 
+  // Downloads: the panel list (Ctrl+J) plus a top-bar pill with overall
+  // progress while anything is unfinished.
+  const unfinished = new Map<string, { name: string; received: number; total: number }>();
+  const dlBtn = document.getElementById("btn-downloads");
+  const renderDlBtn = () => {
+    if (!dlBtn) return;
+    dlBtn.hidden = unfinished.size === 0;
+    let rec = 0, tot = 0;
+    for (const d of unfinished.values()) { rec += d.received; tot += d.total; }
+    dlBtn.textContent = tot > 0 ? `↓ ${Math.floor((rec / tot) * 100)}%` : `↓ ${unfinished.size}`;
+    updateHitRects();
+  };
+  dlBtn?.addEventListener("click", () => views?.open("downloads"));
+
   listen<DownloadItem>("download:started", (event) => {
-    views?.addDownload(event.payload);
-    showToast(`Downloading ${event.payload.fileName}`);
+    const d = event.payload;
+    views?.addDownload(d);
+    unfinished.set(d.id, { name: d.fileName, received: 0, total: d.total ?? 0 });
+    renderDlBtn();
+    showToast(`Downloading ${d.fileName}`);
   });
 
-  // Live progress + terminal state for downloads (P3.1).
   listen<{ id: string; received: number; total: number }>("download:progress", (event) => {
-    views?.updateDownload(event.payload.id, {
-      received: event.payload.received,
-      total: event.payload.total,
-      state: "inprogress",
-    });
+    const { id, received, total } = event.payload;
+    views?.updateDownload(id, { received, total });
+    const d = unfinished.get(id);
+    if (d) { d.received = received; d.total = total; renderDlBtn(); }
   });
-  listen<{ id: string; state: string; path: string }>("download:done", (event) => {
-    views?.updateDownload(event.payload.id, {
-      state: event.payload.state,
-      path: event.payload.path,
-    });
-    if (event.payload.state === "completed") showToast("Download complete");
+
+  // Pause and resumable errors keep a download listed as unfinished.
+  listen<{ id: string; state: string; path: string; reason: string }>("download:state", (event) => {
+    const { id, state, path, reason } = event.payload;
+    views?.updateDownload(id, { state, path, reason });
+    const name = unfinished.get(id)?.name ?? "file";
+    if (state === "completed" || state === "cancelled" || state === "failed") {
+      unfinished.delete(id);
+      renderDlBtn();
+    }
+    if (state === "completed") showToast(`Downloaded ${name}`);
+    else if (state === "failed") showToast(`Download failed: ${name}`);
+    else if (state === "interrupted") showToast(`Download interrupted: ${name} — resume it from Downloads`);
+  });
+
+  // Picture-in-picture pill: shown while the active tab is playing media.
+  const playingTabs = new Set<number>();
+  const pipBtn = document.getElementById("btn-pip");
+  syncPipButton = () => {
+    if (!pipBtn) return;
+    const show = playingTabs.has(activeTabId);
+    if (pipBtn.hidden === !show) return;
+    pipBtn.hidden = !show;
+    updateHitRects();
+  };
+  pipBtn?.addEventListener("click", () => handleShortcut("Alt+P"));
+  listen<{ tabId: number; playing: boolean }>("tab:audio", (event) => {
+    if (event.payload.playing) playingTabs.add(event.payload.tabId);
+    else playingTabs.delete(event.payload.tabId);
+    syncPipButton();
   });
 
   // Listen to chord HUD event from Rust

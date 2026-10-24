@@ -88,8 +88,7 @@ pub fn execute_screenshot_action(
             let _ = app.emit("toast:show", "Image copied! Press Ctrl+V to search Google Lens.".to_string());
             
             // Bring the main window forward first, or the tab opens into a
-            // hidden window and the user sees "nothing happened" (same bug class
-            // as the old palette path — Phase 8.5).
+            // hidden window and nothing appears to happen.
             crate::windows::ensure_main_window(&app);
             let active_win_id = get_focused_window_id(&app);
             let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>();

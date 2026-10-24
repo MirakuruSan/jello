@@ -1,4 +1,4 @@
-// Virtualized tab list renderer (~80 lines, per SPEC §E)
+// Virtualized tab list renderer
 // Fixed 36px rows, renders only visible + buffer rows
 
 import { invoke } from "@tauri-apps/api/core";
@@ -89,7 +89,7 @@ export class VirtualTabList {
       title.textContent = tab.title || tab.url;
       row.appendChild(title);
 
-      // State dot: green = live, amber = suspended, grey = unloaded (#3).
+      // State dot: green = live, amber = suspended, grey = unloaded.
       const dot = document.createElement("span");
       const state = this.loadedStates[tab.id] ?? "cold";
       dot.className = `state-dot ${state}`;

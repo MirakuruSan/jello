@@ -90,8 +90,7 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
         let hidden = rx.recv().unwrap_or_default();
         // MERGE (dedupe) into the restore list — never overwrite. A second
         // trigger while overlays are open hides nothing new, so overwriting would
-        // clobber the original list with [] and the windows would never restore
-        // (§2 finding #10).
+        // clobber the original list with [] and the windows would never restore.
         {
             let mut guard = HIDDEN_FOR_CAPTURE.lock().unwrap();
             for l in hidden {
@@ -135,8 +134,7 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
             .skip_taskbar(true)
             // Must match the other app windows: webviews sharing the app data
             // dir must agree on this, or WebView2 refuses to create the second
-            // environment and the overlay webview never loads (regression from
-            // enabling extensions on the main window).
+            // environment and the overlay webview never loads.
             .browser_extensions_enabled(true)
             .build()
             .map_err(|e| format!("Failed to build capture overlay window: {}", e))?;
@@ -192,7 +190,7 @@ pub async fn capture_ocr_action(
             let _ = app.emit("toast:show", "Text copied".to_string());
         }
         "search" => {
-            // Front the main window first so the results tab is visible (Phase 8.5).
+            // Front the main window first so the results tab is visible.
             crate::windows::ensure_main_window(&app);
             let query = percent_encode(&text);
             let url = format!("https://duckduckgo.com/?q={}", query);

@@ -60,15 +60,19 @@ pub fn tabs_activate_impl(
     // still on about:blank shortly after activation while a real URL was meant
     // to load (a canceled navigation — e.g. something touched the profile while
     // the restore was in flight), re-issue it. No-op in the healthy case.
+    // A slow page (or one that became a download) is blank for a while too, so
+    // keep checking until the navigation settles instead of judging at 2.5s.
     {
+        use crate::engine::pool::BlankHeal;
         let pool = pool.clone();
         let db = db.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2500));
-            let Some(url) = crate::engine::pool::TabPool::stored_url_pub(&db, id) else { return };
-            if let Ok(p) = pool.lock() {
-                if p.get_active_tab_id() == Some(id) {
-                    p.heal_blank_tab(id, &url);
+            for _ in 0..8 {
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                let Some(url) = crate::engine::pool::TabPool::stored_url_pub(&db, id) else { return };
+                let Ok(p) = pool.lock() else { return };
+                if p.get_active_tab_id() != Some(id) || p.heal_blank_tab(id, &url, false) != BlankHeal::Wait {
+                    return;
                 }
             }
         });
@@ -128,9 +132,8 @@ pub fn tabs_create_impl(
         .as_secs() as i64;
 
     // Single DB round-trip for the new-tab fast path: compute the order key,
-    // insert the row, and read it back in one message to the DB thread. This
-    // was previously a separate `tabs_list` round-trip followed by insert+get
-    // (Phase 3 — "new tab slow/sluggish").
+    // insert the row, and read it back in one message to the DB thread, so
+    // opening a tab costs one round-trip instead of three.
     let (tx, rx) = std::sync::mpsc::channel();
     let db_clone = db.clone();
     db_clone.execute(move |conn| {
@@ -205,12 +208,80 @@ pub async fn tabs_activate(
     }
 }
 
+fn window_label(app: &AppHandle, win_id: i32) -> String {
+    if win_id == 1 {
+        "main".to_string()
+    } else if app.get_window(&format!("main_{}", win_id)).is_some() {
+        format!("main_{}", win_id)
+    } else {
+        format!("incognito_{}", win_id)
+    }
+}
+
+/// After the active tab closed or unloaded: switch to the most recently used
+/// tab that is still loaded, or show the new-tab page when none is — never
+/// load a cold tab just because it sat next to the one that went away.
+fn land_after_active_gone(
+    id: i32,
+    win_id: i32,
+    db: &DbState,
+    pool: &Arc<Mutex<TabPool>>,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let remaining: Vec<i32> = tabs_list_impl(win_id, db)?
+        .into_iter()
+        .map(|t| t.id)
+        .filter(|&t| t != id)
+        .collect();
+    let next = pool.lock().unwrap().next_loaded_tab(id, &remaining);
+    if let Some(next_id) = next {
+        tabs_activate_impl(next_id, db, pool, app)?;
+        // Refocus the newly active webview so its in-page accelerators
+        // (Alt+←/→ tab switch, Ctrl+±, …) keep working without a click.
+        pool.lock().unwrap().focus_tab(next_id);
+    } else {
+        // No loaded tab left; overlay takes input again (new-tab page).
+        pool.lock().unwrap().set_active_tab_id(None);
+        let label = window_label(app, win_id);
+        crate::app::overlay_mark_content(app, &label, false);
+        // Tell the frontend we landed on the home screen (no live tab) so
+        // the new-tab page shows, and focus the chrome so it's typable.
+        let _ = app.emit("tab:activated", -1);
+        crate::windows::focus_chrome(app, &label);
+    }
+    Ok(())
+}
+
+/// A tab whose navigation became a download never committed a page: left
+/// alone it shows an empty view, and since its stored URL is the file, every
+/// later activation or session restore downloads it again. Close it like
+/// Chrome does; its webview stays parked until the download ends. It is kept
+/// off the reopen-closed stack, since reopening it would download again.
+pub fn retire_download_only_tab(app: &AppHandle, id: i32) {
+    let db = app.state::<DbState>();
+    let pool = app.state::<Arc<Mutex<TabPool>>>();
+    if let Err(e) = tabs_close_impl(id, false, &db, &pool, app) {
+        tracing::warn!("closing download-only tab {} failed: {}", id, e);
+    }
+}
+
 #[command]
 pub async fn tabs_close(
     id: i32,
     db: State<'_, DbState>,
     pool: State<'_, Arc<Mutex<TabPool>>>,
     app: AppHandle,
+) -> Result<(), String> {
+    tabs_close_impl(id, true, &db, &pool, &app)
+}
+
+/// Close a tab. `remember` puts it on the reopen-closed (Ctrl+Shift+T) stack.
+pub fn tabs_close_impl(
+    id: i32,
+    remember: bool,
+    db: &DbState,
+    pool: &Arc<Mutex<TabPool>>,
+    app: &AppHandle,
 ) -> Result<(), String> {
     // Check if the tab is active
     let is_active = {
@@ -236,7 +307,9 @@ pub async fn tabs_close(
     };
 
     // Snapshot the tab for the undo stack before removing it.
-    let closing_tab = if id < 0 {
+    let closing_tab = if !remember {
+        None
+    } else if id < 0 {
         crate::incognito::get_incognito_tab(id)
     } else {
         let (tx_s, rx_s) = std::sync::mpsc::channel();
@@ -278,41 +351,15 @@ pub async fn tabs_close(
 
     let _ = app.emit("tab:closed", id);
 
-    // If it was the active tab, activate the next available tab in the window
     if is_active && win_id != 0 {
-        let remaining = tabs_list_impl(win_id, &db)?;
-        if !remaining.is_empty() {
-            // Find closest index or just activate the last tab
-            let next_id = remaining.last().unwrap().id;
-            tabs_activate_impl(next_id, &db, &pool, &app)?;
-            // Refocus the newly active webview so its in-page accelerators
-            // (Alt+←/→ tab switch, Ctrl+±, …) keep working without a click (#3).
-            pool.lock().unwrap().focus_tab(next_id);
-        } else {
-            // Reset active tab in pool; overlay takes input again (new-tab page).
-            let mut pool_guard = pool.lock().unwrap();
-            pool_guard.set_active_tab_id(None);
-            drop(pool_guard);
-            let label = if win_id == 1 {
-                "main".to_string()
-            } else if app.get_window(&format!("main_{}", win_id)).is_some() {
-                format!("main_{}", win_id)
-            } else {
-                format!("incognito_{}", win_id)
-            };
-            crate::app::overlay_mark_content(&app, &label, false);
-            // Tell the frontend we landed on the home screen (no live tab) so
-            // the new-tab page shows, and focus the chrome so it's typable.
-            let _ = app.emit("tab:activated", -1);
-            crate::windows::focus_chrome(&app, &label);
-        }
+        land_after_active_gone(id, win_id, db, pool, app)?;
     }
 
     Ok(())
 }
 
-/// id → "live" | "suspended" for tabs that currently have a webview (#3/#4:
-/// tab-panel dots + greyed-out Unload).
+/// id → "live" | "suspended" for tabs that currently have a webview (drives
+/// the tab-panel state dots and the greyed-out Unload item).
 #[command]
 pub async fn tabs_loaded_states(
     pool: State<'_, Arc<Mutex<TabPool>>>,
@@ -327,8 +374,8 @@ pub async fn tabs_loaded_states(
 }
 
 /// Unload (discard) a tab's webview to free memory while keeping the tab, then
-/// move to the next tab in the window (or the new-tab/home screen if none) —
-/// #10. Works for the active tab or any tab.
+/// move to the next loaded tab in the window (or the new-tab page if none).
+/// Works for the active tab or any tab.
 #[command]
 pub async fn tabs_unload(
     id: i32,
@@ -362,37 +409,7 @@ pub async fn tabs_unload(
     let _ = app.emit("tab:updated", &id);
 
     if was_active && win_id != 0 {
-        // Prefer the next LOADED tab; activating an unloaded one would defeat
-        // the point of unloading (#5). None loaded → home screen.
-        let remaining: Vec<Tab> = tabs_list_impl(win_id, &db)?
-            .into_iter()
-            .filter(|t| t.id != id)
-            .collect();
-        let next_loaded = {
-            let pool_guard = pool.lock().unwrap();
-            remaining.iter().rev().find(|t| pool_guard.is_loaded(t.id)).map(|t| t.id)
-        };
-        if let Some(next_id) = next_loaded {
-            tabs_activate_impl(next_id, &db, &pool, &app)?;
-            pool.lock().unwrap().focus_tab(next_id);
-        } else {
-            // No other tabs → show the new-tab/home screen.
-            let mut pool_guard = pool.lock().unwrap();
-            pool_guard.set_active_tab_id(None);
-            drop(pool_guard);
-            let label = if win_id == 1 {
-                "main".to_string()
-            } else if app.get_window(&format!("main_{}", win_id)).is_some() {
-                format!("main_{}", win_id)
-            } else {
-                format!("incognito_{}", win_id)
-            };
-            crate::app::overlay_mark_content(&app, &label, false);
-            // Tell the frontend we landed on the home screen (no live tab) so
-            // the new-tab page shows, and focus the chrome so it's typable.
-            let _ = app.emit("tab:activated", -1);
-            crate::windows::focus_chrome(&app, &label);
-        }
+        land_after_active_gone(id, win_id, &db, &pool, &app)?;
     }
     Ok(())
 }

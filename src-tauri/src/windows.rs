@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 /// Raw Win32 HWND of the "main" window, stored at creation on the main thread
 /// (`window.hwnd()` is safe there). Used by the self-healing show/hide helpers
-/// (P0.1): in the degraded runtime state tauri's own visibility plumbing can
+///: in the degraded runtime state tauri's own visibility plumbing can
 /// lie or no-op, so we drive `ShowWindow` on this HWND directly as the
 /// authoritative fallback. 0 = not yet resolved.
 pub static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -15,8 +15,8 @@ pub fn set_main_hwnd(hwnd: isize) {
 }
 
 /// Raw-Win32 show of the main window — bypasses tauri entirely so it works even
-/// when tao's internal window map/flags have desynced from reality (the P0.1
-/// degradation: `win.show()` silently no-ops). Restores if minimized, shows if
+/// when tao's internal window map/flags have desynced from reality and
+/// `win.show()` silently no-ops. Restores if minimized, shows if
 /// hidden, then foregrounds. No-op if the HWND isn't resolved yet.
 pub fn force_show_main() {
     #[cfg(target_os = "windows")]
@@ -292,6 +292,7 @@ pub fn on_main_hidden(app: &AppHandle) {
     if let Ok(pool) = pool_state.try_lock() {
         pool.set_memory_target_all(true);
     }
+    pip_active_tab(app, crate::engine::PipRequest::Auto);
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -306,8 +307,24 @@ pub fn on_main_hidden(app: &AppHandle) {
     });
 }
 
+/// Send a picture-in-picture request to the active tab without blocking the
+/// caller (window events run on the main thread; the pool may be busy).
+pub fn pip_active_tab(app: &AppHandle, req: crate::engine::PipRequest) {
+    // The setting gates floating a video automatically, never bringing back
+    // one Jello already floated.
+    if req == crate::engine::PipRequest::Auto && !crate::prefs::auto_pip() {
+        return;
+    }
+    let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>().inner().clone();
+    std::thread::spawn(move || {
+        if let Ok(p) = pool.lock() {
+            let _ = p.pip_active(req);
+        };
+    });
+}
+
 /// The full logical client rect of a window — content webviews fill the whole
-/// window (chromeless: all UI floats above the page). SPEC §F.
+/// window (chromeless: all UI floats above the page).
 pub fn content_rect(window: &tauri::Window) -> crate::engine::Rect {
     let scale = window.scale_factor().unwrap_or(1.0);
     let size = window
@@ -325,7 +342,7 @@ pub fn content_rect(window: &tauri::Window) -> crate::engine::Rect {
 /// window is normally hidden (never destroyed) on close, so this reliably brings
 /// it back for tray-click, summon, and single-instance relaunch. If it has
 /// somehow been destroyed, recreate it with the startup options so reopen can
-/// never silently no-op (past bug: window.close() killed it → dead reopen).
+/// never silently no-op.
 pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     // IMPORTANT: use get_window, NOT get_webview_window. Once content tabs are
     // added as child webviews (window.add_child), the main window is no longer a
@@ -351,7 +368,8 @@ pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
             let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>().inner().clone();
             std::thread::spawn(move || {
                 if let Ok(p) = pool.lock() {
-                    p.set_memory_target_all(false);
+                    p.restore_active_memory_target();
+                    let _ = p.pip_active(crate::engine::PipRequest::ExitAuto);
                 };
             });
         }
@@ -366,7 +384,7 @@ pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         .transparent(true)
         .visible(true)
         // Uniform with the config-defined main window + content webviews so all
-        // app-data-dir-sharing webviews agree on the extensions setting (Phase 4).
+        // app-data-dir-sharing webviews agree on the extensions setting.
         .browser_extensions_enabled(true)
         .build()
     {

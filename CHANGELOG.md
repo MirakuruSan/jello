@@ -4,6 +4,57 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.9] — 2026-10-25
+
+### Added
+- **Picture-in-picture.** Alt+P (or the ⧉ button that appears while a tab plays
+  media) floats the page's video in a small always-on-top window. Switching
+  tabs or minimizing Jello floats a playing video automatically and returning
+  brings it back; turn this off under Settings → Media.
+- **"Open with" and file types.** Jello registers itself with Windows as a web
+  browser (http/https) and as an "Open with" handler for the file types you
+  tick under Settings → Files & default browser (web pages and PDFs by default;
+  images, audio/video and text/data available). Files opened this way, and
+  files dropped on the window, open in a new tab.
+- **Performance settings.** Choose how many tabs stay loaded, how soon
+  background tabs freeze, and when idle tabs are unloaded entirely (memory
+  saver, default 30 minutes). Background tabs also trim their memory as soon as
+  you leave them.
+- **Ask AI from the palette.** Every palette search offers "Ask Google AI Mode"
+  and "Ask Duck.ai" rows next to the normal web search.
+- Downloads: a top-bar progress pill, Open / Show in folder buttons, and
+  readable failure reasons.
+- Most-visited sites on the new-tab page.
+
+### Fixed
+- **Downloads finish.** Closing a tab — or Jello unloading it — cancelled any
+  download it had started, leaving a truncated file under the real name. Such
+  tabs now keep downloading in the background until the file is done.
+- **No more duplicate downloads.** The blank-tab recovery mistook a download
+  for a lost page load and requested the file again; it now waits for slow
+  pages and ignores downloads. Tabs that exist only to download a file close
+  automatically, so they no longer sit empty or re-download on restore.
+- **Pause / Resume work.** Pausing used to be treated as a failed download, so
+  Resume could never find it again. Interrupted downloads can now be retried.
+- **Google AI Overviews show in search results.** The built-in uBlock Origin
+  blocked the request that loads them ("Can't generate an AI overview right
+  now"). Jello adds a single exception for that request; ads and trackers stay
+  blocked.
+- **Closing a tab switches to the tab you used last that is still loaded**
+  instead of loading an unloaded neighbour; with none loaded, the new-tab page
+  shows.
+- The palette searched DuckDuckGo regardless of the chosen search engine.
+- Links handed to Jello by other apps now open in a new tab instead of
+  replacing the page you were on.
+- An extension settings page that closes itself no longer leaves an empty
+  window behind.
+- **Settings that did nothing.** "Save & autofill passwords", "Autofill
+  addresses & forms" and "Clear history on exit" now take effect. The "Block
+  ads" and "Search suggestions" switches had no effect and are removed; ad
+  blocking is the uBlock Origin entry under Extensions.
+- A tab that only downloaded a file no longer comes back (and downloads again)
+  with Reopen closed tab.
+
 ## [0.4.8] — 2026-07-17
 
 ### Changed
@@ -254,8 +305,8 @@ post-Gemini bug reports.
 - **Zoom hotkeys.** Ctrl+= / Ctrl+− / Ctrl+0 (including numpad +, −, 0) zoom the
   active page; also handled when the overlay has focus.
 - **In-window shortcut reference** in Settings listing every active shortcut.
-- Robust in-Rust extension download (HTTPS with a Chrome User-Agent) and
-  in-process zip extraction — no more PowerShell shell-outs.
+- Extension download (HTTPS with a Chrome User-Agent) and zip extraction run
+  in-process in Rust instead of shelling out to PowerShell.
 
 ### Changed
 - Dedicated browser Back/Forward keys (mouse thumb buttons, media keys) are now

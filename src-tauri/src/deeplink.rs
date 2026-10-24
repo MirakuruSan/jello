@@ -101,7 +101,12 @@ fn set_reg_value(subkey_str: &str, name_str: &str, value_str: &str) -> Result<()
 }
 
 /// Registers the jello:// protocol handler in the Windows registry (HKCU).
+/// Dev builds skip it (unless JELLO_SHELL_REGISTER=1) so running target\debug
+/// never repoints the installed Jello's protocol at the debug exe.
 pub fn register_jello_protocol() {
+    if cfg!(debug_assertions) && std::env::var("JELLO_SHELL_REGISTER").as_deref() != Ok("1") {
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
         std::thread::spawn(move || {
@@ -123,10 +128,40 @@ pub fn register_jello_protocol() {
     }
 }
 
-/// Handles a CLI or deep link argument.
+/// `file:///` URL for an existing local file path (an Explorer "Open with",
+/// file-association launch, or a file dropped on the window).
+fn local_file_url(arg: &str) -> Option<String> {
+    let path = std::path::Path::new(arg);
+    if !path.is_absolute() || !path.is_file() {
+        return None;
+    }
+    tauri::Url::from_file_path(path).ok().map(|u| u.to_string())
+}
+
+/// Bring the main window forward (window ops belong on the main thread).
+fn summon_main(app: &AppHandle) {
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        crate::windows::ensure_main_window(&app2);
+    });
+}
+
+/// Handles a CLI or deep link argument. Pages handed over by other apps (a
+/// clicked link with Jello as the default browser, an opened file) get their
+/// own new tab rather than replacing what the active tab shows.
 pub fn handle_open_argument(app: &AppHandle, arg: &str) -> Result<(), String> {
-    let arg_trimmed = arg.trim();
+    let arg_trimmed = arg.trim().trim_matches('"');
     if arg_trimmed.is_empty() {
+        return Ok(());
+    }
+
+    // A real file chosen in the shell: the allowFileUrls gate below is for
+    // file:// URLs arriving by other routes, not for files the user opened.
+    if let Some(url) = local_file_url(arg_trimmed) {
+        let db = app.state::<crate::db::DbState>();
+        let pool = app.state::<Arc<Mutex<crate::engine::pool::TabPool>>>();
+        summon_main(app);
+        crate::tabs::tabs_create_impl(Some(url), Some(false), Some(1), &db, &pool, app)?;
         return Ok(());
     }
 
@@ -179,19 +214,7 @@ pub fn handle_open_argument(app: &AppHandle, arg: &str) -> Result<(), String> {
         }
     };
 
-    let active = pool.lock().unwrap().get_active_tab_id();
-    match active {
-        Some(tid) => pool.lock().unwrap().navigate_tab(db.inner(), app, tid, &resolved_url)?,
-        None => {
-            crate::tabs::tabs_create_impl(Some(resolved_url), Some(false), None, &db, &pool, app)?;
-        }
-    }
-
-    // Focus/summon the main window
-    if let Some(win) = app.get_window("main") {
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
-
+    summon_main(app);
+    crate::tabs::tabs_create_impl(Some(resolved_url), Some(false), Some(1), &db, &pool, app)?;
     Ok(())
 }

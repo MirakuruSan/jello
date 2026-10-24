@@ -96,11 +96,10 @@ fn is_ip_literal(s: &str) -> bool {
 }
 
 /// The default search template (a URL containing `%s`), from the `searchEngine`
-/// setting, falling back to DuckDuckGo. Lets the user pick their engine (#12).
+/// setting, falling back to DuckDuckGo. Lets the user pick their engine.
 pub fn default_search_url(app: &tauri::AppHandle) -> String {
-    // `defaultSearch` is the key the setup wizard writes (a URL template with
-    // `%s`). It was previously never read, so choosing an engine had no effect
-    // (#12). Fall back to DuckDuckGo.
+    // `defaultSearch` is the key the setup wizard and Settings write (a URL
+    // template with `%s`). Fall back to DuckDuckGo.
     crate::capture::screenshot::get_setting(app, "defaultSearch")
         .filter(|s| s.contains("%s"))
         .unwrap_or_else(|| "https://duckduckgo.com/?q=%s".to_string())

@@ -6,8 +6,7 @@ use crate::ipc_types::{PaletteItem, PaletteResults};
 use crate::search::{classify_input, InputClassification, get_search_engines, route_query};
 
 /// A tab's display title, falling back to its URL host (not "Untitled") when the
-/// title is empty — after Phase 3 titles are usually fresh, but new/blank tabs
-/// still benefit from showing the host (Phase 8 item 4).
+/// title is empty, as it is for new and still-loading tabs.
 fn tab_display_title(title: &Option<String>, url: &str) -> String {
     if let Some(t) = title {
         if !t.trim().is_empty() {
@@ -298,8 +297,8 @@ pub async fn palette_open(
     pool: State<'_, Arc<Mutex<TabPool>>>,
 ) -> Result<(), String> {
     // 1. Bring the main browser window forward FIRST — otherwise the tab opens
-    //    into a hidden/backgrounded window and the user sees "nothing happened"
-    //    while the palette lingers. (Same class of bug as the old capture paths.)
+    //    into a hidden/backgrounded window and nothing appears to happen while
+    //    the palette lingers.
     crate::windows::ensure_main_window(&app);
 
     // 2. Hide the palette.
@@ -318,12 +317,12 @@ pub async fn palette_open(
         });
         let engines = rx.recv().unwrap_or(Ok(Vec::new())).map_err(|e| e.to_string())?;
         
-        let default_engine = "https://duckduckgo.com/?q=%s";
+        let default_engine = crate::search::default_search_url(&app);
         let classification = classify_input(&url);
-        
+
         match classification {
             InputClassification::Url(u) => u,
-            InputClassification::SearchQuery(q) => route_query(&q, &engines, default_engine),
+            InputClassification::SearchQuery(q) => route_query(&q, &engines, &default_engine),
         }
     } else {
         url.clone()
@@ -363,8 +362,8 @@ pub async fn palette_open(
             crate::tabs::tabs_create_impl(Some(target_url), Some(false), None, &db, &pool, &app)?;
         }
         "new-window" => {
-            // Mask the id the same way window_new_impl/incognito do (Phase 8
-            // item 2): the label id must equal the value parsed back by the
+            // Mask the id the same way window_new_impl/incognito do: the
+            // label id must equal the value parsed back by the
             // frontend, or the new window queries the wrong window's tabs.
             let id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() & 0x7FFFFFFF) as i32;
             let label = format!("main_{}", id);

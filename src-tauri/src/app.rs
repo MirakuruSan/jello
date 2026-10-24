@@ -40,7 +40,7 @@ pub fn apply_overlay_region(app: &AppHandle, label: &str) {
             None => return, // not resolved yet; initial region stays full
         };
         // NOTE: PANEL_OPEN deliberately does NOT force a full region anymore —
-        // that made an open tab/settings panel eat every click on the page (#2).
+        // that made an open tab/settings panel eat every click on the page.
         // The open panel's own rect is included in the hit rects instead, so the
         // page stays interactive around it. PANEL_OPEN still gates Esc handling.
         let overlay_interactive = OVERLAY_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed);
@@ -153,7 +153,7 @@ pub async fn window_controls(action: String, window: Window, app: AppHandle) -> 
             }
             // The Resized event handler (attach_window_plumbing) now resizes the
             // active tab on EVERY resize path — button, Win+Up, snap, title-drag —
-            // with a debounced off-main retry when the pool is busy (P2.1). No
+            // with a debounced off-main retry when the pool is busy. No
             // per-command retry needed here; one mechanism covers them all.
             Ok(())
         }
@@ -169,7 +169,7 @@ pub async fn window_controls(action: String, window: Window, app: AppHandle) -> 
                 if minimize_to_tray {
                     window.hide().map_err(|e| e.to_string())?;
                     // Follow tauri's hide with the raw fallback so tao's flag and
-                    // on-screen reality can't diverge (P0.1 step 6).
+                    // on-screen reality can't diverge.
                     crate::windows::force_hide_main();
                     crate::windows::on_main_hidden(&app);
                     Ok(())
@@ -233,6 +233,12 @@ pub async fn nav_reload(
     pool.lock().unwrap().reload_or_reactivate(&db, &app)
 }
 
+/// Float the active page's video in picture-in-picture, or bring it back.
+#[tauri::command]
+pub async fn pip_toggle(pool: State<'_, Arc<Mutex<crate::engine::pool::TabPool>>>) -> Result<(), String> {
+    pool.lock().unwrap().pip_active(crate::engine::PipRequest::Toggle)
+}
+
 #[tauri::command]
 pub async fn nav_stop(pool: State<'_, Arc<Mutex<crate::engine::pool::TabPool>>>) -> Result<(), String> {
     pool.lock().unwrap().nav_stop()
@@ -270,7 +276,7 @@ pub async fn zoom_set(
     Ok(())
 }
 
-/// Read the saved per-host zoom factor (P2.3). Returns None when the host has no
+/// Read the saved per-host zoom factor. Returns None when the host has no
 /// saved zoom so the frontend can leave the current factor untouched.
 #[tauri::command]
 pub async fn zoom_get(host: String, db: State<'_, crate::db::DbState>) -> Result<Option<f64>, String> {
@@ -317,7 +323,7 @@ pub async fn nav_to(
 
     // Route to the CALLING window's active tab (the frontend passes its own
     // activeTabId + windowId). The pool has a single GLOBAL active tab, so
-    // relying on it navigated the wrong window when more than one was open (#1).
+    // relying on it navigated the wrong window when more than one was open.
     if let Some(tid) = tab_id.filter(|&t| t != 0) {
         let res = pool.lock().unwrap().navigate_tab(&db, &app, tid, &target);
         if res.is_ok() {
@@ -444,7 +450,7 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
             crate::platform::win_window::install_resize_subclass(hwnd);
         }
         // Store the main window's HWND for the self-healing raw-Win32 show/hide
-        // fallback (P0.1). Runs at creation on the main thread, so hwnd() is safe.
+        // fallback. Runs at creation on the main thread, so hwnd() is safe.
         if window.label() == "main" && !hwnd.is_invalid() {
             crate::windows::set_main_hwnd(hwnd.0 as isize);
         }
@@ -462,9 +468,10 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
     let scale_state = overlay_state;
     let scale_label = window.label().to_string();
     let scale_app = app.clone();
-    // Debounce flag for the resize-retry thread (P2.1): at most one retry thread
+    // Debounce flag for the resize-retry thread: at most one retry thread
     // in flight per window, so a resize storm doesn't spawn a thread per event.
     let resize_retry_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let was_minimized = std::sync::atomic::AtomicBool::new(false);
     window.on_window_event(move |event| {
         match event {
             tauri::WindowEvent::ScaleFactorChanged { scale_factor: new_scale, .. } => {
@@ -472,6 +479,23 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                 apply_overlay_region(&scale_app, &scale_label);
             }
             tauri::WindowEvent::Resized(_) => {
+                // Minimizing the main window floats a playing video (auto
+                // picture-in-picture); restoring brings it back into the page.
+                if scale_label == "main" {
+                    use std::sync::atomic::Ordering;
+                    let minimized = resize_window.is_minimized().unwrap_or(false);
+                    if minimized != was_minimized.swap(minimized, Ordering::Relaxed) {
+                        let req = if minimized {
+                            crate::engine::PipRequest::Auto
+                        } else {
+                            crate::engine::PipRequest::ExitAuto
+                        };
+                        crate::windows::pip_active_tab(&scale_app, req);
+                    }
+                    if minimized {
+                        return;
+                    }
+                }
                 let rect = crate::windows::content_rect(&resize_window);
                 if let Ok(mut pool) = tab_pool.try_lock() {
                     if let Some(active_id) = pool.get_active_tab_id() {
@@ -480,7 +504,7 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                 } else if !resize_retry_pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     // Pool busy — the try_lock skip is exactly why OS-driven
                     // maximize (Win+Up, snap, title-drag-to-top) left content at
-                    // the pre-maximize size (P2.1). Spawn ONE retry thread that
+                    // the pre-maximize size. Spawn ONE retry thread that
                     // blocks on the lock off-main and recomputes the rect fresh.
                     // resize_tab only calls webview set_size/set_position, which
                     // marshal internally, so running it off the main thread is safe.
@@ -499,14 +523,14 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                     });
                 }
             }
-            // Drag-and-drop install (P1.3.2): a dropped .crx/.zip installs as an
+            // Drag-and-drop install: a dropped .crx/.zip installs as an
             // extension (with the normal consent dialog inside the command).
             tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
                 for p in paths {
                     let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+                    let app_h = scale_app.clone();
+                    let path_str = p.to_string_lossy().to_string();
                     if matches!(ext.as_deref(), Some("crx") | Some("zip")) {
-                        let app_h = scale_app.clone();
-                        let path_str = p.to_string_lossy().to_string();
                         tauri::async_runtime::spawn(async move {
                             let db = app_h.state::<crate::db::DbState>();
                             match crate::extensions::extensions_install_file(path_str, db, app_h.clone()).await {
@@ -516,6 +540,12 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
                         });
                         break;
                     }
+                    // Any other dropped file opens in a new tab, like a browser.
+                    std::thread::spawn(move || {
+                        if let Err(e) = crate::deeplink::handle_open_argument(&app_h, &path_str) {
+                            tracing::warn!("opening dropped file failed: {}", e);
+                        }
+                    });
                 }
             }
             // Closing the primary window minimizes to the system tray when
@@ -582,7 +612,7 @@ pub struct HotkeyItem {
     pub shortcut: String,
 }
 
-/// Hot-path caches (P0.2): the global-shortcut handler runs on the plugin's
+/// Hot-path caches: the global-shortcut handler runs on the plugin's
 /// poller thread and must NOT touch the DB on a keypress (that blocking round
 /// trip on the hot path was a source of dropped/laggy hotkeys). These are
 /// refreshed from the DB only inside `reregister_all_shortcuts`; the handler
@@ -610,7 +640,7 @@ fn default_hotkeys() -> Vec<HotkeyItem> {
     v
 }
 
-/// The AI chatbot URL to open for the aichat hotkey / new-tab AI button (#7,#13),
+/// The AI chatbot URL to open for the aichat hotkey / new-tab AI button,
 /// from the `aiChatUrl` setting, defaulting to ChatGPT.
 pub fn ai_chat_url(app: &AppHandle) -> String {
     // `defaultChatbot` is what the wizard writes. It may be a query template
@@ -716,7 +746,7 @@ fn get_quick_launch_slots(db: &crate::db::DbState) -> Vec<crate::ipc_types::Quic
 /// sequence is a plain combo (no comma = not a leader chord). Refreshes the
 /// hot-path caches from the DB, then rebuilds the registration atomically under
 /// REREGISTER_LOCK. Registration failures are surfaced via a toast so they are
-/// never silent again (P0.2.4).
+/// never silent again.
 pub fn reregister_all_shortcuts(app: &AppHandle) -> Result<(), String> {
     // Serialize concurrent callers (startup thread + settings save) so their
     // unregister_all/register can't interleave and drop hotkeys.
@@ -773,7 +803,7 @@ pub fn reregister_all_shortcuts(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Background watchdog (P0.2.3): every 60s, re-register any cached shortcut the
+/// Background watchdog: every 60s, re-register any cached shortcut the
 /// OS has silently dropped. REGISTER ONLY — never unregister_all here (that is
 /// what the reregister path is for) so we can't race a live rebind.
 pub fn spawn_hotkey_watchdog(app: &AppHandle) {
@@ -849,7 +879,7 @@ pub fn run() {
                 if event.state() == ShortcutState::Pressed {
                     // HOT PATH: read the caches only — NEVER touch the DB here
                     // (blocking DB round trips on a keypress caused dropped/laggy
-                    // hotkeys, P0.2). Clone out and drop the lock before acting.
+                    // hotkeys). Clone out and drop the lock before acting.
                     let matched_item = HOTKEY_CACHE
                         .lock()
                         .unwrap()
@@ -987,10 +1017,11 @@ pub fn run() {
             let db_tx = crate::db::init_db()?;
             let db_state = crate::db::DbState { sender: db_tx };
             app.manage(db_state.clone());
+            crate::prefs::load(&db_state);
 
             // Build the enabled-extensions staging dir before any content webview
             // is created (they read extensions_path at build time) so uBOL etc.
-            // load on the first tab (Phase 4).
+            // load on the first tab.
             // Speed: with full uBO enabled, stacked redundant blockers made every
             // request pay multiple filter passes. Disable them BEFORE staging.
             let deduped = crate::extensions::dedupe_ad_blockers(&db_state);
@@ -1009,12 +1040,13 @@ pub fn run() {
             tracing::info!("staged {} browser extension(s) for loading", staged);
 
             // Purge stale PROFILE extensions: AddBrowserExtension persists in the
-            // shared WebView2 profile across sessions, so disable/uninstall/dedupe
-            // that only touched the DB + staging left every previously-added
-            // extension running forever (stacked ad blockers → slow page loads).
-            // The chrome webview shares the profile, so sync on it at startup.
+            // shared WebView2 profile across sessions, so an extension disabled or
+            // removed only in the DB + staging would keep running (stacked ad
+            // blockers → slow page loads). The chrome webview shares the profile,
+            // so sync on it at startup.
             if let Some(wv) = app.webviews().get("main") {
                 crate::extensions::sync_profile_extensions(app.handle(), wv);
+                crate::extensions::ensure_ubo_user_filters(app.handle());
                 // Engine-death recovery (sleep/resume bug): if the WebView2
                 // browser process dies, every webview — chrome included — goes
                 // permanently dead while the event loop lives on. Watch for it
@@ -1023,8 +1055,9 @@ pub fn run() {
             }
             crate::windows::register_resume_watch(app.handle());
 
-            // Deeplink registry registration
+            // Deeplink + "Open with" / default-browser registration (HKCU).
             crate::deeplink::register_jello_protocol();
+            crate::file_assoc::register_on_startup(app.handle());
 
             // Store startup command line argument if any
             let args: Vec<String> = std::env::args().collect();
@@ -1143,6 +1176,7 @@ pub fn run() {
             nav_reload,
             nav_stop,
             nav_to,
+            pip_toggle,
             find_in_page,
             zoom_set,
             zoom_get,
@@ -1187,6 +1221,7 @@ pub fn run() {
             crate::capture::capture_cancel,
             crate::data_cmds::history_search,
             crate::data_cmds::history_delete,
+            crate::data_cmds::top_sites,
             crate::data_cmds::bookmarks_list,
             crate::data_cmds::bookmarks_add,
             crate::data_cmds::bookmarks_update,
@@ -1198,6 +1233,10 @@ pub fn run() {
             crate::engine::webview2::download_resume,
             crate::engine::webview2::download_cancel,
             crate::engine::webview2::download_reveal,
+            crate::engine::webview2::download_open,
+            crate::file_assoc::file_assoc_status,
+            crate::file_assoc::file_assoc_set,
+            crate::file_assoc::file_assoc_open_defaults,
             crate::updater::updater_check,
             crate::updater::updater_apply,
             crate::updater::updater_enabled,

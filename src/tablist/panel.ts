@@ -109,7 +109,7 @@ export class TabPanelController {
 
   // Coalesce bursts of tab:* events (opening a tab fires created + activated
   // back-to-back) into a single tabs_list fetch on a 50ms trailing timer, so
-  // rapid tab churn doesn't trigger N redundant DB reads (Phase 3).
+  // rapid tab churn doesn't trigger N redundant DB reads.
   private reloadTimer: number | null = null;
   private scheduleReload(): void {
     if (this.reloadTimer !== null) return;
@@ -184,7 +184,7 @@ export class TabPanelController {
           invoke("tabs_set_pinned", { id: tab.id, pinned: !tab.pinned }).then(reload).catch(console.error) },
       { label: tab.muted ? "Unmute" : "Mute", onClick: () =>
           invoke("tabs_set_muted", { id: tab.id, muted: !tab.muted }).then(reload).catch(console.error) },
-      // Greyed out when the tab has no webview to unload (#4).
+      // Greyed out when the tab has no webview to unload.
       { label: "Unload", disabled: !(tab.id in this.loadedStates), onClick: () =>
           invoke("tabs_unload", { id: tab.id }).then(reload).catch(console.error) },
       "separator",

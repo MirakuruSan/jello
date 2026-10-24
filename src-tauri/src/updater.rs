@@ -1,4 +1,4 @@
-// M7.1: app-shell auto-updater plumbing (consent-gated; manual approval).
+// App-shell auto-updater plumbing (consent-gated; manual approval).
 // NOTE: a real update endpoint + minisign pubkey must be configured in
 // tauri.conf.json ("plugins.updater") before this functions against a server.
 // Until then check() returns an error which we surface as a toast.

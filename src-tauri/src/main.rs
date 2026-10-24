@@ -21,6 +21,8 @@ pub mod sessions;
 pub mod tray;
 pub mod updater;
 pub mod deeplink;
+pub mod file_assoc;
+pub mod prefs;
 
 fn main() {
     app::run();

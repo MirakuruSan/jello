@@ -1,8 +1,8 @@
-//! Field-diagnostics logging (P0.4).
+//! Field-diagnostics logging.
 //!
-//! The app previously had NO tracing subscriber, so every `tracing::error!` /
-//! `tracing::info!` in the codebase went to the void — silent field bugs. This
-//! installs a subscriber that writes to `%APPDATA%\Jello\logs\jello.log` so that
+//! Without a subscriber every `tracing::error!` / `tracing::info!` in the
+//! codebase goes nowhere. This installs one that writes to
+//! `%APPDATA%\Jello\logs\jello.log` so that
 //! hotkey-registration failures, DB errors, window recreation, etc. become
 //! diagnosable after the fact.
 //!

@@ -1,4 +1,4 @@
-// M6.7: system tray icon. Left-click opens the palette; menu offers common actions.
+// System tray icon. Left-click opens the palette; menu offers common actions.
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},

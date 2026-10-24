@@ -22,14 +22,3 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-
-# Internal planning & design docs — kept local, never published
-/ULTRAPLAN.md
-/FINALPLAN.md
-/CONTINUATION.md
-/FIXPLAN.md
-/FIXPLAN2.md
-/PLAN.md
-/SPEC.md
-/docs/
-/devtools/

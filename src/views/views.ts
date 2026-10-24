@@ -1,4 +1,4 @@
-// M6: History / Bookmarks / Downloads / Settings panel.
+// History / Bookmarks / Downloads / Settings panel.
 import { invoke } from "@tauri-apps/api/core";
 
 interface HistoryEntry { id: number; url: string; title: string; visitCount: number; lastVisit: number; }
@@ -11,7 +11,20 @@ export interface DownloadItem {
   received?: number;
   total?: number;
   path?: string;
+  /// WebView2 interrupt reason for failed/interrupted downloads.
+  reason?: string;
 }
+
+/// Download states that are over (no further progress is possible).
+const DOWNLOAD_ENDED = new Set(["completed", "cancelled", "failed"]);
+const DOWNLOAD_LABEL: Record<string, string> = {
+  inprogress: "Downloading",
+  paused: "Paused",
+  interrupted: "Interrupted",
+  completed: "Done",
+  cancelled: "Cancelled",
+  failed: "Failed",
+};
 
 type ViewName = "history" | "bookmarks" | "downloads" | "settings";
 
@@ -61,7 +74,7 @@ export class ViewsController {
     if (this.isOpen() && this.current === "downloads") this.render();
   }
 
-  /// Merge a progress/done update into an existing download (P3.1). Re-renders
+  /// Merge a progress/done update into an existing download. Re-renders
   /// only the affected row's dynamic bits to avoid a full rebuild storm.
   updateDownload(id: string, patch: Partial<DownloadItem>): void {
     const d = this.downloads.find((x) => x.id === id);
@@ -186,8 +199,7 @@ export class ViewsController {
     };
     for (const d of this.downloads) {
       const row = this.rowHtml(d.fileName, d.url);
-      const done = d.state === "completed" || d.state === "interrupted" || d.state === "cancelled";
-      const inflight = !done;
+      const inflight = !DOWNLOAD_ENDED.has(d.state);
 
       // Progress bar (received/total) for in-flight downloads.
       if (inflight && (d.total ?? 0) > 0) {
@@ -196,7 +208,7 @@ export class ViewsController {
         bar.style.cssText = "flex-basis:100%;height:4px;border-radius:2px;background:var(--surface-2,rgba(128,128,128,0.25));overflow:hidden;margin-top:4px;";
         const fill = document.createElement("div");
         const pct = Math.min(100, Math.round(((d.received ?? 0) / (d.total || 1)) * 100));
-        fill.style.cssText = `height:100%;width:${pct}%;background:var(--accent,#4a9eff);transition:width 0.2s;`;
+        fill.style.cssText = `height:100%;width:100%;transform-origin:left;transform:scaleX(${pct / 100});background:var(--accent,#4a9eff);transition:transform 0.2s;`;
         bar.appendChild(fill);
         row.appendChild(bar);
       }
@@ -204,7 +216,11 @@ export class ViewsController {
       const state = document.createElement("span");
       state.className = "views-dl-state";
       const sizeText = (d.total ?? 0) > 0 ? ` ${fmtBytes(d.received ?? 0)}/${fmtBytes(d.total ?? 0)}` : "";
-      state.textContent = done ? d.state : `${d.state}${sizeText}`;
+      const label = DOWNLOAD_LABEL[d.state] ?? d.state;
+      state.textContent = inflight ? `${label}${sizeText}` : label;
+      if (d.reason && (d.state === "failed" || d.state === "interrupted")) {
+        state.textContent += ` — ${d.reason}`;
+      }
       row.appendChild(state);
 
       const mkBtn = (label: string, cmd: string) => {
@@ -230,17 +246,24 @@ export class ViewsController {
       };
 
       if (inflight) {
-        if (d.state === "paused") row.appendChild(mkToggle("Resume", "download_resume", "inprogress"));
-        else row.appendChild(mkToggle("Pause", "download_pause", "paused"));
+        if (d.state === "paused" || d.state === "interrupted") {
+          row.appendChild(mkToggle(d.state === "paused" ? "Resume" : "Retry", "download_resume", "inprogress"));
+        } else {
+          row.appendChild(mkToggle("Pause", "download_pause", "paused"));
+        }
         row.appendChild(mkBtn("Cancel", "download_cancel"));
       } else if (d.state === "completed" && d.path) {
-        const open = document.createElement("button");
-        open.className = "views-btn interactive";
-        open.textContent = "Open folder";
-        open.addEventListener("click", () => {
-          invoke("download_reveal", { path: d.path }).catch(() => {});
-        });
-        row.appendChild(open);
+        const mkPathBtn = (text: string, cmd: string) => {
+          const b = document.createElement("button");
+          b.className = "views-btn interactive";
+          b.textContent = text;
+          b.addEventListener("click", () => {
+            invoke(cmd, { path: d.path }).catch((e) => console.error(e));
+          });
+          return b;
+        };
+        row.appendChild(mkPathBtn("Open", "download_open"));
+        row.appendChild(mkPathBtn("Show in folder", "download_reveal"));
       }
       list.appendChild(row);
     }
@@ -299,11 +322,7 @@ export class ViewsController {
 
 
 
-    addSection("Browsing");
-    addToggle("adblock", "Block ads & trackers (uBlock Origin)", true);
-    addToggle("searchSuggestions", "Search suggestions (sends keystrokes to engine)", false);
-
-    addSection("Privacy & security");
+    addSection("Privacy & security", "Password and autofill changes apply to tabs loaded afterwards. Ad blocking is the uBlock Origin entry under Extensions.");
     addToggle("passwordAutosave", "Save & autofill passwords", true);
     addToggle("generalAutofill", "Autofill addresses & forms", true);
     addToggle("clearHistoryOnExit", "Clear history on exit", false);
@@ -352,6 +371,47 @@ export class ViewsController {
     addToggle("startMinimized", "Start Jello minimized in system tray", false);
     addToggle("minimizeToTray", "Closing the window minimizes to the system tray", true);
 
+    // Numeric choice stored as a number (0 = never / unlimited).
+    const addSelect = (key: string, label: string, options: [number, string][], def: number) => {
+      const row = document.createElement("label");
+      row.className = "views-setting-row";
+      const span = document.createElement("span");
+      span.textContent = label;
+      span.style.cssText = "flex:1;";
+      const sel = document.createElement("select");
+      sel.className = "views-search interactive";
+      sel.style.cssText = "flex:0 0 150px;";
+      const current = Number(settings[key] ?? def);
+      for (const [value, text] of options) {
+        const o = document.createElement("option");
+        o.value = String(value);
+        o.textContent = text;
+        o.selected = value === current;
+        sel.appendChild(o);
+      }
+      sel.addEventListener("change", () => {
+        invoke("settings_set", { patch: { [key]: Number(sel.value) } }).catch(() => {});
+      });
+      row.append(span, sel);
+      form.appendChild(row);
+    };
+
+    addSection(
+      "Performance",
+      "Fewer loaded tabs and quicker unloading keep memory and CPU low. Tabs playing audio, downloading, or in picture-in-picture are never frozen or unloaded."
+    );
+    addSelect("maxLoadedTabs", "Tabs kept loaded at once",
+      [[3, "3"], [5, "5"], [8, "8"], [12, "12"], [0, "Unlimited"]], 5);
+    addSelect("suspendAfterMins", "Freeze background tabs after",
+      [[1, "1 minute"], [2, "2 minutes"], [5, "5 minutes"], [15, "15 minutes"], [30, "30 minutes"], [0, "Never"]], 5);
+    addSelect("discardAfterMins", "Unload inactive tabs after (memory saver)",
+      [[10, "10 minutes"], [30, "30 minutes"], [60, "1 hour"], [120, "2 hours"], [0, "Never"]], 30);
+
+    addSection("Media");
+    addToggle("autoPip", "Float a playing video in picture-in-picture when you switch tabs or minimize (Alt+P toggles it any time)", true);
+
+    this.renderFilesSection(form, addSection);
+
 
     // --- Extensions ---
     this.renderExtensionsSection(form);
@@ -367,7 +427,7 @@ export class ViewsController {
     form.appendChild(hkNote);
     // Rows arrive async — anchor them HERE. Appending straight to `form` inside
     // the .then() pushed them after every later section, leaving this section
-    // visually empty (#7).
+    // visually empty.
     const hkWrap = document.createElement("div");
     form.appendChild(hkWrap);
 
@@ -446,6 +506,8 @@ export class ViewsController {
       ["History / Downloads / Bookmarks", "Ctrl+H  /  Ctrl+J  /  Ctrl+Shift+O"],
       ["Tab list panel", "Ctrl+Shift+E"],
       ["Mute tab", "Ctrl+M"],
+      ["Picture-in-picture video", "Alt+P"],
+      ["Unload tab (free its memory)", "Ctrl+Shift+W"],
       ["Fullscreen", "F11"],
       ["Close window", "Ctrl+Q"],
     ];
@@ -505,6 +567,57 @@ export class ViewsController {
     }
 
     this.content.appendChild(form);
+  }
+
+  /// "Open with", file types, and default-browser hookup (file_assoc.rs).
+  private renderFilesSection(form: HTMLElement, addSection: (title: string, subtitle?: string) => void): void {
+    addSection(
+      "Files & default browser",
+      "Jello registers with Windows as an \"Open with\" handler for the checked file types. Windows only lets you pick defaults yourself — use the button to open Default Apps."
+    );
+    // Rows arrive async; anchor them here so they stay inside this section.
+    const wrap = document.createElement("div");
+    form.appendChild(wrap);
+
+    type Status = { groups: { key: string; label: string; enabled: boolean }[]; defaultBrowser: boolean; available: boolean };
+    invoke<Status>("file_assoc_status")
+      .then((st) => {
+        const boxes: { key: string; cb: HTMLInputElement }[] = [];
+        const status = document.createElement("div");
+        status.className = "views-section-sub";
+        const save = () => {
+          const groups = boxes.filter((b) => b.cb.checked).map((b) => b.key);
+          invoke("file_assoc_set", { groups })
+            .then(() => { status.textContent = "Saved — file-type registration updated."; })
+            .catch((e) => { status.textContent = String(e); });
+        };
+        for (const g of st.groups) {
+          const row = document.createElement("label");
+          row.className = "views-setting-row";
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.className = "interactive";
+          cb.checked = g.enabled;
+          cb.disabled = !st.available;
+          cb.addEventListener("change", save);
+          const span = document.createElement("span");
+          span.textContent = g.label;
+          row.append(cb, span);
+          wrap.appendChild(row);
+          boxes.push({ key: g.key, cb });
+        }
+        const btn = document.createElement("button");
+        btn.className = "views-btn interactive";
+        btn.textContent = st.defaultBrowser ? "Jello is your default browser ✓ — manage defaults…" : "Make Jello your default browser…";
+        btn.disabled = !st.available;
+        btn.addEventListener("click", () => {
+          invoke("file_assoc_open_defaults").catch((e) => { status.textContent = String(e); });
+        });
+        wrap.appendChild(btn);
+        if (!st.available) status.textContent = "Shell integration is registered by installed builds of Jello.";
+        wrap.appendChild(status);
+      })
+      .catch(() => {});
   }
 
   private renderExtensionsSection(form: HTMLElement): void {
