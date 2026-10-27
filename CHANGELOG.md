@@ -4,6 +4,38 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.11] — 2026-10-27
+
+### Changed
+- **New app icon:** a hand-drawn, translucent red jelly.
+- **Toolbar reveal.** The toolbar appears when the pointer touches the
+  window's top edge and hides shortly after the pointer leaves it, so the top
+  of the page stays clickable. It now fades in at once instead of stepping in.
+- **Keep window on top** has its own button in the address bar, next to the
+  bookmark star.
+- **Redesigned screen capture and OCR.** The frozen screen dims around the
+  selection, with corner handles, a size readout and an action bar (Copy,
+  Save, Pin, Search, Ask AI). Recognized text opens in an editable panel with
+  Copy, Search and Ask AI. Enter captures the whole screen, Ctrl+C and Ctrl+S
+  copy or save the selection, arrow keys nudge it and Esc cancels.
+
+### Fixed
+- The capture overlay could appear as an empty, transparent window. It now
+  shows only once the screenshot has painted, takes keyboard focus on the
+  monitor under the pointer, and no longer includes Jello's own window in the
+  frozen image.
+- Capture overlays were the wrong size on monitors with different display
+  scaling.
+- A capture hotkey could hide Jello without showing the overlay. A failed
+  capture now always brings Jello back.
+- Picture-in-picture "Back to tab" now restores Jello when it is minimized or
+  in the tray, and switches to the video's tab.
+- The palette hotkey closes the palette when it is open, and the palette
+  always opens with the cursor in its search field.
+- Clicking ⋯ again closes the menu. In short windows the menu scrolls instead
+  of covering the toolbar.
+- The toolbar no longer overlaps itself in narrow windows.
+
 ## [0.4.10] — 2026-10-27
 
 ### Added

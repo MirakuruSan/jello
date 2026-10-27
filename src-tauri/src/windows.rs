@@ -307,6 +307,48 @@ pub fn on_main_hidden(app: &AppHandle) {
     });
 }
 
+/// Bring a window to the foreground even while another app owns it. Windows
+/// ignores SetForegroundWindow from a background process unless the calling
+/// thread shares input state with the current foreground thread, so attach to
+/// it for the duration of the call. Main thread only.
+pub fn force_foreground(window: &tauri::Window) {
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = window.hwnd() {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+        };
+        unsafe {
+            let target = HWND(hwnd.0);
+            let fg_thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
+            let me = GetCurrentThreadId();
+            let attached = fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, true).as_bool();
+            let _ = BringWindowToTop(target);
+            let _ = SetForegroundWindow(target);
+            if attached {
+                let _ = AttachThreadInput(me, fg_thread, false);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = window.set_focus();
+}
+
+/// Picture-in-picture "Back to tab": restore Jello (from minimized or the tray)
+/// and switch to the tab the video belongs to.
+pub fn return_from_pip(app: &AppHandle, tab_id: i32) {
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        ensure_main_window(&app2);
+    });
+    let db = app.state::<crate::db::DbState>();
+    let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>();
+    if let Err(e) = crate::tabs::tabs_activate_impl(tab_id, &db, &pool, app) {
+        tracing::warn!("returning to tab {} from picture-in-picture failed: {}", tab_id, e);
+    }
+}
+
 /// Send a picture-in-picture request to the active tab without blocking the
 /// caller (window events run on the main thread; the pool may be busy).
 pub fn pip_active_tab(app: &AppHandle, req: crate::engine::PipRequest) {

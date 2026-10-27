@@ -26,12 +26,16 @@ export type MenuEntry = MenuItem | MenuCustom | "separator";
 
 let current: HTMLElement | null = null;
 let teardown: (() => void) | null = null;
+/// The button that opened the current menu: pressing it again must toggle the
+/// menu closed, not count as an outside click that closes and then reopens it.
+let anchorEl: HTMLElement | null = null;
 
 export function closeContextMenu(): void {
   if (teardown) {
     teardown();
     teardown = null;
   }
+  anchorEl = null;
   if (current) {
     current.remove();
     current = null;
@@ -75,20 +79,23 @@ function buildItem(entry: MenuItem): HTMLButtonElement {
 
 /** Open a menu at (x, y), clamped inside the viewport. */
 export function showContextMenu(x: number, y: number, entries: MenuEntry[]): void {
+  anchorEl = null;
   open(entries, (r) => ({
     left: Math.max(4, Math.min(x, window.innerWidth - r.width - 8)),
     top: Math.max(4, Math.min(y, window.innerHeight - r.height - 8)),
   }));
 }
 
-/** Open a menu below `anchor`, right-aligned to it, and focus the first item. */
+/** Open a menu below `anchor`, right-aligned to it, and focus the first item.
+ *  It never moves up over its anchor; in a short window it scrolls instead. */
 export function showMenuAt(anchor: HTMLElement, entries: MenuEntry[]): void {
   const a = anchor.getBoundingClientRect();
+  anchorEl = anchor;
   open(
     entries,
     (r) => ({
       left: Math.max(8, Math.min(a.right - r.width, window.innerWidth - r.width - 8)),
-      top: Math.min(a.bottom + 8, window.innerHeight - r.height - 8),
+      top: a.bottom + 8,
     }),
     true
   );
@@ -99,7 +106,9 @@ function open(
   place: (r: DOMRect) => { left: number; top: number },
   focusFirst = false
 ): void {
+  const keepAnchor = anchorEl;
   closeContextMenu();
+  anchorEl = keepAnchor;
   const menu = document.createElement("div");
   menu.className = "context-menu interactive";
   menu.setAttribute("role", "menu");
@@ -120,6 +129,11 @@ function open(
   const { left, top } = place(menu.getBoundingClientRect());
   menu.style.left = `${left}px`;
   menu.style.top = `${top}px`;
+  const room = window.innerHeight - top - 8;
+  if (menu.getBoundingClientRect().height > room) {
+    menu.style.maxHeight = `${room}px`;
+    menu.style.overflowY = "auto";
+  }
   // Region must include the menu now that it exists and is positioned.
   window.dispatchEvent(new Event("overlay:layout"));
 
@@ -130,7 +144,9 @@ function open(
   // Dismiss on outside-click / Escape / scroll; arrows move between items.
   // Capture phase so the menu wins over page-level shortcuts.
   const onDown = (ev: MouseEvent) => {
-    if (current && !current.contains(ev.target as Node)) closeContextMenu();
+    const target = ev.target as Node;
+    if (anchorEl?.contains(target)) return;
+    if (current && !current.contains(target)) closeContextMenu();
   };
   const onKey = (ev: KeyboardEvent) => {
     if (ev.key === "Escape") {
@@ -153,7 +169,11 @@ function open(
       list[next].focus();
     }
   };
-  const onScroll = () => closeContextMenu();
+  // Scrolling the page dismisses the menu; scrolling inside a tall menu doesn't.
+  const onScroll = (ev: Event) => {
+    if (current && ev.target instanceof Node && current.contains(ev.target)) return;
+    closeContextMenu();
+  };
   // Defer attaching so the opening click doesn't immediately dismiss.
   setTimeout(() => {
     document.addEventListener("mousedown", onDown, true);

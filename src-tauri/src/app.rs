@@ -935,7 +935,7 @@ pub fn run() {
                             }
                             "palette" => {
                                 let app_h = app.clone();
-                                std::thread::spawn(move || crate::palette::show_palette(&app_h, "search", ""));
+                                std::thread::spawn(move || crate::palette::toggle_palette(&app_h));
                             }
                             "addressbar" => {
                                 // Show the main window and open its IN-WINDOW address
@@ -1221,6 +1221,7 @@ pub fn run() {
             crate::capture::capture_crop,
             crate::capture::capture_ocr_action,
             crate::capture::capture_cancel,
+            crate::capture::capture_ready,
             crate::data_cmds::history_search,
             crate::data_cmds::history_delete,
             crate::data_cmds::top_sites,

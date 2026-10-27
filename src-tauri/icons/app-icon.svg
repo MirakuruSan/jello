@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="body" x1="0" y1="236" x2="0" y2="816" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f53b4f"/>
+      <stop offset="1" stop-color="#d41b35"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="512" cy="600" r="290" gradientTransform="translate(0 600) scale(1 0.7) translate(0 -600)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff8692" stop-opacity="0.75"/>
+      <stop offset="1" stop-color="#ff8692" stop-opacity="0"/>
+    </radialGradient>
+    <path id="shape" d="M506 236 C688 230 830 372 854 556 C870 676 838 776 738 796 C632 816 386 818 284 794 C182 772 152 668 170 552 C196 372 330 242 506 236 Z"/>
+    <clipPath id="bodyClip"><use href="#shape"/></clipPath>
+  </defs>
+
+  <g transform="translate(512 512) scale(1.1) translate(-512 -526)">
+    <!-- Gelatin -->
+    <use href="#shape" fill="url(#body)"/>
+    <g clip-path="url(#bodyClip)">
+      <rect x="140" y="220" width="744" height="610" fill="url(#glow)"/>
+      <!-- Light top, like the set surface of the jelly -->
+      <path d="M232 492 C276 350 392 282 508 280 C632 282 744 348 792 482 C700 420 604 398 510 398 C414 398 316 422 232 492 Z" fill="#ff8590" opacity="0.5"/>
+      <!-- Deeper colour where the gelatin is thickest, at the edges -->
+      <use href="#shape" fill="none" stroke="#a50d26" stroke-width="64" opacity="0.45"/>
+      <!-- Mold lobes -->
+      <g fill="none" stroke="#b3112b" stroke-width="14" stroke-linecap="round" opacity="0.6">
+        <path d="M428 300 C384 384 356 470 350 548"/>
+        <path d="M598 300 C642 384 670 470 676 548"/>
+      </g>
+      <!-- Light passing through the base -->
+      <path d="M268 742 C396 772 636 772 768 740" fill="none" stroke="#ffa3ad" stroke-width="18" stroke-linecap="round" opacity="0.7"/>
+      <!-- The ink line gains weight along the base -->
+      <path d="M170 552 C152 668 182 772 284 794 C386 818 632 816 738 796 C838 776 870 676 854 556 C852 660 820 752 736 774 C630 796 390 798 288 774 C206 754 172 664 170 552 Z" fill="#4d0a17"/>
+      <!-- Bubbles set in the jelly -->
+      <g fill="#ff9ca6" fill-opacity="0.55" stroke="#ffc6cc" stroke-width="5">
+        <circle cx="694" cy="424" r="20"/>
+        <circle cx="740" cy="482" r="11"/>
+        <circle cx="764" cy="694" r="13"/>
+      </g>
+    </g>
+
+    <!-- Gloss -->
+    <path d="M292 476 C312 404 358 348 420 316" fill="none" stroke="#fff" stroke-width="34" stroke-linecap="round" opacity="0.92"/>
+    <circle cx="478" cy="298" r="17" fill="#fff" opacity="0.92"/>
+    <path d="M806 594 C818 646 812 694 790 734" fill="none" stroke="#fff" stroke-width="16" stroke-linecap="round" opacity="0.5"/>
+
+    <!-- Face -->
+    <ellipse cx="352" cy="652" rx="44" ry="26" fill="#ff7f9a" opacity="0.8"/>
+    <ellipse cx="672" cy="652" rx="44" ry="26" fill="#ff7f9a" opacity="0.8"/>
+    <ellipse cx="432" cy="592" rx="30" ry="40" fill="#2a0610"/>
+    <ellipse cx="592" cy="592" rx="30" ry="40" fill="#2a0610"/>
+    <circle cx="422" cy="577" r="11" fill="#fff"/>
+    <circle cx="582" cy="577" r="11" fill="#fff"/>
+    <path d="M484 642 Q512 686 540 642 Z" fill="#2a0610" stroke="#2a0610" stroke-width="10" stroke-linejoin="round"/>
+
+    <!-- Outline -->
+    <use href="#shape" fill="none" stroke="#4d0a17" stroke-width="30" stroke-linejoin="round"/>  </g>
+</svg>

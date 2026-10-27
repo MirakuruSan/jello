@@ -137,11 +137,13 @@ pub fn execute_screenshot_action(
             let img = image::open(&image_path).map_err(|e| e.to_string())?;
             let (w, h) = img.dimensions();
             
-            let window = app.get_webview_window("main")
-                .or_else(|| app.webview_windows().values().next().cloned())
-                .ok_or_else(|| "No main window found".to_string())?;
-            let monitor = window.current_monitor().map_err(|e| e.to_string())?.unwrap();
-            let scale = monitor.scale_factor();
+            // get_window, not get_webview_window: the latter is None for main
+            // once tabs are open.
+            let scale = app
+                .get_window("main")
+                .and_then(|w| w.current_monitor().ok().flatten())
+                .map(|m| m.scale_factor())
+                .unwrap_or(1.0);
             
             let id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() & 0x7FFFFFFF) as i32;
             let label = format!("pin_{}", id);

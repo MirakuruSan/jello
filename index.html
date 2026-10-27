@@ -17,7 +17,7 @@
       <!-- Top navigation loading bar -->
       <div class="nav-progress region-visible" id="nav-progress"></div>
       <!-- ===== Top bar: floating pills ===== -->
-      <div class="top-bar interactive" id="top-bar" data-tauri-drag-region>
+      <div class="top-bar" id="top-bar">
 
         <!-- Navigation pill (top-left) -->
         <div class="nav-pill glass interactive no-drag" id="nav-pill">
@@ -34,6 +34,7 @@
           <span class="page-actions" id="page-actions">
             <button class="page-btn zoom-chip interactive" id="btn-zoom-reset" title="Reset zoom (Ctrl+0)" hidden>100%</button>
             <button class="page-btn interactive" id="btn-pip" title="Picture-in-picture (Alt+P)" hidden></button>
+            <button class="page-btn interactive" id="btn-keep-on-top" title="Keep window on top" aria-pressed="false"></button>
             <button class="page-btn interactive" id="btn-bookmark" title="Bookmark this page (Ctrl+D)" aria-pressed="false"></button>
           </span>
         </div>
@@ -164,23 +165,34 @@
 
     <!-- ===== Capture selection overlay ===== -->
     <div class="capture-overlay" id="capture-overlay">
-      <div class="capture-bg" id="capture-bg"></div>
+      <img class="capture-img" id="capture-img" alt="" draggable="false" />
+      <div class="capture-dim"></div>
       <div class="capture-selection" id="capture-selection">
-        <div class="capture-badge" id="capture-badge">0 × 0</div>
+        <span class="capture-handle nw"></span><span class="capture-handle ne"></span>
+        <span class="capture-handle sw"></span><span class="capture-handle se"></span>
       </div>
-      <!-- Screenshot action bar (shown after a selection is drawn) -->
-      <div class="capture-actionbar glass" id="capture-actionbar">
-        <button class="capture-action-btn" data-action="copy">Copy</button>
-        <button class="capture-action-btn" data-action="save">Save</button>
-        <button class="capture-action-btn" data-action="search">Search</button>
-        <button class="capture-action-btn" data-action="ask_ai">Ask AI</button>
-        <button class="capture-action-btn" data-action="pin">Pin</button>
+      <div class="capture-size" id="capture-badge"></div>
+      <div class="capture-hint glass" id="capture-hint"></div>
+      <!-- Actions for the selected area (screenshot mode) -->
+      <div class="capture-actionbar glass" id="capture-actionbar" role="toolbar" aria-label="Screenshot actions">
+        <button class="capture-action-btn primary" data-action="copy" title="Copy (Enter)">Copy</button>
+        <button class="capture-action-btn" data-action="save" title="Save to Pictures\Jello (Ctrl+S)">Save</button>
+        <button class="capture-action-btn" data-action="pin" title="Pin on screen">Pin</button>
+        <span class="capture-sep"></span>
+        <button class="capture-action-btn" data-action="search" title="Search the web with this image">Search</button>
+        <button class="capture-action-btn" data-action="ask_ai" title="Ask AI about this image">Ask AI</button>
+        <span class="capture-sep"></span>
+        <button class="capture-action-btn icon-only" data-action="cancel" title="Cancel (Esc)" aria-label="Cancel"></button>
       </div>
-      <!-- OCR result popover -->
+      <!-- Recognized text (OCR mode) -->
       <div class="capture-ocr-popover glass" id="capture-ocr-popover">
+        <div class="capture-ocr-head">
+          <span>Recognized text</span>
+          <span class="capture-ocr-count" id="capture-ocr-count"></span>
+        </div>
         <textarea id="capture-ocr-text" class="capture-ocr-text" spellcheck="false"></textarea>
         <div class="capture-ocr-actions">
-          <button class="capture-action-btn" data-ocr-action="copy">Copy</button>
+          <button class="capture-action-btn primary" data-ocr-action="copy">Copy text</button>
           <button class="capture-action-btn" data-ocr-action="search">Search</button>
           <button class="capture-action-btn" data-ocr-action="ask_ai">Ask AI</button>
         </div>

@@ -28,7 +28,8 @@ let lastHitRectsKey = "";
 function updateHitRects(): void {
   // The backend turns these rects into the overlay's window REGION — anything
   // not listed is click-through to the page AND not painted. So: skip faded
-  // chrome (it must not eat clicks while invisible), and include transient
+  // chrome and the closed find bar, which rests invisibly over the top of the
+  // page (neither may eat clicks while invisible), and include transient
   // visuals (toasts, chord HUD) so they stay visible over content.
   // Open panels contribute their whole rect: the backend no longer forces a
   // full-window region while a panel is open (that ate every page click),
@@ -38,7 +39,7 @@ function updateHitRects(): void {
   );
   const rects: HitRect[] = [];
   for (const el of Array.from(elements)) {
-    if (el.closest(".faded")) continue;
+    if (el.closest(".faded, .find-bar:not(.open)")) continue;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) continue;
     rects.push({
@@ -54,28 +55,53 @@ function updateHitRects(): void {
   invoke("overlay_set_hit_rects", { rects }).catch(() => { lastHitRectsKey = ""; });
 }
 
-// ===== Hover-fade system =====
-function resetTopBarFade(): void {
-  const topBar = document.getElementById("top-bar");
-  if (!topBar) return;
-  topBar.classList.remove("faded");
+// ===== Toolbar reveal =====
+// The toolbar appears when the cursor touches the window's top edge (the drag
+// strip) and hides shortly after the cursor leaves the strip and the bar, so
+// the page's own top controls stay reachable. It stays up while the address is
+// being edited, a menu or panel is open, or the new-tab page is showing.
+const TOOLBAR_HIDE_MS = 900;
+
+function toolbarHeld(): boolean {
+  return !!document.getElementById("domain-pill")?.classList.contains("editing")
+    || isMenuOpen()
+    || !!document.getElementById("newtab-page")?.classList.contains("visible")
+    || (tabPanel?.isOpen() ?? false)
+    || (views?.isOpen() ?? false)
+    || !!document.querySelector("#top-bar:hover, .drag-region:hover");
+}
+
+function scheduleToolbarHide(): void {
   if (topBarFadeTimer) clearTimeout(topBarFadeTimer);
   topBarFadeTimer = setTimeout(() => {
-    // Don't fade away the address bar while it's open/focused — it hid what the
-    // user was typing. Reschedule instead so it fades once editing ends.
-    if (document.getElementById("domain-pill")?.classList.contains("editing")) {
-      resetTopBarFade();
+    const topBar = document.getElementById("top-bar");
+    if (!topBar) return;
+    if (toolbarHeld()) {
+      scheduleToolbarHide();
       return;
     }
     topBar.classList.add("faded");
+    // Release the pills' click area once the fade-out has played.
+    setTimeout(updateHitRects, 200);
+  }, TOOLBAR_HIDE_MS);
+}
+
+function showToolbar(): void {
+  const topBar = document.getElementById("top-bar");
+  if (!topBar) return;
+  if (topBar.classList.contains("faded")) {
+    topBar.classList.remove("faded");
+    // Claim the click/paint area now, not on the next layout tick: a late
+    // region update clipped the toolbar mid-fade.
     updateHitRects();
-  }, 2000);
+  }
+  scheduleToolbarHide();
 }
 
 function handleMouseMove(e: MouseEvent): void {
-  if (e.clientY < 56) {
-    resetTopBarFade();
-  }
+  const target = e.target as HTMLElement | null;
+  if (target?.closest(".drag-region")) showToolbar();
+  else if (target?.closest("#top-bar")) scheduleToolbarHide();
 }
 
 // Tell the backend whether any overlay panel is open, so the accelerator
@@ -223,6 +249,7 @@ function updateNewtabVisibility(tab: Tab | undefined): void {
     const s = document.getElementById("newtab-search") as HTMLInputElement | null;
     requestAnimationFrame(() => { s?.focus(); });
     renderTopSites();
+    showToolbar();
   }
 }
 
@@ -370,7 +397,7 @@ function openAddressBar(): void {
   if (!pill || !input) return;
   input.value = activeTab()?.url || "";
   pill.classList.add("editing");
-  resetTopBarFade(); // ensure the bar is un-faded and stays put while editing
+  showToolbar(); // ensure the bar is un-faded and stays put while editing
   updateHitRects();
   requestAnimationFrame(() => {
     input.focus();
@@ -475,7 +502,7 @@ async function toggleCurrentBookmark(): Promise<void> {
 
 // ===== Shortcut dispatch =====
 function handleShortcut(action: string): void {
-  resetTopBarFade();
+  showToolbar();
   switch (action) {
     case "Ctrl+T":
       invoke("tabs_create", { windowId: getWindowId() }).catch(console.error);
@@ -602,203 +629,249 @@ function handleShortcut(action: string): void {
   }
 }
 
-// ===== Capture Overlay Controller =====
+// ===== Capture overlay (screenshot / OCR selection) =====
+// One window per monitor shows the frozen screenshot. The window stays hidden
+// until the image has painted, so nothing transparent ever flashes on screen.
 function initCaptureMode(params: URLSearchParams): void {
   document.body.classList.add("capture-mode");
 
   const imagePath = params.get("image_path") || "";
-  const scale = parseFloat(params.get("scale") || "1");
-  const mode = params.get("mode") || "screenshot";
+  const fallbackScale = parseFloat(params.get("scale") || "1");
+  // Screenshot pixels per CSS pixel, from the image as actually displayed, so
+  // a crop always matches what the user selected.
+  const scaleX = () => (img!.naturalWidth && window.innerWidth ? img!.naturalWidth / window.innerWidth : fallbackScale);
+  const scaleY = () => (img!.naturalHeight && window.innerHeight ? img!.naturalHeight / window.innerHeight : fallbackScale);
+  const isOcr = params.get("mode") === "ocr";
 
-  // Set frozen screenshot as background
-  const bgEl = document.getElementById("capture-bg");
-  if (bgEl) {
-    const fileUrl = convertFileSrc(imagePath);
-    bgEl.style.backgroundImage = `url("${fileUrl}")`;
-  }
+  const overlay = document.getElementById("capture-overlay");
+  const img = document.getElementById("capture-img") as HTMLImageElement | null;
+  const selEl = document.getElementById("capture-selection");
+  const sizeEl = document.getElementById("capture-badge");
+  const hint = document.getElementById("capture-hint");
+  const actionbar = document.getElementById("capture-actionbar");
+  const popover = document.getElementById("capture-ocr-popover");
+  const ocrTextEl = document.getElementById("capture-ocr-text") as HTMLTextAreaElement | null;
+  const ocrCount = document.getElementById("capture-ocr-count");
+  if (!overlay || !img || !selEl || !sizeEl || !hint || !actionbar || !popover || !ocrTextEl) return;
 
-  const selEl = document.getElementById("capture-selection") as HTMLDivElement | null;
-  const badgeEl = document.getElementById("capture-badge");
-  if (!selEl) return;
+  const cancel = () => { invoke("capture_cancel", {}).catch(console.error); };
 
+  // Key hints in the pill; drawn icons on the action buttons.
+  const hintParts: [string, string | null][] = isOcr
+    ? [["Drag over text to read it", null], ["Esc", "cancel"]]
+    : [["Drag to capture an area", null], ["Enter", "full screen"], ["Esc", "cancel"]];
+  hint.replaceChildren();
+  hintParts.forEach(([label, key], i) => {
+    if (i > 0) {
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      hint.append(dot);
+    }
+    if (key === null) {
+      hint.append(label);
+      return;
+    }
+    const kbd = document.createElement("kbd");
+    kbd.textContent = label;
+    hint.append(kbd, ` ${key}`);
+  });
+  const actionIcons: Record<string, string> = {
+    copy: icons.copy, save: icons.download, pin: icons.pin, search: icons.search, ask_ai: icons.sparkle, cancel: icons.close,
+  };
+  actionbar.querySelectorAll<HTMLButtonElement>(".capture-action-btn").forEach((btn) => {
+    const svg = actionIcons[btn.dataset.action || ""];
+    if (!svg) return;
+    if (btn.classList.contains("icon-only")) btn.innerHTML = svg;
+    else btn.insertAdjacentHTML("afterbegin", svg);
+  });
+
+  img.onload = () => {
+    // Decoded means the first paint after showing already has the image.
+    // (No requestAnimationFrame here: a hidden window never runs frames.)
+    img.decode().catch(() => undefined).then(() => invoke("capture_ready", {})).catch(console.error);
+  };
+  img.onerror = () => {
+    console.error("capture: the screenshot could not be loaded");
+    cancel();
+  };
+  img.src = convertFileSrc(imagePath);
+
+  // Selection in CSS pixels.
+  let sel = { x: 0, y: 0, w: 0, h: 0 };
   let dragging = false;
   let startX = 0;
   let startY = 0;
-  let selX = 0;
-  let selY = 0;
-  let selW = 0;
-  let selH = 0;
+  const hasSelection = () => sel.w > 3 && sel.h > 3;
 
-  function updateSelectionRect(): void {
-    if (!selEl) return;
-    selEl.style.left = selX + "px";
-    selEl.style.top = selY + "px";
-    selEl.style.width = selW + "px";
-    selEl.style.height = selH + "px";
-    if (badgeEl) {
-      const physW = Math.round(selW * scale);
-      const physH = Math.round(selH * scale);
-      badgeEl.textContent = `${physW} × ${physH}`;
+  function render(): void {
+    selEl!.style.left = `${sel.x}px`;
+    selEl!.style.top = `${sel.y}px`;
+    selEl!.style.width = `${sel.w}px`;
+    selEl!.style.height = `${sel.h}px`;
+    selEl!.classList.toggle("active", sel.w > 0 && sel.h > 0);
+    // Size readout just above the selection (inside it when there's no room).
+    sizeEl!.textContent = `${Math.round(sel.w * scaleX())} × ${Math.round(sel.h * scaleY())}`;
+    sizeEl!.classList.toggle("visible", sel.w > 0 && sel.h > 0);
+    sizeEl!.style.left = `${sel.x}px`;
+    sizeEl!.style.top = `${sel.y >= 30 ? sel.y - 26 : sel.y + 6}px`;
+  }
+
+  // Panels sit below the selection, right-aligned; above it when there's no
+  // room below; inside its bottom edge as a last resort.
+  function place(el: HTMLElement): void {
+    const r = el.getBoundingClientRect();
+    const left = Math.min(Math.max(8, sel.x + sel.w - r.width), window.innerWidth - r.width - 8);
+    let top = sel.y + sel.h + 10;
+    if (top + r.height > window.innerHeight - 8) top = sel.y - r.height - 10;
+    if (top < 8) top = Math.max(8, sel.y + sel.h - r.height - 10);
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  }
+
+  function physical() {
+    const sx = scaleX();
+    const sy = scaleY();
+    return {
+      x: Math.round(sel.x * sx),
+      y: Math.round(sel.y * sy),
+      width: Math.round(sel.w * sx),
+      height: Math.round(sel.h * sy),
+    };
+  }
+
+  function hidePanels(): void {
+    actionbar!.classList.remove("visible");
+    popover!.classList.remove("visible");
+  }
+
+  function runAction(action: string): void {
+    if (action === "cancel") {
+      cancel();
+      return;
+    }
+    if (!hasSelection()) return;
+    invoke("capture_crop", { sourcePath: imagePath, ...physical(), action, isOcr: false }).catch(console.error);
+  }
+
+  let lastCropPath = "";
+  async function runOcr(): Promise<void> {
+    try {
+      const res = await invoke<{ ocrText: string; imagePath: string }>("capture_crop", {
+        sourcePath: imagePath, ...physical(), action: "ocr", isOcr: true,
+      });
+      lastCropPath = res.imagePath;
+      const text = res.ocrText || "";
+      ocrTextEl!.value = text;
+      if (ocrCount) ocrCount.textContent = text ? `${text.length} characters · copied` : "No text found";
+      popover!.classList.add("visible");
+      place(popover!);
+      ocrTextEl!.focus();
+    } catch (e) {
+      console.error(e);
+      cancel();
     }
   }
 
-  // Clicks on the action bar / OCR popover must reach the buttons — they must
-  // never restart the selection or dismiss the panel they live in.
-  function insidePanel(e: MouseEvent): boolean {
-    const t = e.target as HTMLElement | null;
-    return !!t?.closest("#capture-actionbar, #capture-ocr-popover");
+  function finishSelection(): void {
+    if (!hasSelection()) {
+      sel = { x: 0, y: 0, w: 0, h: 0 };
+      overlay!.classList.remove("has-selection");
+      render();
+      return;
+    }
+    overlay!.classList.add("has-selection");
+    if (isOcr) {
+      runOcr();
+    } else {
+      actionbar!.classList.add("visible");
+      place(actionbar!);
+    }
   }
 
+  const insidePanel = (e: Event) =>
+    !!(e.target as HTMLElement | null)?.closest("#capture-actionbar, #capture-ocr-popover");
+
   document.addEventListener("mousedown", (e: MouseEvent) => {
-    if (insidePanel(e)) return;
+    if (e.button !== 0 || insidePanel(e)) return;
+    hidePanels();
     dragging = true;
     startX = e.clientX;
     startY = e.clientY;
-    selX = startX;
-    selY = startY;
-    selW = 0;
-    selH = 0;
-    selEl.classList.add("active");
-    updateSelectionRect();
+    sel = { x: startX, y: startY, w: 0, h: 0 };
+    overlay.classList.add("selecting");
+    overlay.classList.remove("has-selection");
+    render();
   });
 
   document.addEventListener("mousemove", (e: MouseEvent) => {
     if (!dragging) return;
-    const cx = e.clientX;
-    const cy = e.clientY;
-    selX = Math.min(startX, cx);
-    selY = Math.min(startY, cy);
-    selW = Math.abs(cx - startX);
-    selH = Math.abs(cy - startY);
-    updateSelectionRect();
-  });
-
-  const isOcr = mode === "ocr";
-  const actionbar = document.getElementById("capture-actionbar");
-  const popover = document.getElementById("capture-ocr-popover");
-  const ocrTextEl = document.getElementById("capture-ocr-text") as HTMLTextAreaElement | null;
-  let lastCropPath = "";
-
-  // Physical (image) coords of the current selection.
-  function physCoords() {
-    return {
-      x: Math.round(selX * scale),
-      y: Math.round(selY * scale),
-      width: Math.round(selW * scale),
-      height: Math.round(selH * scale),
+    sel = {
+      x: Math.min(startX, e.clientX),
+      y: Math.min(startY, e.clientY),
+      w: Math.abs(e.clientX - startX),
+      h: Math.abs(e.clientY - startY),
     };
-  }
-
-  // Anchor a panel just below-right of the selection, clamped to the viewport.
-  function anchorPanel(el: HTMLElement): void {
-    const px = Math.min(selX, window.innerWidth - el.offsetWidth - 8);
-    const py = Math.min(selY + selH + 8, window.innerHeight - el.offsetHeight - 8);
-    el.style.left = Math.max(8, px) + "px";
-    el.style.top = Math.max(8, py) + "px";
-  }
-
-  function runScreenshotAction(action: string): void {
-    const p = physCoords();
-    invoke("capture_crop", {
-      sourcePath: imagePath, x: p.x, y: p.y, width: p.width, height: p.height,
-      action, isOcr: false,
-    }).catch(console.error);
-  }
-
-  async function runOcr(): Promise<void> {
-    const p = physCoords();
-    try {
-      const res = await invoke<{ ocrText: string; imagePath: string }>("capture_crop", {
-        sourcePath: imagePath, x: p.x, y: p.y, width: p.width, height: p.height,
-        action: "ocr", isOcr: true,
-      });
-      lastCropPath = res.imagePath;
-      if (ocrTextEl) ocrTextEl.value = res.ocrText || "";
-      if (popover) {
-        popover.classList.add("visible");
-        anchorPanel(popover);
-        ocrTextEl?.focus();
-      }
-    } catch (e) {
-      console.error(e);
-      invoke("capture_cancel", {}).catch(console.error);
-    }
-  }
-
-  function showActionBar(): void {
-    if (!isOcr) {
-      if (actionbar) { actionbar.classList.add("visible"); anchorPanel(actionbar); }
-    } else {
-      runOcr();
-    }
-  }
-
-  // Screenshot action bar buttons.
-  actionbar?.querySelectorAll<HTMLButtonElement>(".capture-action-btn").forEach((btn) => {
-    btn.addEventListener("click", () => runScreenshotAction(btn.dataset.action || "copy"));
+    render();
   });
 
-  // OCR popover buttons.
-  popover?.querySelectorAll<HTMLButtonElement>(".capture-action-btn").forEach((btn) => {
+  document.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    overlay.classList.remove("selecting");
+    finishSelection();
+  });
+
+  actionbar.querySelectorAll<HTMLButtonElement>(".capture-action-btn").forEach((btn) => {
+    btn.addEventListener("click", () => runAction(btn.dataset.action || "copy"));
+  });
+  popover.querySelectorAll<HTMLButtonElement>(".capture-action-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       invoke("capture_ocr_action", {
-        text: ocrTextEl?.value || "",
+        text: ocrTextEl.value,
         action: btn.dataset.ocrAction || "copy",
         imagePath: lastCropPath,
       }).catch(console.error);
     });
   });
 
-  document.addEventListener("mouseup", () => {
-    if (!dragging) return;
-    dragging = false;
-    if (selW > 2 && selH > 2) showActionBar();
-  });
-
-  // A fresh mousedown outside any open panel restarts selection.
-  document.addEventListener("mousedown", (e: MouseEvent) => {
-    if (insidePanel(e)) return;
-    actionbar?.classList.remove("visible");
-    popover?.classList.remove("visible");
-  });
-
   document.addEventListener("keydown", (e: KeyboardEvent) => {
     if (e.key === "Escape") {
-      invoke("capture_cancel", {}).catch(console.error);
-      return;
-    }
-
-    if (e.key === "Enter" && selW > 2 && selH > 2) {
-      // Enter = first action (Copy for screenshot, run OCR for OCR mode).
-      if (isOcr) runOcr();
-      else runScreenshotAction("copy");
       e.preventDefault();
+      cancel();
       return;
     }
-
-    const step = e.shiftKey ? 10 : 1;
-    switch (e.key) {
-      case "ArrowLeft":
-        selX = Math.max(0, selX - step);
-        updateSelectionRect();
-        e.preventDefault();
-        break;
-      case "ArrowRight":
-        selX += step;
-        updateSelectionRect();
-        e.preventDefault();
-        break;
-      case "ArrowUp":
-        selY = Math.max(0, selY - step);
-        updateSelectionRect();
-        e.preventDefault();
-        break;
-      case "ArrowDown":
-        selY += step;
-        updateSelectionRect();
-        e.preventDefault();
-        break;
+    if (e.target === ocrTextEl) return; // the recognized text is editable
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (!hasSelection()) {
+        // Nothing selected: take the whole screen.
+        sel = { x: 0, y: 0, w: window.innerWidth, h: window.innerHeight };
+        render();
+        if (isOcr) finishSelection();
+        else runAction("copy");
+        return;
+      }
+      if (isOcr) runOcr();
+      else runAction("copy");
+      return;
     }
+    if (e.ctrlKey && !isOcr && hasSelection()) {
+      if (e.code === "KeyC") { e.preventDefault(); runAction("copy"); return; }
+      if (e.code === "KeyS") { e.preventDefault(); runAction("save"); return; }
+    }
+    // Arrow keys nudge the selection (Shift = 10px).
+    if (!hasSelection()) return;
+    const step = e.shiftKey ? 10 : 1;
+    const moves: Record<string, [number, number]> = {
+      ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step],
+    };
+    const mv = moves[e.key];
+    if (!mv) return;
+    e.preventDefault();
+    sel.x = Math.max(0, Math.min(window.innerWidth - sel.w, sel.x + mv[0]));
+    sel.y = Math.max(0, Math.min(window.innerHeight - sel.h, sel.y + mv[1]));
+    render();
+    if (actionbar.classList.contains("visible")) place(actionbar);
   });
 }
 
@@ -855,8 +928,20 @@ function setPageLoading(loading: boolean): void {
   btn.setAttribute("aria-label", btn.title);
 }
 
+// Keep-on-top toggle in the address pill reflects the current state.
+function renderKeepOnTop(): void {
+  const btn = document.getElementById("btn-keep-on-top");
+  if (!btn) return;
+  btn.innerHTML = pinnedOnTop ? icons.pinFilled : icons.pin;
+  btn.classList.toggle("pinned", pinnedOnTop);
+  btn.setAttribute("aria-pressed", String(pinnedOnTop));
+  btn.title = pinnedOnTop ? "Stop keeping window on top" : "Keep window on top";
+  btn.setAttribute("aria-label", btn.title);
+}
+
 function setPinnedOnTop(pinned: boolean): void {
   pinnedOnTop = pinned;
+  renderKeepOnTop();
   invoke("window_set_pinned", { pinned }).catch(console.error);
   showToast(pinned ? "Window stays on top" : "Window no longer stays on top");
 }
@@ -1044,8 +1129,10 @@ window.addEventListener("DOMContentLoaded", () => {
     loadBookmarks();
   }
 
-  // Keep-on-top lives in the main menu; reflect the persisted state.
-  invoke<boolean>("window_pinned_state").then((p) => { pinnedOnTop = p; }).catch(() => {});
+  // Keep-on-top: the address-pill button and the main menu share this state.
+  renderKeepOnTop();
+  invoke<boolean>("window_pinned_state").then((p) => { pinnedOnTop = p; renderKeepOnTop(); }).catch(() => {});
+  document.getElementById("btn-keep-on-top")?.addEventListener("click", () => setPinnedOnTop(!pinnedOnTop));
 
   // New-tab search: a real input — Enter navigates/searches directly.
   const newtabSearch = document.getElementById("newtab-search") as HTMLInputElement | null;
@@ -1060,8 +1147,11 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   // Domain pill opens the in-app address bar (matches its Ctrl+L tooltip).
+  // The page buttons inside it are excluded via the event path, which still
+  // holds the clicked node even after its handler has swapped the icon out.
   document.getElementById("domain-pill")?.addEventListener("click", (e) => {
-    if ((e.target as HTMLElement).closest(".page-actions")) return;
+    const onPageAction = e.composedPath().some((n) => n instanceof Element && n.classList.contains("page-actions"));
+    if (onPageAction) return;
     openAddressBar();
   });
   // Right-click the domain pill → Copy URL / Paste and go.
@@ -1157,7 +1247,7 @@ window.addEventListener("DOMContentLoaded", () => {
     e.preventDefault();
     applyZoom(zoomFactor + (e.deltaY < 0 ? 0.1 : -0.1));
   }, { passive: false });
-  resetTopBarFade();
+  showToolbar();
 
   // ===== Clock + top sites (the new-tab page starts out visible) =====
   updateClock();

@@ -1,5 +1,4 @@
 use image::{ImageBuffer, Rgba};
-use tauri::Manager;
 use windows::Win32::Graphics::Gdi::{
     GetDC, CreateCompatibleDC, CreateCompatibleBitmap, SelectObject, BitBlt, DeleteObject, DeleteDC, ReleaseDC, SRCCOPY, BITMAPINFO, BITMAPINFOHEADER, GetDIBits, DIB_RGB_COLORS, BI_RGB
 };
@@ -99,11 +98,9 @@ pub fn capture_rect(x: i32, y: i32, width: i32, height: i32) -> Result<ImageBuff
 }
 
 pub fn capture_all_monitors(app: &tauri::AppHandle) -> Result<Vec<MonitorCaptureInfo>, String> {
-    let window = app.get_webview_window("main")
-        .or_else(|| app.webview_windows().values().next().cloned())
-        .ok_or_else(|| "No window found to query monitors".to_string())?;
-        
-    let monitors = window.available_monitors().map_err(|e| e.to_string())?;
+    // Ask the app, not a window: get_webview_window("main") is None once tabs
+    // are open, and no other webview window may exist yet.
+    let monitors = app.available_monitors().map_err(|e| e.to_string())?;
     
     let temp_dir = std::env::temp_dir().join("JelloCapture");
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;

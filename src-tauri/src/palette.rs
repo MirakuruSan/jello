@@ -57,13 +57,28 @@ pub fn show_palette(app: &AppHandle, mode: &str, prefill: &str) {
         let _ = window.set_size(tauri::LogicalSize::new(680.0, 60.0));
         let _ = window.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
     }
-    let _ = window.show();
-    let _ = window.set_focus();
-
-    let _ = app.emit("palette:open", PaletteOpenPayload {
-        mode: mode.to_string(),
-        prefill: prefill.to_string(),
+    // Show and focus on the UI thread: the window must own the foreground and
+    // its webview must hold keyboard focus before the page focuses the input,
+    // or the palette opens without a caret.
+    let app2 = app.clone();
+    let payload = PaletteOpenPayload { mode: mode.to_string(), prefill: prefill.to_string() };
+    let _ = app.run_on_main_thread(move || {
+        let _ = window.show();
+        crate::windows::force_foreground(&window.as_ref().window());
+        crate::windows::focus_chrome(&app2, "palette");
+        let _ = app2.emit("palette:open", payload);
     });
+}
+
+/// Global hotkey: open the palette, or close it if it is already showing.
+pub fn toggle_palette(app: &AppHandle) {
+    if let Some(window) = app.get_window("palette") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+            return;
+        }
+    }
+    show_palette(app, "search", "");
 }
 
 /// Async: may lazily CREATE the palette window — must not run inside the

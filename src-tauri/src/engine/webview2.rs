@@ -143,7 +143,16 @@ const PIP_JS: &str = r#"(async (mode) => {
   const pool = mode === "auto" ? playing : (playing.length ? playing : vids);
   if (!pool.length) return "novideo";
   pool.sort((a, b) => b.videoWidth * b.videoHeight - a.videoWidth * a.videoHeight);
-  await pool[0].requestPictureInPicture();
+  const video = pool[0];
+  await video.requestPictureInPicture();
+  // Tell Jello how PiP ended: "Back to tab" keeps the video playing, the
+  // window's close button pauses it.
+  video.addEventListener("leavepictureinpicture", () => {
+    setTimeout(() => {
+      const playing = !video.paused && !video.ended;
+      window.chrome?.webview?.postMessage(playing ? "jello:pip-return" : "jello:pip-closed");
+    }, 200);
+  }, { once: true });
   return "entered";
 })"#;
 
@@ -202,6 +211,8 @@ impl WebView2ContentView {
         }));
         let nav_pending_since = Arc::new(AtomicU64::new(now_millis()));
         let download_seen = Arc::new(AtomicBool::new(false));
+        let pip_active = Arc::new(AtomicBool::new(false));
+        let pip_auto = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "windows")]
         {
             let app_handle = webview.app_handle().clone();
@@ -323,6 +334,41 @@ impl WebView2ContentView {
                         if let Ok(core4) = core.cast::<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4>() {
                             let _ = core4.add_DownloadStarting(&handler, &mut token as *mut i64);
                         }
+                    }
+                }
+            });
+
+            // Picture-in-picture endings reported by PIP_JS. "Back to tab" brings
+            // Jello forward on this tab. Honored only while this view has a video
+            // in PiP, so a page can't use the message to pull Jello to the front.
+            let msg_app = webview.app_handle().clone();
+            let msg_pip = pip_active.clone();
+            let msg_auto = pip_auto.clone();
+            let msg_tab = id.0 as i32;
+            let _ = webview.with_webview(move |w| {
+                use webview2_com::WebMessageReceivedEventHandler;
+                use windows::core::PWSTR;
+                unsafe {
+                    if let Ok(core) = w.controller().CoreWebView2() {
+                        let handler = WebMessageReceivedEventHandler::create(Box::new(move |_s, args| {
+                            let Some(args) = args else { return Ok(()) };
+                            let mut raw = PWSTR::null();
+                            if args.TryGetWebMessageAsString(&mut raw).is_err() || raw.is_null() {
+                                return Ok(());
+                            }
+                            let msg = raw.to_string().unwrap_or_default();
+                            if msg != "jello:pip-return" && msg != "jello:pip-closed" {
+                                return Ok(());
+                            }
+                            msg_auto.store(false, Ordering::Relaxed);
+                            if msg_pip.swap(false, Ordering::Relaxed) && msg == "jello:pip-return" {
+                                let app = msg_app.clone();
+                                std::thread::spawn(move || crate::windows::return_from_pip(&app, msg_tab));
+                            }
+                            Ok(())
+                        }));
+                        let mut token: i64 = 0;
+                        let _ = core.add_WebMessageReceived(&handler, &mut token);
                     }
                 }
             });
@@ -535,8 +581,8 @@ impl WebView2ContentView {
             alive: alive.clone(),
             nav_pending_since,
             download_seen,
-            pip_active: Arc::new(AtomicBool::new(false)),
-            pip_auto: Arc::new(AtomicBool::new(false)),
+            pip_active,
+            pip_auto,
         };
 
         // Lightweight scroll poller. Title/URL are event-driven now; the only

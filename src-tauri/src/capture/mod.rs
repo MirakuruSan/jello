@@ -3,11 +3,19 @@ pub mod screenshot;
 
 use tauri::{AppHandle, Manager, WebviewWindowBuilder, WebviewUrl, Emitter};
 use crate::ipc_types::MonitorCaptureInfo;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Labels of Jello windows we hid so they wouldn't appear as ghosts in the
 /// frozen screenshot; restored when the capture overlays close.
 static HIDDEN_FOR_CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Bumped on every capture so a stale safety timer never closes a newer one.
+static CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// How long an overlay may take to paint its screenshot before the capture is
+/// abandoned and the hidden windows come back.
+const OVERLAY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Close all capture overlay windows and re-show any Jello windows that were
 /// hidden for the capture (so the main window returns exactly when it was
@@ -32,13 +40,37 @@ fn close_overlays_and_restore(app: &AppHandle) {
                 // when tabs are open — that was the restore bug.
                 if let Some(w) = app_h.get_window("main") {
                     let _ = w.show();
+                    set_dwm_transitions(&w, true);
                 }
                 crate::windows::force_show_main();
             } else if let Some(w) = app_h.get_window(&label) {
                 let _ = w.show();
+                set_dwm_transitions(&w, true);
             }
         }
     });
+}
+
+/// DWM fades a hidden window out over several frames, and a screenshot taken
+/// mid-fade freezes Jello's own window into the capture. The fade is switched
+/// off while a capture hides a window and back on once it is shown again.
+fn set_dwm_transitions(win: &tauri::Window, enabled: bool) {
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = win.hwnd() {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
+        let disabled: i32 = if enabled { 0 } else { 1 };
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                HWND(hwnd.0),
+                DWMWA_TRANSITIONS_FORCEDISABLED,
+                &disabled as *const _ as *const _,
+                std::mem::size_of_val(&disabled) as u32,
+            );
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (win, enabled);
 }
 
 fn percent_encode(s: &str) -> String {
@@ -77,6 +109,7 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
                     win.is_visible().unwrap_or(false)
                 };
                 if visible {
+                    set_dwm_transitions(win, false);
                     let _ = win.hide();
                     if label == "main" {
                         // Raw-hide so it can't ghost into the frozen frame.
@@ -99,10 +132,17 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
         }
     }
     // Let DWM drop the just-hidden windows from the composited frame before we
-    // BitBlt the screen.
+    // BitBlt the screen (with their fade-out disabled, one frame is enough).
     std::thread::sleep(std::time::Duration::from_millis(90));
 
-    let monitors = crate::platform::win_capture::capture_all_monitors(&app)?;
+    // Any failure from here on must give back the windows hidden above.
+    let fail = |e: String| {
+        tracing::warn!("screen capture failed: {}", e);
+        close_overlays_and_restore(&app);
+        e
+    };
+
+    let monitors = crate::platform::win_capture::capture_all_monitors(&app).map_err(fail)?;
 
     // Close any existing capture windows first to be safe
     for win in app.windows().values() {
@@ -125,25 +165,95 @@ pub async fn capture_trigger(app: AppHandle, mode: String) -> Result<Vec<Monitor
         let logical_w = (info.width as f64) / info.scale_factor;
         let logical_h = (info.height as f64) / info.scale_factor;
         
+        // Created hidden: the page reports back through capture_ready once the
+        // screenshot has painted, so an empty window never flashes on screen.
         let win = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url_str.into()))
             .position(logical_x, logical_y)
             .inner_size(logical_w, logical_h)
+            .visible(false)
             .always_on_top(true)
             .decorations(false)
-            .transparent(true)
+            .resizable(false)
+            .shadow(false)
             .skip_taskbar(true)
             // Must match the other app windows: webviews sharing the app data
             // dir must agree on this, or WebView2 refuses to create the second
             // environment and the overlay webview never loads.
             .browser_extensions_enabled(true)
             .build()
-            .map_err(|e| format!("Failed to build capture overlay window: {}", e))?;
+            .map_err(|e| fail(format!("Failed to build capture overlay window: {}", e)))?;
             
+        // Pin the overlay to the monitor's exact physical bounds. The logical
+        // size above is resolved at the creating monitor's scale, so on a
+        // mixed-DPI setup the window lands on another monitor at the wrong size.
+        let _ = win.set_position(tauri::PhysicalPosition::new(info.x, info.y));
+        let _ = win.set_size(tauri::PhysicalSize::new(info.width.max(1) as u32, info.height.max(1) as u32));
+
         // Ensure fullscreen/topmost z-order
         let _ = win.set_always_on_top(true);
     }
-    
+
+    // If an overlay never paints (the screenshot failed to load), give the
+    // user their windows back instead of leaving Jello hidden.
+    let generation = CAPTURE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let app_t = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(OVERLAY_READY_TIMEOUT);
+        if CAPTURE_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let stalled = app_t
+            .windows()
+            .values()
+            .any(|w| w.label().starts_with("capture_") && !w.is_visible().unwrap_or(false));
+        if stalled {
+            tracing::warn!("capture overlay did not become ready; closing the capture");
+            close_overlays_and_restore(&app_t);
+        }
+    });
+
     Ok(monitors)
+}
+
+/// Called by an overlay once its screenshot has painted. Shows the window; the
+/// overlay under the pointer also takes keyboard focus so Esc, Enter and the
+/// arrow keys work immediately.
+#[tauri::command]
+pub async fn capture_ready(app: AppHandle, window: tauri::Window) -> Result<(), String> {
+    let under_cursor = match (app.cursor_position(), window.outer_position(), window.outer_size()) {
+        (Ok(c), Ok(p), Ok(s)) => {
+            c.x >= p.x as f64
+                && c.y >= p.y as f64
+                && c.x < (p.x + s.width as i32) as f64
+                && c.y < (p.y + s.height as i32) as f64
+        }
+        _ => true,
+    };
+    let app_m = app.clone();
+    app.run_on_main_thread(move || {
+        if under_cursor {
+            let _ = window.show();
+            crate::windows::force_foreground(&window);
+            let _ = window.set_focus();
+            crate::windows::focus_chrome(&app_m, window.label());
+        } else {
+            show_without_activating(&window);
+        }
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn show_without_activating(window: &tauri::Window) {
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = window.hwnd() {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
+        unsafe {
+            let _ = ShowWindow(HWND(hwnd.0), SW_SHOWNA);
+        }
+        return;
+    }
+    let _ = window.show();
 }
 
 #[tauri::command]
