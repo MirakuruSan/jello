@@ -182,6 +182,15 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM history_fts WHERE history_fts MATCH 'test'", [], |r| r.get(0))
             .unwrap();
         assert!(hits >= 1);
+
+        // A new page is recorded untitled, then named by its own title — never
+        // by the title of the page the tab showed before.
+        history::record_visit(&conn, "https://b.test/", None, false).unwrap();
+        history::set_title(&conn, "https://b.test/", "B").unwrap();
+        let b_title: String = conn
+            .query_row("SELECT title FROM history WHERE url = 'https://b.test/'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(b_title, "B");
     }
 
     #[test]

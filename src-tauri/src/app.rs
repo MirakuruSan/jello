@@ -1106,6 +1106,7 @@ pub fn run() {
 
             // Wire pass-through watcher + resize handler for the main window.
             attach_window_plumbing(app.handle(), window);
+            crate::appearance::apply_saved(app.handle());
 
             // Reliably show the main window from the main thread (setup runs on
             // it). The frontend also calls show() after should_show_on_startup,
@@ -1177,6 +1178,7 @@ pub fn run() {
             nav_stop,
             nav_to,
             pip_toggle,
+            crate::appearance::appearance_apply,
             find_in_page,
             zoom_set,
             zoom_get,

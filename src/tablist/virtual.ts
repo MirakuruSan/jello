@@ -111,7 +111,8 @@ export class VirtualTabList {
       // Close button
       const close = document.createElement("span");
       close.className = "close-x";
-      close.textContent = "×";
+      close.innerHTML = icons.close;
+      close.setAttribute("aria-label", "Close tab");
       close.addEventListener("click", (e) => {
         e.stopPropagation();
         this.opts.onClose(tab.id);

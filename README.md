@@ -9,12 +9,14 @@ works as an instant research tool rather than a heavyweight browser.
 No telemetry. Screenshot search and OCR text capture are built in, and Chrome
 extensions are supported.
 
-> Status: **v0.4.9** — active development.
+> Status: **v0.4.10** — active development.
 
 ## Features
 
 - **Chromeless, page-first UI.** The web page fills the whole window; floating
   glass pills provide tabs, navigation, and the address bar on demand.
+- **Liquid-glass look** with a live Windows Acrylic blur behind the new-tab page
+  and palette (or Mica / Solid), in dark and light themes.
 - **Quick palette** (Alt+Space style) for search, history, bookmarks, and tabs,
   with one-step "Ask Google AI Mode" / "Ask Duck.ai" rows, plus an in-window
   address bar (Ctrl+L).

@@ -1,28 +1,5 @@
-#[cfg(target_os = "windows")]
-pub fn apply_acrylic(window: &tauri::WebviewWindow) {
-    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW};
-    use windows::Win32::Foundation::HWND;
-
-    if let Ok(hwnd) = window.hwnd() {
-        let hwnd_raw = HWND(hwnd.0);
-        let value = DWMSBT_TRANSIENTWINDOW.0; // Acrylic backdrop type (3)
-        unsafe {
-            let _ = DwmSetWindowAttribute(
-                hwnd_raw,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                &value as *const i32 as *const _,
-                std::mem::size_of::<i32>() as u32,
-            );
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn apply_acrylic(_window: &tauri::WebviewWindow) {}
-
-// (set_hwnd_click_through removed: WS_EX_TRANSPARENT on the overlay HOST does
-// not affect the Chromium child windows inside it — pass-through is done with
-// SetWindowRgn in app::apply_overlay_region instead.)
+// Overlay click-through is done with SetWindowRgn in app::apply_overlay_region:
+// WS_EX_TRANSPARENT on the host window does not reach its Chromium child windows.
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn window_subclass_proc(

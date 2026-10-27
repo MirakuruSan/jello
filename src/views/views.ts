@@ -1,5 +1,7 @@
 // History / Bookmarks / Downloads / Settings panel.
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
+import * as icons from "../icons";
 
 interface HistoryEntry { id: number; url: string; title: string; visitCount: number; lastVisit: number; }
 interface Bookmark { id: number; url: string; title: string; position: number; }
@@ -33,6 +35,8 @@ export class ViewsController {
   private content: HTMLElement;
   private current: ViewName = "history";
   private downloads: DownloadItem[] = [];
+  /// Scroll handler of the settings section index; replaced on each render.
+  private navSync: (() => void) | null = null;
   private onNavigate: (url: string) => void;
   private onOpenChanged: (open: boolean) => void;
 
@@ -84,6 +88,10 @@ export class ViewsController {
   }
 
   private async render(): Promise<void> {
+    if (this.navSync) {
+      this.content.removeEventListener("scroll", this.navSync);
+      this.navSync = null;
+    }
     this.content.innerHTML = "<div class='views-loading'>Loading…</div>";
     switch (this.current) {
       case "history": return this.renderHistory();
@@ -137,7 +145,8 @@ export class ViewsController {
         row.addEventListener("click", () => { this.onNavigate(h.url); this.close(); });
         const del = document.createElement("button");
         del.className = "views-row-del interactive";
-        del.textContent = "×";
+        del.innerHTML = icons.close;
+        del.setAttribute("aria-label", "Remove");
         del.addEventListener("click", async (e) => {
           e.stopPropagation();
           await invoke("history_delete", { mode: "ids", ids: [h.id] }).catch(() => {});
@@ -169,7 +178,8 @@ export class ViewsController {
       row.addEventListener("click", () => { this.onNavigate(b.url); this.close(); });
       const del = document.createElement("button");
       del.className = "views-row-del interactive";
-      del.textContent = "×";
+      del.innerHTML = icons.close;
+        del.setAttribute("aria-label", "Remove");
       del.addEventListener("click", async (e) => {
         e.stopPropagation();
         await invoke("bookmarks_remove", { id: b.id }).catch(() => {});
@@ -310,15 +320,47 @@ export class ViewsController {
       }
     };
 
-    addSection("Setup & data");
+    addSection("General");
     const rerun = document.createElement("button");
     rerun.className = "views-btn interactive";
-    rerun.textContent = "Configure";
+    rerun.textContent = "Run setup again";
     rerun.addEventListener("click", () => {
       invoke("settings_set", { patch: { wizardComplete: false } }).catch(() => {});
       window.dispatchEvent(new CustomEvent("jello:run-wizard"));
     });
     form.appendChild(rerun);
+
+    // Theme + window material apply live: save, re-apply the native backdrop,
+    // and tell every window (palette included) to restyle.
+    addSection("Appearance", "Acrylic shows a live blur of whatever is behind the window on the new-tab page and the palette; Mica tints with your wallpaper and is lighter on the GPU.");
+    const addChoice = (key: string, label: string, options: [string, string][], def: string) => {
+      const row = document.createElement("label");
+      row.className = "views-setting-row";
+      const span = document.createElement("span");
+      span.textContent = label;
+      span.style.cssText = "flex:1;";
+      const sel = document.createElement("select");
+      sel.className = "views-search interactive";
+      sel.style.cssText = "flex:0 0 200px;";
+      const current = typeof settings[key] === "string" ? (settings[key] as string) : def;
+      for (const [value, text] of options) {
+        const o = document.createElement("option");
+        o.value = value;
+        o.textContent = text;
+        o.selected = value === current;
+        sel.appendChild(o);
+      }
+      sel.addEventListener("change", async () => {
+        await invoke("settings_set", { patch: { [key]: sel.value } }).catch(() => {});
+        const all = await invoke<Record<string, unknown>>("settings_get").catch(() => ({ [key]: sel.value }));
+        await emit("appearance:changed", all).catch(() => {});
+        invoke("appearance_apply").catch(() => {});
+      });
+      row.append(span, sel);
+      form.appendChild(row);
+    };
+    addChoice("theme", "Theme", [["dark", "Dark"], ["light", "Light"]], "dark");
+    addChoice("windowMaterial", "Window material", [["acrylic", "Acrylic (live blur)"], ["mica", "Mica (wallpaper tint)"], ["solid", "Solid"]], "acrylic");
 
 
 
@@ -566,13 +608,43 @@ export class ViewsController {
       form.appendChild(checkUpdateBtn);
     }
 
-    this.content.appendChild(form);
+    this.content.appendChild(this.withSectionNav(form));
+  }
+
+  /// Wrap the settings form with a section index: click to jump, and the
+  /// section being read stays highlighted while scrolling.
+  private withSectionNav(form: HTMLElement): HTMLElement {
+    const layout = document.createElement("div");
+    layout.className = "settings-layout";
+    const nav = document.createElement("nav");
+    nav.className = "settings-nav";
+    nav.setAttribute("aria-label", "Settings sections");
+    const headers = Array.from(form.querySelectorAll<HTMLElement>(".views-section-header"));
+    const links = headers.map((h) => {
+      const b = document.createElement("button");
+      b.className = "interactive";
+      b.textContent = h.textContent;
+      b.addEventListener("click", () => h.scrollIntoView({ block: "start", behavior: "smooth" }));
+      nav.appendChild(b);
+      return b;
+    });
+    const sync = () => {
+      const top = this.content.getBoundingClientRect().top + 24;
+      let current = 0;
+      headers.forEach((h, i) => { if (h.getBoundingClientRect().top <= top) current = i; });
+      links.forEach((l, i) => l.classList.toggle("active", i === current));
+    };
+    this.navSync = sync;
+    this.content.addEventListener("scroll", sync, { passive: true });
+    requestAnimationFrame(sync);
+    layout.append(nav, form);
+    return layout;
   }
 
   /// "Open with", file types, and default-browser hookup (file_assoc.rs).
   private renderFilesSection(form: HTMLElement, addSection: (title: string, subtitle?: string) => void): void {
     addSection(
-      "Files & default browser",
+      "Default apps",
       "Jello registers with Windows as an \"Open with\" handler for the checked file types. Windows only lets you pick defaults yourself — use the button to open Default Apps."
     );
     // Rows arrive async; anchor them here so they stay inside this section.
@@ -637,7 +709,7 @@ export class ViewsController {
     restartNote.style.cssText =
       "color:var(--warn);font-size:0.6875rem;margin:4px 0;display:none;";
     const restartBtn = document.createElement("button");
-    restartBtn.className = "views-btn interactive";
+    restartBtn.className = "views-btn primary interactive";
     restartBtn.textContent = "↻ Restart Jello now";
     restartBtn.style.cssText = "display:none;margin:4px 0;";
     restartBtn.addEventListener("click", () => {

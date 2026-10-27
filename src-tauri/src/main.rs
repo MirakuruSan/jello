@@ -23,6 +23,7 @@ pub mod updater;
 pub mod deeplink;
 pub mod file_assoc;
 pub mod prefs;
+pub mod appearance;
 
 fn main() {
     app::run();

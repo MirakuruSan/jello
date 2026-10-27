@@ -10,7 +10,7 @@ import { TabPanelController } from "./tablist/panel";
 import { PaletteController } from "./palette/controller";
 import { ViewsController, type DownloadItem } from "./views/views";
 import { Wizard, applyTheme } from "./views/wizard";
-import { showContextMenu } from "./contextMenu";
+import { showContextMenu, showMenuAt, closeContextMenu, isMenuOpen, type MenuEntry } from "./contextMenu";
 import * as icons from "./icons";
 
 // ===== State =====
@@ -272,9 +272,22 @@ function applyZoom(f: number): void {
   showZoomHud(zoomFactor);
 }
 
+// Zoom chip in the address pill: visible only when the page isn't at 100%.
+function updateZoomChip(): void {
+  const chip = document.getElementById("btn-zoom-reset");
+  if (!chip) return;
+  const pct = Math.round(zoomFactor * 100);
+  const hidden = Math.abs(zoomFactor - 1) < 0.01;
+  if (chip.hidden === hidden && chip.textContent === `${pct}%`) return;
+  chip.hidden = hidden;
+  chip.textContent = `${pct}%`;
+  updateHitRects();
+}
+
 // Transient zoom pill: shows e.g. "120%" for ~1.2s while adjusting.
 let zoomHudTimer = 0;
 function showZoomHud(f: number): void {
+  updateZoomChip();
   let hud = document.getElementById("zoom-hud");
   if (!hud) {
     hud = document.createElement("div");
@@ -310,6 +323,7 @@ async function maybeRestoreZoom(host: string): Promise<void> {
   }
   const f = typeof saved === "number" ? saved : 1.0;
   zoomFactor = f;
+  updateZoomChip();
   // Apply to the active view. Only pass the host (which saves) when we actually
   // have a stored value, so we never pollute settings with 100% for every host.
   invoke("zoom_set", { factor: f, host: typeof saved === "number" ? host : "" }).catch(() => {});
@@ -812,8 +826,115 @@ function initPinMode(params: URLSearchParams): void {
   });
 }
 
+// Drawn icons for the icon-only chrome buttons (the markup leaves them empty).
+const CHROME_ICONS: Record<string, string> = {
+  "btn-back": icons.back,
+  "btn-forward": icons.forward,
+  "btn-reload": icons.reload,
+  "btn-pip": icons.pip,
+  "btn-new-tab": icons.plus,
+  "btn-menu": icons.more,
+  "btn-min": icons.minimize,
+  "btn-max": icons.maximize,
+  "btn-close": icons.close,
+  "btn-close-panel": icons.close,
+  "find-prev": icons.chevronUp,
+  "find-next": icons.chevronDown,
+  "find-close": icons.close,
+  "views-close": icons.close,
+  "pin-close-btn": icons.close,
+};
+// Reload turns into Stop while the active page loads.
+let pageLoading = false;
+function setPageLoading(loading: boolean): void {
+  pageLoading = loading;
+  const btn = document.getElementById("btn-reload");
+  if (!btn) return;
+  btn.innerHTML = loading ? icons.close : icons.reload;
+  btn.title = loading ? "Stop loading (Esc)" : "Reload (Ctrl+R)";
+  btn.setAttribute("aria-label", btn.title);
+}
+
+function setPinnedOnTop(pinned: boolean): void {
+  pinnedOnTop = pinned;
+  invoke("window_set_pinned", { pinned }).catch(console.error);
+  showToast(pinned ? "Window stays on top" : "Window no longer stays on top");
+}
+
+// Inline zoom stepper row for the main menu: − 110% +, without closing it.
+function zoomMenuRow(): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "menu-zoom-row";
+  const icon = document.createElement("span");
+  icon.className = "menu-icon";
+  icon.innerHTML = icons.search;
+  const label = document.createElement("span");
+  label.className = "menu-label";
+  label.textContent = "Zoom";
+  const value = document.createElement("button");
+  value.className = "menu-zoom-value";
+  value.title = "Reset to 100% (Ctrl+0)";
+  const render = () => { value.textContent = `${Math.round(zoomFactor * 100)}%`; };
+  const step = (svg: string, title: string, delta: number) => {
+    const b = document.createElement("button");
+    b.className = "menu-zoom-btn";
+    b.title = title;
+    b.setAttribute("aria-label", title);
+    b.innerHTML = svg;
+    b.addEventListener("click", (e) => { e.stopPropagation(); applyZoom(zoomFactor + delta); render(); });
+    return b;
+  };
+  value.addEventListener("click", (e) => { e.stopPropagation(); applyZoom(1.0); render(); });
+  render();
+  row.append(icon, label, step(icons.minimize, "Zoom out (Ctrl+−)", -0.1), value, step(icons.plus, "Zoom in (Ctrl+=)", 0.1));
+  return row;
+}
+
+function showMainMenu(anchor: HTMLElement): void {
+  const hasPage = !!activeTab() && activeTab()?.url !== "about:blank";
+  const entries: MenuEntry[] = [
+    { label: "New tab", icon: icons.plus, shortcut: "Ctrl+T", onClick: () => handleShortcut("Ctrl+T") },
+    { label: "Reopen closed tab", icon: icons.reopen, shortcut: "Ctrl+Shift+T", onClick: () => handleShortcut("Ctrl+Shift+T") },
+    "separator",
+    { label: "History", icon: icons.history, shortcut: "Ctrl+H", onClick: () => views?.open("history") },
+    { label: "Bookmarks", icon: icons.bookmark, shortcut: "Ctrl+Shift+O", onClick: () => views?.open("bookmarks") },
+    { label: "Downloads", icon: icons.download, shortcut: "Ctrl+J", onClick: () => views?.open("downloads") },
+    "separator",
+    { label: "Find in page", icon: icons.search, shortcut: "Ctrl+F", disabled: !hasPage, onClick: () => toggleFindBar() },
+    { render: zoomMenuRow },
+    { label: "Picture-in-picture", icon: icons.pip, shortcut: "Alt+P", disabled: !hasPage, onClick: () => handleShortcut("Alt+P") },
+    { label: "Take screenshot", icon: icons.camera, shortcut: "Ctrl+Alt+S", onClick: () => invoke("capture_trigger", { mode: "screenshot" }).catch(console.error) },
+    "separator",
+    { label: "Keep window on top", icon: icons.pin, checked: pinnedOnTop, onClick: () => setPinnedOnTop(!pinnedOnTop) },
+    { label: "Settings", icon: icons.settings, onClick: () => views?.open("settings") },
+  ];
+  showMenuAt(anchor, entries);
+}
+
+function applyChromeIcons(): void {
+  for (const [id, svg] of Object.entries(CHROME_ICONS)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.innerHTML = svg;
+    if (el.title) el.setAttribute("aria-label", el.title);
+  }
+}
+
+// Theme + window material, for every window kind (main, palette, capture).
+// The material class tells CSS whether a Windows backdrop shows through.
+function applyAppearance(s: Record<string, unknown>): void {
+  if (typeof s.theme === "string") applyTheme(s.theme);
+  const material = typeof s.windowMaterial === "string" ? s.windowMaterial : "acrylic";
+  for (const m of ["acrylic", "mica", "solid"]) {
+    document.body.classList.toggle(`material-${m}`, m === material);
+  }
+}
+
 // ===== Init =====
 window.addEventListener("DOMContentLoaded", () => {
+  applyChromeIcons();
+  invoke<Record<string, unknown>>("settings_get").then(applyAppearance).catch(() => {});
+  listen<Record<string, unknown>>("appearance:changed", (e) => applyAppearance(e.payload));
   const currentLabel = getCurrentWebviewWindow().label;
   const params = new URLSearchParams(window.location.search);
 
@@ -856,10 +977,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   const winId = getWindowId();
 
-  // Apply saved theme, then run the first-run wizard on the main window.
-  invoke<Record<string, unknown>>("settings_get").then((s) => {
-    if (typeof s.theme === "string") applyTheme(s.theme);
-  }).catch(() => {});
+  // First-run wizard on the main window (theme/material are applied above).
   if (winId === 1) {
     new Wizard().maybeShow();
   }
@@ -887,13 +1005,17 @@ window.addEventListener("DOMContentLoaded", () => {
   // ===== Button wiring =====
   document.getElementById("btn-back")?.addEventListener("click", () => invoke("nav_back", {}).catch(console.error));
   document.getElementById("btn-forward")?.addEventListener("click", () => invoke("nav_forward", {}).catch(console.error));
-  document.getElementById("btn-reload")?.addEventListener("click", () => invoke("nav_reload", {}).catch(console.error));
+  document.getElementById("btn-reload")?.addEventListener("click", () =>
+    invoke(pageLoading ? "nav_stop" : "nav_reload", {}).catch(console.error));
   document.getElementById("btn-min")?.addEventListener("click", () => invoke("window_controls", { action: "min" }).catch(console.error));
   document.getElementById("btn-max")?.addEventListener("click", () => invoke("window_controls", { action: "max" }).catch(console.error));
   document.getElementById("btn-close")?.addEventListener("click", () => invoke("window_controls", { action: "close" }).catch(console.error));
-  document.getElementById("btn-menu")?.addEventListener("click", () => {
-    views?.open("settings");
+  const menuBtn = document.getElementById("btn-menu");
+  menuBtn?.addEventListener("click", () => {
+    if (isMenuOpen()) closeContextMenu();
+    else if (menuBtn) showMainMenu(menuBtn);
   });
+  document.getElementById("btn-zoom-reset")?.addEventListener("click", () => applyZoom(1.0));
   // '+' new-tab button.
   document.getElementById("btn-new-tab")?.addEventListener("click", () =>
     invoke("tabs_create", { windowId: getWindowId() }).catch(console.error));
@@ -910,7 +1032,7 @@ window.addEventListener("DOMContentLoaded", () => {
     refreshBookmarkStar = () => {
       const t = activeTab();
       const marked = !!(t && t.url && bookmarkMap.has(t.url));
-      bookmarkBtn.textContent = marked ? "★" : "☆";
+      bookmarkBtn.innerHTML = marked ? icons.bookmarkFilled : icons.bookmark;
       bookmarkBtn.classList.toggle("pinned", marked);
       bookmarkBtn.setAttribute("aria-pressed", String(marked));
       bookmarkBtn.setAttribute("title", marked ? "Remove bookmark (Ctrl+D)" : "Bookmark this page (Ctrl+D)");
@@ -922,28 +1044,8 @@ window.addEventListener("DOMContentLoaded", () => {
     loadBookmarks();
   }
 
-  // Pin-on-top toggle
-  const pinBtn = document.getElementById("btn-pin");
-  if (pinBtn) {
-    const renderPin = (p: boolean) => {
-      pinBtn.innerHTML = p ? icons.pinFilled : icons.pin;
-      pinBtn.classList.toggle("pinned", p);
-      pinBtn.setAttribute("aria-pressed", String(p));
-      pinBtn.setAttribute("title", p ? "Unpin window" : "Pin window on top");
-    };
-    renderPin(pinnedOnTop);
-    // Reflect any persisted state from the backend.
-    invoke<boolean>("window_pinned_state").then((p) => {
-      pinnedOnTop = p;
-      renderPin(p);
-    }).catch(() => {});
-    pinBtn.addEventListener("click", () => {
-      pinnedOnTop = !pinnedOnTop;
-      renderPin(pinnedOnTop);
-      invoke("window_set_pinned", { pinned: pinnedOnTop }).catch(console.error);
-      showToast(pinnedOnTop ? "Pinned on top" : "Unpinned");
-    });
-  }
+  // Keep-on-top lives in the main menu; reflect the persisted state.
+  invoke<boolean>("window_pinned_state").then((p) => { pinnedOnTop = p; }).catch(() => {});
 
   // New-tab search: a real input — Enter navigates/searches directly.
   const newtabSearch = document.getElementById("newtab-search") as HTMLInputElement | null;
@@ -958,7 +1060,10 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   // Domain pill opens the in-app address bar (matches its Ctrl+L tooltip).
-  document.getElementById("domain-pill")?.addEventListener("click", () => openAddressBar());
+  document.getElementById("domain-pill")?.addEventListener("click", (e) => {
+    if ((e.target as HTMLElement).closest(".page-actions")) return;
+    openAddressBar();
+  });
   // Right-click the domain pill → Copy URL / Paste and go.
   document.getElementById("domain-pill")?.addEventListener("contextmenu", (e) => {
     e.preventDefault();
@@ -1088,6 +1193,7 @@ window.addEventListener("DOMContentLoaded", () => {
   listen<number>("tab:activated", (event) => {
     activeTabId = event.payload;
     const tab = tabs.find((t) => t.id === activeTabId);
+    setPageLoading(false);
     updateDomainPill(tab);
     updateNewtabVisibility(tab);
     syncPipButton();
@@ -1121,6 +1227,7 @@ window.addEventListener("DOMContentLoaded", () => {
   // Top loading bar driven by NavigationStarting/Completed.
   listen<{ tabId: number; loading: boolean }>("nav:loading", (event) => {
     if (event.payload.tabId !== activeTabId) return;
+    setPageLoading(event.payload.loading);
     const bar = document.getElementById("nav-progress");
     if (!bar) return;
     if (event.payload.loading) {
@@ -1153,7 +1260,11 @@ window.addEventListener("DOMContentLoaded", () => {
     dlBtn.hidden = unfinished.size === 0;
     let rec = 0, tot = 0;
     for (const d of unfinished.values()) { rec += d.received; tot += d.total; }
-    dlBtn.textContent = tot > 0 ? `↓ ${Math.floor((rec / tot) * 100)}%` : `↓ ${unfinished.size}`;
+    const label = document.createElement("span");
+    label.className = "dl-label";
+    label.textContent = tot > 0 ? `${Math.floor((rec / tot) * 100)}%` : String(unfinished.size);
+    dlBtn.innerHTML = icons.download;
+    dlBtn.append(label);
     updateHitRects();
   };
   dlBtn?.addEventListener("click", () => views?.open("downloads"));

@@ -63,6 +63,12 @@ pub fn record_visit(conn: &Connection, url: &str, title: Option<&str>, typed: bo
     Ok(())
 }
 
+/// Set the title of a URL's history entry (no-op if the URL isn't recorded).
+pub fn set_title(conn: &Connection, url: &str, title: &str) -> Result<()> {
+    conn.execute("UPDATE history SET title = ?1 WHERE url = ?2", params![title, url])?;
+    Ok(())
+}
+
 /// Search history by FTS (title/url) ordered by recency. Empty query returns
 /// the most recent entries.
 pub fn search_history(conn: &Connection, query: &str, limit: i64) -> Result<Vec<crate::ipc_types::HistoryEntry>> {

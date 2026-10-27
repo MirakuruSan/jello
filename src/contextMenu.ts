@@ -1,15 +1,28 @@
-// Lightweight overlay context menu. Pure DOM — no COM. The menu div
-// carries `.interactive` so the overlay's hit-rect region includes it (clicks
-// land instead of passing through to the page); opening/closing dispatches
-// `overlay:layout` so main.ts recomputes the region.
+// Overlay menus: the main menu and the right-click menus on chrome (tab rows,
+// address pill). Pure DOM — no COM. The menu carries `.interactive` so the
+// overlay's hit-rect region includes it (clicks land instead of passing
+// through to the page); opening/closing dispatches `overlay:layout` so
+// main.ts recomputes the region.
 
 export interface MenuItem {
   label: string;
   onClick: () => void;
   disabled?: boolean;
   danger?: boolean;
+  /** Inline SVG string (see icons.ts). */
+  icon?: string;
+  /** Shortcut hint shown on the right, e.g. "Ctrl+T". */
+  shortcut?: string;
+  /** Shows a check mark; for toggles. */
+  checked?: boolean;
 }
-export type MenuEntry = MenuItem | "separator";
+
+/** A row the caller builds itself (e.g. the zoom stepper). */
+export interface MenuCustom {
+  render: () => HTMLElement;
+}
+
+export type MenuEntry = MenuItem | MenuCustom | "separator";
 
 let current: HTMLElement | null = null;
 let teardown: (() => void) | null = null;
@@ -26,55 +39,122 @@ export function closeContextMenu(): void {
   }
 }
 
+export function isMenuOpen(): boolean {
+  return current !== null;
+}
+
+function buildItem(entry: MenuItem): HTMLButtonElement {
+  const item = document.createElement("button");
+  item.className = "context-menu-item" + (entry.danger ? " danger" : "");
+  item.setAttribute("role", entry.checked === undefined ? "menuitem" : "menuitemcheckbox");
+  if (entry.checked !== undefined) item.setAttribute("aria-checked", String(entry.checked));
+
+  const icon = document.createElement("span");
+  icon.className = "menu-icon";
+  if (entry.icon) icon.innerHTML = entry.icon;
+  const label = document.createElement("span");
+  label.className = "menu-label";
+  label.textContent = entry.label;
+  const hint = document.createElement("span");
+  hint.className = "menu-hint";
+  if (entry.checked) hint.classList.add("checked");
+  hint.textContent = entry.shortcut ?? "";
+  item.append(icon, label, hint);
+
+  if (entry.disabled) {
+    item.disabled = true;
+  } else {
+    item.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      closeContextMenu();
+      entry.onClick();
+    });
+  }
+  return item;
+}
+
+/** Open a menu at (x, y), clamped inside the viewport. */
 export function showContextMenu(x: number, y: number, entries: MenuEntry[]): void {
+  open(entries, (r) => ({
+    left: Math.max(4, Math.min(x, window.innerWidth - r.width - 8)),
+    top: Math.max(4, Math.min(y, window.innerHeight - r.height - 8)),
+  }));
+}
+
+/** Open a menu below `anchor`, right-aligned to it, and focus the first item. */
+export function showMenuAt(anchor: HTMLElement, entries: MenuEntry[]): void {
+  const a = anchor.getBoundingClientRect();
+  open(
+    entries,
+    (r) => ({
+      left: Math.max(8, Math.min(a.right - r.width, window.innerWidth - r.width - 8)),
+      top: Math.min(a.bottom + 8, window.innerHeight - r.height - 8),
+    }),
+    true
+  );
+}
+
+function open(
+  entries: MenuEntry[],
+  place: (r: DOMRect) => { left: number; top: number },
+  focusFirst = false
+): void {
   closeContextMenu();
   const menu = document.createElement("div");
   menu.className = "context-menu interactive";
-
+  menu.setAttribute("role", "menu");
   for (const entry of entries) {
     if (entry === "separator") {
       const sep = document.createElement("div");
       sep.className = "context-menu-sep";
+      sep.setAttribute("role", "separator");
       menu.appendChild(sep);
-      continue;
-    }
-    const item = document.createElement("button");
-    item.className = "context-menu-item" + (entry.danger ? " danger" : "");
-    item.textContent = entry.label;
-    if (entry.disabled) {
-      item.disabled = true;
+    } else if ("render" in entry) {
+      menu.appendChild(entry.render());
     } else {
-      item.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        closeContextMenu();
-        entry.onClick();
-      });
+      menu.appendChild(buildItem(entry));
     }
-    menu.appendChild(item);
   }
-
   document.body.appendChild(menu);
   current = menu;
-
-  // Clamp inside the viewport.
-  const r = menu.getBoundingClientRect();
-  const left = Math.max(4, Math.min(x, window.innerWidth - r.width - 8));
-  const top = Math.max(4, Math.min(y, window.innerHeight - r.height - 8));
+  const { left, top } = place(menu.getBoundingClientRect());
   menu.style.left = `${left}px`;
   menu.style.top = `${top}px`;
-
   // Region must include the menu now that it exists and is positioned.
   window.dispatchEvent(new Event("overlay:layout"));
 
-  // Dismiss on outside-click / Escape / scroll. Capture phase so it wins.
+  const items = () =>
+    Array.from(menu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+  if (focusFirst) items()[0]?.focus();
+
+  // Dismiss on outside-click / Escape / scroll; arrows move between items.
+  // Capture phase so the menu wins over page-level shortcuts.
   const onDown = (ev: MouseEvent) => {
     if (current && !current.contains(ev.target as Node)) closeContextMenu();
   };
   const onKey = (ev: KeyboardEvent) => {
-    if (ev.key === "Escape") closeContextMenu();
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeContextMenu();
+      return;
+    }
+    const list = items();
+    if (!list.length) return;
+    const at = list.indexOf(document.activeElement as HTMLButtonElement);
+    let next = -1;
+    if (ev.key === "ArrowDown") next = at < 0 ? 0 : (at + 1) % list.length;
+    else if (ev.key === "ArrowUp") next = at < 0 ? list.length - 1 : (at - 1 + list.length) % list.length;
+    else if (ev.key === "Home") next = 0;
+    else if (ev.key === "End") next = list.length - 1;
+    if (next >= 0) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      list[next].focus();
+    }
   };
   const onScroll = () => closeContextMenu();
-  // Defer attaching so the opening right-click doesn't immediately dismiss.
+  // Defer attaching so the opening click doesn't immediately dismiss.
   setTimeout(() => {
     document.addEventListener("mousedown", onDown, true);
     document.addEventListener("keydown", onKey, true);

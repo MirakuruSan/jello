@@ -21,30 +21,38 @@
 
         <!-- Navigation pill (top-left) -->
         <div class="nav-pill glass interactive no-drag" id="nav-pill">
-          <button class="pill-btn interactive" id="btn-back" title="Back (Alt+←)">←</button>
-          <button class="pill-btn interactive" id="btn-forward" title="Forward (Alt+→)">→</button>
-          <button class="pill-btn interactive" id="btn-reload" title="Reload (Ctrl+R)">↻</button>
+          <button class="pill-btn interactive" id="btn-back" title="Back (Alt+←)"></button>
+          <button class="pill-btn interactive" id="btn-forward" title="Forward (Alt+→)"></button>
+          <button class="pill-btn interactive" id="btn-reload" title="Reload (Ctrl+R)"></button>
         </div>
 
-        <!-- Domain pill (top-center) — click to edit the URL inline -->
-        <div class="domain-pill glass interactive no-drag" id="domain-pill" title="Click to edit URL (Ctrl+L)">
+        <!-- Address (top-center): click to edit the URL; page actions sit inside it -->
+        <div class="domain-pill glass interactive no-drag" id="domain-pill" title="Edit address (Ctrl+L)">
           <span class="lock-icon"></span>
           <span id="domain-text">New Tab</span>
-          <input type="text" class="address-input interactive no-drag" id="address-input" spellcheck="false" autocomplete="off" placeholder="Search or enter URL…" />
+          <input type="text" class="address-input interactive no-drag" id="address-input" spellcheck="false" autocomplete="off" placeholder="Search or enter address" />
+          <span class="page-actions" id="page-actions">
+            <button class="page-btn zoom-chip interactive" id="btn-zoom-reset" title="Reset zoom (Ctrl+0)" hidden>100%</button>
+            <button class="page-btn interactive" id="btn-pip" title="Picture-in-picture (Alt+P)" hidden></button>
+            <button class="page-btn interactive" id="btn-bookmark" title="Bookmark this page (Ctrl+D)" aria-pressed="false"></button>
+          </span>
         </div>
 
-        <!-- Controls pill (top-right) -->
-        <div class="controls-pill glass interactive no-drag" id="controls-pill">
-          <button class="pill-btn interactive" id="btn-pip" title="Picture-in-picture (Alt+P)" hidden>⧉</button>
-          <button class="pill-btn dl-btn interactive" id="btn-downloads" title="Downloads (Ctrl+J)" hidden>↓</button>
-          <button class="pill-btn interactive" id="btn-pin" title="Pin window on top" aria-pressed="false"></button>
-          <button class="pill-btn interactive" id="btn-bookmark" title="Bookmark this page (Ctrl+D)" aria-pressed="false">☆</button>
-          <button class="pill-btn interactive" id="btn-new-tab" title="New tab (Ctrl+T)">+</button>
-          <button class="pill-btn tab-count-btn interactive" id="btn-tab-count" title="Toggle tab list (Ctrl+Shift+E)">1</button>
-          <button class="pill-btn interactive" id="btn-menu" title="Menu">⋯</button>
-          <button class="pill-btn interactive" id="btn-min" title="Minimize">─</button>
-          <button class="pill-btn interactive" id="btn-max" title="Maximize">□</button>
-          <button class="pill-btn close-btn interactive" id="btn-close" title="Close (Ctrl+Q)">×</button>
+        <div class="top-right">
+          <!-- App controls (top-right) -->
+          <div class="controls-pill glass interactive no-drag" id="controls-pill">
+            <button class="pill-btn dl-btn interactive" id="btn-downloads" title="Downloads (Ctrl+J)" hidden></button>
+            <button class="pill-btn interactive" id="btn-new-tab" title="New tab (Ctrl+T)"></button>
+            <button class="pill-btn tab-count-btn interactive" id="btn-tab-count" title="Tabs (Ctrl+Shift+E)">1</button>
+            <button class="pill-btn interactive" id="btn-menu" title="Menu" aria-haspopup="menu"></button>
+          </div>
+
+          <!-- Window controls (far right) -->
+          <div class="window-controls glass interactive no-drag" id="window-controls">
+            <button class="pill-btn win-btn interactive" id="btn-min" title="Minimize"></button>
+            <button class="pill-btn win-btn interactive" id="btn-max" title="Maximize"></button>
+            <button class="pill-btn win-btn close-btn interactive" id="btn-close" title="Close (Ctrl+Q)"></button>
+          </div>
         </div>
       </div>
 
@@ -52,7 +60,7 @@
       <div class="tab-panel glass" id="tab-panel">
         <div class="tab-panel-header">
           <h3>Tabs</h3>
-          <button class="pill-btn interactive" id="btn-close-panel" title="Close panel">×</button>
+          <button class="pill-btn interactive" id="btn-close-panel" title="Close panel"></button>
         </div>
         <input type="text" class="tab-search interactive" id="tab-search" placeholder="Search tabs…" />
         <div class="tab-list-viewport" id="tab-list-viewport">
@@ -63,9 +71,9 @@
       <!-- ===== Find bar ===== -->
       <div class="find-bar glass" id="find-bar">
         <input type="text" class="interactive" id="find-input" placeholder="Find in page…" />
-        <button class="pill-btn interactive" id="find-prev" title="Previous">▲</button>
-        <button class="pill-btn interactive" id="find-next" title="Next">▼</button>
-        <button class="pill-btn interactive" id="find-close" title="Close">×</button>
+        <button class="pill-btn interactive" id="find-prev" title="Previous"></button>
+        <button class="pill-btn interactive" id="find-next" title="Next"></button>
+        <button class="pill-btn interactive" id="find-close" title="Close"></button>
       </div>
 
       <!-- ===== Toast container ===== -->
@@ -93,7 +101,7 @@
             <button class="views-tab interactive" data-view="downloads">Downloads</button>
             <button class="views-tab interactive" data-view="settings">Settings</button>
           </div>
-          <button class="pill-btn interactive" id="views-close" title="Close">×</button>
+          <button class="pill-btn interactive" id="views-close" title="Close"></button>
         </div>
         <div class="views-content interactive" id="views-content"></div>
       </div>
@@ -182,7 +190,7 @@
     <!-- ===== Pin image viewer ===== -->
     <div class="pin-image-container" id="pin-image-container">
       <img id="pin-image" alt="Pinned crop" />
-      <button class="pin-close-btn" id="pin-close-btn">×</button>
+      <button class="pin-close-btn" id="pin-close-btn"></button>
     </div>
   </body>
 </html>

@@ -4,6 +4,37 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.10] — 2026-10-27
+
+### Added
+- **Liquid-glass interface.** Toolbar pills, panels, menus and the palette
+  share one glass material: a translucent tint, a rim that catches light, a
+  specular top edge and soft depth. The new-tab page and the palette show a
+  live blur of whatever is behind the window.
+- **Settings → Appearance.** Theme (dark / light) and window material —
+  Acrylic (live blur), Mica (wallpaper tint, lighter on the GPU) or Solid —
+  applied immediately to every Jello window.
+- Drawn icons in the toolbar, panels, find bar and lists, replacing text
+  symbols.
+
+### Changed
+- **Reorganized toolbar.** Navigation on the left; the address in the center
+  with page actions inside it (bookmark, picture-in-picture, and a zoom chip
+  that appears when the page isn't at 100%); new tab, tab list, downloads and
+  the menu on the right; window controls in their own group. Reload turns
+  into Stop while a page loads.
+- **A real main menu.** The ⋯ button opens a menu with icons and shortcuts:
+  new and reopened tabs, history, bookmarks, downloads, find, an inline zoom
+  control, picture-in-picture, screenshot, keep-on-top and settings. Menus
+  work from the keyboard (arrows, Home/End, Enter, Esc).
+- **Settings** gained a section index that follows the scroll, switches for
+  on/off options, and consistent buttons, inputs and selects.
+
+### Fixed
+- History entries were sometimes named after the previous page when a tab
+  navigated to a new one.
+- The palette now follows the light/dark theme.
+
 ## [0.4.9] — 2026-10-25
 
 ### Added

@@ -421,9 +421,7 @@ pub fn create_palette_window(app: &AppHandle) -> Result<tauri::WebviewWindow, Bo
     .browser_extensions_enabled(true)
     .build()?;
 
-    // Apply Win11 Acrylic backdrop
-    #[cfg(target_os = "windows")]
-    crate::platform::win_window::apply_acrylic(&window);
+    crate::appearance::apply_saved_to(app, &window.as_ref().window());
 
     Ok(window)
 }

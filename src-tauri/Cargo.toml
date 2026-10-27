@@ -1,6 +1,6 @@
 [package]
 name = "jello"
-version = "0.4.9"
+version = "0.4.10"
 description = "A Jello Browser"
 authors = ["MirakuruSan"]
 edition = "2021"
@@ -34,6 +34,14 @@ tracing-appender = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_System_Registry", "Win32_Security", "Win32_System_Power", "Win32_System_Threading"] }
+
+# Dev builds keep line tables for readable backtraces and skip debug info for
+# dependencies, which keeps target/debug a fraction of the size.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"

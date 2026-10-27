@@ -86,13 +86,16 @@ fn persist_tab_meta(
                 if !ti.is_empty() { t.title = Some(ti.clone()); }
             }
             let _ = crate::db::tabs_repo::update_tab(conn, &t);
-            // Record a history visit on real URL changes to http(s) pages.
-            if url_changed {
-                if let Some(u) = &url {
-                    if u.starts_with("http://") || u.starts_with("https://") {
-                        let th = t.title.clone();
-                        let _ = crate::db::history::record_visit(conn, u, th.as_deref(), false);
-                    }
+            // History: record the visit when the URL changes, then name it when
+            // the page reports its title. The tab's title at URL-change time
+            // still belongs to the previous page.
+            let is_web = t.url.starts_with("http://") || t.url.starts_with("https://");
+            if url_changed && is_web {
+                let _ = crate::db::history::record_visit(conn, &t.url, None, false);
+            }
+            if let Some(ti) = title.as_deref().filter(|ti| !ti.is_empty()) {
+                if is_web {
+                    let _ = crate::db::history::set_title(conn, &t.url, ti);
                 }
             }
             let _ = app2.emit("tab:updated", &t);
