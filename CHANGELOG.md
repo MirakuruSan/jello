@@ -4,7 +4,7 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.4.13] — 2026-10-30
 
 ### Added
 - **Built-in ad blocker, on by default.** Jello now blocks ads and trackers
