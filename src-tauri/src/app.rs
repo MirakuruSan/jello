@@ -1020,6 +1020,13 @@ pub fn run() {
             // Build the enabled-extensions staging dir before any content webview
             // is created (they read extensions_path at build time) so uBOL etc.
             // load on the first tab.
+            // Only one ad blocker runs: unless uBlock Origin is the selected one,
+            // ad-blocking extensions are disabled before they are staged, so
+            // the built-in blocker never filters a page a second time.
+            let reconciled = crate::extensions::reconcile_ad_blocker_extensions(&db_state);
+            if reconciled > 0 {
+                tracing::info!("disabled {} ad-blocking extension(s): not the selected ad blocker", reconciled);
+            }
             // Speed: with full uBO enabled, stacked redundant blockers made every
             // request pay multiple filter passes. Disable them BEFORE staging.
             let deduped = crate::extensions::dedupe_ad_blockers(&db_state);
@@ -1211,6 +1218,12 @@ pub fn run() {
             crate::extensions::extensions_install_file,
             crate::content_blocker::content_blocker_status,
             crate::content_blocker::content_blocker_update,
+            crate::content_blocker::ad_blocker_set,
+            crate::content_blocker::content_blocker_site_toggle,
+            crate::content_blocker::content_blocker_user_filters_get,
+            crate::content_blocker::content_blocker_user_filters_set,
+            crate::content_blocker::content_blocker_tab_stats,
+            crate::content_blocker::content_blocker_pick_element,
             crate::extensions::extensions_install_file_dialog,
             crate::palette::palette_show,
             crate::palette::palette_hide,

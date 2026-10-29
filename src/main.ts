@@ -1065,8 +1065,45 @@ function zoomMenuRow(): HTMLElement {
   return row;
 }
 
-function showMainMenu(anchor: HTMLElement): void {
+/// What the built-in ad blocker did on a tab's page (content_blocker_tab_stats).
+interface AdBlockStats { host: string; paused: boolean; blocked: number; log: unknown[] }
+
+/// The ⋯ menu's ad-blocking entries for the active tab: its blocked count
+/// (opens the request list), pausing the blocker on the site, and the
+/// element picker. Empty when the built-in blocker isn't filtering the tab.
+function adBlockMenuEntries(stats: AdBlockStats | null): MenuEntry[] {
+  if (!stats || !stats.host) return [];
+  const site = stats.host.replace(/^www\./, "");
+  const tabId = activeTabId;
+  return [
+    "separator",
+    {
+      label: stats.paused ? `Ad blocking paused on ${site}` : `${stats.blocked} blocked on this page`,
+      icon: stats.paused ? icons.shieldOff : icons.shield,
+      onClick: () => views?.openBlocked(tabId),
+    },
+    {
+      label: stats.paused ? `Resume ad blocking on ${site}` : `Pause ad blocking on ${site}`,
+      onClick: () => {
+        invoke("content_blocker_site_toggle", { host: site })
+          .then(() => invoke("nav_reload", {}))
+          .catch(console.error);
+      },
+    },
+    {
+      label: "Hide an element…",
+      icon: icons.crosshair,
+      disabled: stats.paused,
+      onClick: () => invoke("content_blocker_pick_element", { tabId }).catch(console.error),
+    },
+  ];
+}
+
+async function showMainMenu(anchor: HTMLElement): Promise<void> {
   const hasPage = !!activeTab() && activeTab()?.url !== "about:blank";
+  const stats = hasPage
+    ? await invoke<AdBlockStats | null>("content_blocker_tab_stats", { tabId: activeTabId }).catch(() => null)
+    : null;
   const entries: MenuEntry[] = [
     { label: "New tab", icon: icons.plus, shortcut: "Ctrl+T", onClick: () => handleShortcut("Ctrl+T") },
     { label: "Reopen closed tab", icon: icons.reopen, shortcut: "Ctrl+Shift+T", onClick: () => handleShortcut("Ctrl+Shift+T") },
@@ -1080,6 +1117,7 @@ function showMainMenu(anchor: HTMLElement): void {
     { label: "Picture-in-picture", icon: icons.pip, shortcut: "Alt+P", disabled: !hasPage, onClick: () => handleShortcut("Alt+P") },
     { label: "Take screenshot", icon: icons.camera, shortcut: "Ctrl+Alt+S", onClick: () => invoke("capture_trigger", { mode: "screenshot" }).catch(console.error) },
     { label: "Full screen", icon: icons.fullscreen, shortcut: "F11", checked: document.body.classList.contains("window-fullscreen"), onClick: () => toggleFullscreen() },
+    ...adBlockMenuEntries(stats),
     "separator",
     { label: "Keep window on top", icon: icons.pin, checked: pinnedOnTop, onClick: () => setPinnedOnTop(!pinnedOnTop) },
     { label: "Settings", icon: icons.settings, onClick: () => views?.open("settings") },

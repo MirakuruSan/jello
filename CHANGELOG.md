@@ -4,6 +4,34 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- **Built-in ad blocker, on by default.** Jello now blocks ads and trackers
+  itself, without an extension, using uBlock Origin's default filter lists
+  (uBlock filters, EasyList, EasyPrivacy, Peter Lowe's list), which it
+  downloads and keeps up to date. It blocks network requests (including in
+  cross-site frames and service workers), hides ad placeholders and empty ad
+  slots, runs uBlock Origin's scriptlets against video ads and anti-adblock
+  walls, strips tracking parameters (`$removeparam`) and applies `$csp`
+  filters. It also works in InPrivate windows. On the tested sites it blocks
+  as much as the uBlock Origin extension while using about 75 MB less memory.
+- **Settings > Ad blocking**: choose Built-in (recommended), the uBlock Origin
+  extension, or Off. Only one ad blocker runs at a time, so switching to the
+  built-in one turns uBlock Origin off, and choosing uBlock Origin installs it
+  if needed.
+- **My filters**: your own blocking and hiding rules in uBlock Origin syntax,
+  edited in Settings.
+- **⋯ menu**: how many requests were blocked on the page (opens the list of
+  blocked requests), **Pause ad blocking on this site**, and **Hide an
+  element…**, which turns the element you click into a filter in My filters.
+
+### Changed
+- The setup wizard's "Block ads & trackers" option uses the built-in blocker
+  instead of installing uBlock Origin. Existing installs switch to the built-in
+  blocker and turn uBlock Origin off; choose it again in Settings > Ad blocking
+  to go back.
+
 ## [0.4.12] — 2026-10-29
 
 ### Added

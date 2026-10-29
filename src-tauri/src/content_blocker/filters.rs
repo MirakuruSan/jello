@@ -220,8 +220,10 @@ pub fn preprocess(text: &str) -> String {
     out
 }
 
-/// Compile downloaded list texts (paired with their sources) into an engine.
-pub fn build_engine<'a>(lists: impl IntoIterator<Item = (&'a ListSource, &'a str)>) -> Engine {
+/// Compile downloaded list texts (paired with their sources) and the user's own
+/// filters into an engine. The user's filters are trusted, like uBlock Origin's
+/// "My filters", so they may use any scriptlet.
+pub fn build_engine<'a>(lists: impl IntoIterator<Item = (&'a ListSource, &'a str)>, user_filters: &str) -> Engine {
     let mut set = FilterSet::new(false);
     for (source, text) in lists {
         let opts = ParseOptions {
@@ -236,6 +238,10 @@ pub fn build_engine<'a>(lists: impl IntoIterator<Item = (&'a ListSource, &'a str
         set.add_filter_list(text, opts);
     }
     set.add_filter_list(JELLO_RULES.to_string(), ParseOptions::default());
+    if !user_filters.trim().is_empty() {
+        let opts = ParseOptions { permissions: TRUSTED_SCRIPTLETS, ..ParseOptions::default() };
+        set.add_filter_list(preprocess(user_filters), opts);
+    }
     Engine::new_with_filter_set(set)
 }
 
@@ -273,10 +279,10 @@ mod tests {
     fn engine_blocks_ads_and_keeps_ai_overviews() {
         let ubo = &LISTS[0];
         let hosts = LISTS.iter().find(|l| l.id == "peter-lowe").unwrap();
-        let engine = build_engine([
-            (ubo, "||ads.example^\n||www.google.com/async/*\n"),
-            (hosts, "127.0.0.1 tracker.example\n"),
-        ]);
+        let engine = build_engine(
+            [(ubo, "||ads.example^\n||www.google.com/async/*\n"), (hosts, "127.0.0.1 tracker.example\n")],
+            "",
+        );
         assert!(blocks(&engine, "https://ads.example/banner.js", "https://news.example/", "script"));
         assert!(blocks(&engine, "https://tracker.example/pixel.gif", "https://news.example/", "image"));
         assert!(!blocks(&engine, "https://cdn.example/app.js", "https://news.example/", "script"));
@@ -298,12 +304,45 @@ mod tests {
         };
         let ubo = &LISTS[0];
         let easylist = LISTS.iter().find(|l| l.id == "easylist").unwrap();
-        let mut engine = build_engine([
-            (ubo, "a.example##+js(trusted-set-cookie, x, 1)\n"),
-            (easylist, "b.example##+js(trusted-set-cookie, x, 1)\n"),
-        ]);
+        let mut engine = build_engine(
+            [(ubo, "a.example##+js(trusted-set-cookie, x, 1)\n"), (easylist, "b.example##+js(trusted-set-cookie, x, 1)\n")],
+            "c.example##+js(trusted-set-cookie, x, 1)\n",
+        );
         engine.use_resources([resource]);
         assert!(engine.url_cosmetic_resources("https://a.example/").injected_script.contains("trustedSetCookie"));
         assert!(!engine.url_cosmetic_resources("https://b.example/").injected_script.contains("trustedSetCookie"));
+        assert!(engine.url_cosmetic_resources("https://c.example/").injected_script.contains("trustedSetCookie"));
+    }
+
+    #[test]
+    fn procedural_filters_arrive_as_steps() {
+        let ubo = &LISTS[0];
+        let engine = build_engine(
+            [(ubo, "news.example##div.card:has-text(/Sponsored/i):upward(2)\nnews.example##.promo:style(height: 0)\nnews.example##.x:remove()\n")],
+            "",
+        );
+        let res = engine.url_cosmetic_resources("https://news.example/");
+        let actions: Vec<serde_json::Value> =
+            res.procedural_actions.iter().map(|a| serde_json::from_str(a).unwrap()).collect();
+        let has_text = actions.iter().find(|a| a["selector"].as_array().map_or(false, |s| s.len() == 3)).unwrap();
+        assert_eq!(has_text["selector"][0]["type"], "css-selector");
+        assert_eq!(has_text["selector"][1]["type"], "has-text");
+        assert_eq!(has_text["selector"][2]["type"], "upward");
+        assert!(actions.iter().any(|a| a["action"]["type"] == "style"));
+        assert!(actions.iter().any(|a| a["action"]["type"] == "remove"));
+        // A selector that is not valid CSS is dropped instead of reaching pages.
+        let bad = build_engine([(ubo, "news.example##div[[broken\n")], "");
+        assert!(bad.url_cosmetic_resources("https://news.example/").hide_selectors.is_empty());
+    }
+
+    #[test]
+    fn user_filters_block_hide_and_allow() {
+        let easylist = LISTS.iter().find(|l| l.id == "easylist").unwrap();
+        let user = "||cdn.example/promo.js\nnews.example##.sponsor\n@@||ads.example/needed.js\n! a comment\n";
+        let engine = build_engine([(easylist, "||ads.example^\n")], user);
+        assert!(blocks(&engine, "https://cdn.example/promo.js", "https://news.example/", "script"));
+        assert!(!blocks(&engine, "https://ads.example/needed.js", "https://news.example/", "script"));
+        assert!(blocks(&engine, "https://ads.example/other.js", "https://news.example/", "script"));
+        assert!(engine.url_cosmetic_resources("https://news.example/").hide_selectors.contains(".sponsor"));
     }
 }

@@ -3,7 +3,8 @@
 //! round-trip into every tab switch, so they are loaded once at startup and
 //! refreshed by `settings_set`.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 
 static MAX_LOADED_TABS: AtomicU32 = AtomicU32::new(5);
@@ -13,7 +14,37 @@ static AUTO_PIP: AtomicBool = AtomicBool::new(true);
 static PASSWORD_AUTOSAVE: AtomicBool = AtomicBool::new(true);
 static GENERAL_AUTOFILL: AtomicBool = AtomicBool::new(true);
 static CLEAR_HISTORY_ON_EXIT: AtomicBool = AtomicBool::new(false);
-static BUILTIN_ADBLOCK: AtomicBool = AtomicBool::new(false);
+static AD_BLOCKER: AtomicU8 = AtomicU8::new(AdBlocker::Builtin as u8);
+static AD_BLOCKING_PAUSED: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Which ad blocker filters pages (`adBlocker` setting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdBlocker {
+    /// The built-in engine (content_blocker); the default.
+    Builtin = 0,
+    /// The uBlock Origin extension.
+    UblockOrigin = 1,
+    Off = 2,
+}
+
+impl AdBlocker {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "builtin" => Some(Self::Builtin),
+            "ublock" => Some(Self::UblockOrigin),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::UblockOrigin => "ublock",
+            Self::Off => "off",
+        }
+    }
+}
 
 /// Webviews kept alive at once; the least-recently-used one is unloaded when a
 /// new tab would exceed it. 0 in the setting means unlimited.
@@ -55,10 +86,31 @@ pub fn clear_history_on_exit() -> bool {
     CLEAR_HISTORY_ON_EXIT.load(Ordering::Relaxed)
 }
 
-/// Jello's built-in ad blocker (content_blocker). Tabs opened while it is on
-/// route their requests through it; switching it off stops blocking at once.
+pub fn ad_blocker() -> AdBlocker {
+    match AD_BLOCKER.load(Ordering::Relaxed) {
+        1 => AdBlocker::UblockOrigin,
+        2 => AdBlocker::Off,
+        _ => AdBlocker::Builtin,
+    }
+}
+
+/// The built-in ad blocker is the selected one. Tabs opened while it is
+/// selected route their requests through it; choosing another stops it
+/// filtering at once.
 pub fn builtin_adblock() -> bool {
-    BUILTIN_ADBLOCK.load(Ordering::Relaxed)
+    ad_blocker() == AdBlocker::Builtin
+}
+
+/// Ad blocking is paused on this host (or a parent domain of it) through the
+/// `adblockPausedSites` list.
+pub fn ad_blocking_paused(host: &str) -> bool {
+    let sites = AD_BLOCKING_PAUSED.read().unwrap();
+    sites.iter().any(|site| host == site || host.strip_suffix(site.as_str()).map_or(false, |rest| rest.ends_with('.')))
+}
+
+/// The `adblockPausedSites` list as stored.
+pub fn ad_blocking_paused_sites() -> Vec<String> {
+    AD_BLOCKING_PAUSED.read().unwrap().clone()
 }
 
 fn minutes(m: u32) -> Option<Duration> {
@@ -103,12 +155,26 @@ pub fn apply(key: &str, value: &serde_json::Value) {
                 DISCARD_AFTER_MINS.store(n, Ordering::Relaxed);
             }
         }
-        "autoPip" | "passwordAutosave" | "generalAutofill" | "clearHistoryOnExit" | "builtinAdblock" => {
+        "adBlocker" => {
+            if let Some(mode) = value.as_str().map(|s| s.trim().trim_matches('"')).and_then(AdBlocker::parse) {
+                AD_BLOCKER.store(mode as u8, Ordering::Relaxed);
+            }
+        }
+        "adblockPausedSites" => {
+            let parsed = match value {
+                serde_json::Value::String(s) => serde_json::from_str::<Vec<String>>(s).ok(),
+                other => serde_json::from_value::<Vec<String>>(other.clone()).ok(),
+            };
+            if let Some(sites) = parsed {
+                *AD_BLOCKING_PAUSED.write().unwrap() =
+                    sites.into_iter().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+            }
+        }
+        "autoPip" | "passwordAutosave" | "generalAutofill" | "clearHistoryOnExit" => {
             let flag = match key {
                 "autoPip" => &AUTO_PIP,
                 "passwordAutosave" => &PASSWORD_AUTOSAVE,
                 "generalAutofill" => &GENERAL_AUTOFILL,
-                "builtinAdblock" => &BUILTIN_ADBLOCK,
                 _ => &CLEAR_HISTORY_ON_EXIT,
             };
             if let Some(b) = as_bool(value) {
@@ -167,11 +233,26 @@ mod tests {
         apply("clearHistoryOnExit", &json!(false));
         assert!(!clear_history_on_exit());
 
-        assert!(!builtin_adblock());
-        apply("builtinAdblock", &json!("true"));
+        // The built-in blocker is the default; the stored value may be quoted.
         assert!(builtin_adblock());
-        apply("builtinAdblock", &json!(false));
-        assert!(!builtin_adblock());
+        apply("adBlocker", &json!("ublock"));
+        assert_eq!(ad_blocker(), AdBlocker::UblockOrigin);
+        apply("adBlocker", &json!("\"off\""));
+        assert_eq!(ad_blocker(), AdBlocker::Off);
+        apply("adBlocker", &json!("unknown"));
+        assert_eq!(ad_blocker(), AdBlocker::Off);
+        apply("adBlocker", &json!("builtin"));
+        assert!(builtin_adblock());
+
+        apply("adblockPausedSites", &json!(["Example.com", " "]));
+        assert!(ad_blocking_paused("example.com"));
+        assert!(ad_blocking_paused("www.example.com"));
+        assert!(!ad_blocking_paused("notexample.com"));
+        assert!(!ad_blocking_paused("example.org"));
+        apply("adblockPausedSites", &json!("[\"news.example\"]"));
+        assert!(ad_blocking_paused("news.example"));
+        assert!(!ad_blocking_paused("example.com"));
+        apply("adblockPausedSites", &json!([]));
 
         apply("unrelatedKey", &json!("x"));
     }

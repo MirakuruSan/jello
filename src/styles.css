@@ -1314,3 +1314,12 @@ body.pin-mode .pin-image-container { display: flex; }
   color: var(--text-dim);
 }
 .views-settings { display: flex; flex-direction: column; }
+.views-filters {
+  width: 100%;
+  min-height: 132px;
+  margin: 4px 0;
+  resize: vertical;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.45;
+}

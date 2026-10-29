@@ -700,6 +700,27 @@ pub async fn extensions_set_enabled(
     app: AppHandle,
 ) -> Result<(), String> {
     db_set_extension_enabled(&db, id.clone(), enabled)?;
+    // Only one ad blocker runs at a time: turning an ad-blocking extension on
+    // makes it the selected blocker, and turning the selected one off leaves
+    // no ad blocker.
+    let ad_extension = db_list_extensions(&db)
+        .map(|all| all.iter().any(|e| e.id == id && is_ad_blocker_extension(e)))
+        .unwrap_or(false);
+    if ad_extension {
+        use crate::prefs::AdBlocker;
+        let mode = crate::prefs::ad_blocker();
+        if enabled && mode != AdBlocker::UblockOrigin {
+            crate::content_blocker::store_ad_blocker(&db, AdBlocker::UblockOrigin);
+            disable_ad_blocker_extensions(&db, Some(&id));
+        } else if !enabled && mode == AdBlocker::UblockOrigin {
+            let others = db_list_extensions(&db)
+                .map(|all| all.iter().any(|e| e.enabled && is_ad_blocker_extension(e)))
+                .unwrap_or(false);
+            if !others {
+                crate::content_blocker::store_ad_blocker(&db, AdBlocker::Off);
+            }
+        }
+    }
     if enabled {
         // Stage additively so newly opened tabs pick it up without the
         // destructive rebuild. (Disable takes full effect on restart — files are
@@ -742,13 +763,84 @@ pub fn dedupe_ad_blockers(db: &DbState) -> usize {
     disabled
 }
 
-/// Install the full uBlock Origin (MV2) from its latest GitHub release —
-/// the wizard/settings now offer this instead of the weaker uBO Lite.
+/// Extension id of uBlock Origin installed from its GitHub release.
+fn ubo_extension_id() -> String {
+    slug_id_from("uBlock Origin (GitHub)")
+}
+
+/// uBlock Origin (either install source), uBlock Origin Lite and AdGuard.
+fn is_ad_blocker_extension(ext: &Extension) -> bool {
+    const STORE_IDS: [&str; 3] = [
+        "cjpalhdlnbpafiamejdnhcphjbkeiagm", // uBlock Origin
+        "ddkjiahejlhfcafbddmgiahcphecmpfh", // uBlock Origin Lite
+        "bgnkhhnnamicmpeenaelnjfhikgbkllg", // AdGuard AdBlocker
+    ];
+    ext.id == ubo_extension_id() || STORE_IDS.contains(&ext.id.as_str()) || ext.name.starts_with("uBlock Origin")
+}
+
+/// Disable every enabled ad-blocking extension except `keep`. Returns how many
+/// were disabled. The caller syncs the profile (or stages at startup).
+fn disable_ad_blocker_extensions(db: &DbState, keep: Option<&str>) -> usize {
+    let Ok(exts) = db_list_extensions(db) else { return 0 };
+    let mut disabled = 0;
+    for ext in exts.iter().filter(|e| e.enabled && is_ad_blocker_extension(e) && Some(e.id.as_str()) != keep) {
+        if db_set_extension_enabled(db, ext.id.clone(), false).is_ok() {
+            tracing::info!("disabled ad-blocking extension '{}': it is not the selected ad blocker", ext.name);
+            disabled += 1;
+        }
+    }
+    disabled
+}
+
+/// Startup, before staging: ad-blocking extensions only run when uBlock Origin
+/// is the selected ad blocker, so the built-in one never filters twice.
+pub fn reconcile_ad_blocker_extensions(db: &DbState) -> usize {
+    if crate::prefs::ad_blocker() == crate::prefs::AdBlocker::UblockOrigin {
+        return 0;
+    }
+    disable_ad_blocker_extensions(db, None)
+}
+
+/// Bring the extensions in line with a newly selected ad blocker: uBlock Origin
+/// is enabled (installed first if needed), or every ad-blocking extension is
+/// disabled in the database and removed from the live WebView2 profile.
+pub async fn apply_ad_blocker_choice(
+    mode: crate::prefs::AdBlocker,
+    db: &DbState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    if mode == crate::prefs::AdBlocker::UblockOrigin {
+        let installed = db_list_extensions(db)?
+            .into_iter()
+            .find(|e| e.id == ubo_extension_id() || (e.name == "uBlock Origin" && is_ad_blocker_extension(e)));
+        match installed {
+            Some(ext) => {
+                db_set_extension_enabled(db, ext.id.clone(), true)?;
+                disable_ad_blocker_extensions(db, Some(&ext.id));
+                stage_one_additive(app, &Extension { enabled: true, ..ext });
+            }
+            None => {
+                install_ubo(db, app).await?;
+            }
+        }
+    } else {
+        disable_ad_blocker_extensions(db, None);
+    }
+    refresh_enabled_cache(db);
+    sync_profile_now(app);
+    Ok(())
+}
+
+/// Install the full uBlock Origin (MV2) from its latest GitHub release.
 #[command]
 pub async fn extensions_install_ubo(
     db: State<'_, DbState>,
     app: AppHandle,
 ) -> Result<Extension, String> {
+    install_ubo(&db, &app).await
+}
+
+async fn install_ubo(db: &DbState, app: &AppHandle) -> Result<Extension, String> {
     let client = crx_http_client()?;
     let rel = client
         .get("https://api.github.com/repos/gorhill/uBlock/releases/latest")
@@ -781,13 +873,12 @@ pub async fn extensions_install_ubo(
         .await
         .map_err(|e| format!("uBO download interrupted: {e}"))?
         .to_vec();
-    // Stable id so re-running the wizard updates in place.
-    let id = slug_id_from("uBlock Origin (GitHub)");
-    let ext = install_from_zip_bytes(bytes, id, false, &db, &app).await?;
-    stage_one_additive(&app, &ext);
-    refresh_enabled_cache(&db);
+    // Stable id so installing again updates in place.
+    let ext = install_from_zip_bytes(bytes, ubo_extension_id(), false, db, app).await?;
+    stage_one_additive(app, &ext);
+    refresh_enabled_cache(db);
     // Install into the live profile now (extensions load without a restart).
-    sync_profile_now(&app);
+    sync_profile_now(app);
     Ok(ext)
 }
 

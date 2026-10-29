@@ -603,7 +603,7 @@ impl WebView2ContentView {
         }
 
         if content_blocking {
-            crate::content_blocker::page::attach(&webview);
+            crate::content_blocker::page::attach(&webview, id.0 as i32);
         }
         let visible = Arc::new(AtomicBool::new(true));
         let alive = Arc::new(AtomicBool::new(true));

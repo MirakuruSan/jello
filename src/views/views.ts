@@ -28,13 +28,15 @@ const DOWNLOAD_LABEL: Record<string, string> = {
   failed: "Failed",
 };
 
-type ViewName = "history" | "bookmarks" | "downloads" | "settings";
+type ViewName = "history" | "bookmarks" | "downloads" | "settings" | "blocked";
 
 export class ViewsController {
   private panel: HTMLElement;
   private content: HTMLElement;
   private current: ViewName = "history";
   private downloads: DownloadItem[] = [];
+  /// Tab whose blocked requests the "blocked" view lists.
+  private blockedTabId = -1;
   /// Scroll handler of the settings section index; replaced on each render.
   private navSync: (() => void) | null = null;
   private onNavigate: (url: string) => void;
@@ -64,6 +66,12 @@ export class ViewsController {
       t.classList.toggle("active", t.dataset.view === view)
     );
     this.render();
+  }
+
+  /// The requests the built-in ad blocker stopped on a tab's current page.
+  openBlocked(tabId: number): void {
+    this.blockedTabId = tabId;
+    this.open("blocked");
   }
 
   close(): void {
@@ -98,6 +106,7 @@ export class ViewsController {
       case "bookmarks": return this.renderBookmarks();
       case "downloads": return this.renderDownloads();
       case "settings": return this.renderSettings();
+      case "blocked": return this.renderBlocked();
     }
   }
 
@@ -364,16 +373,17 @@ export class ViewsController {
 
 
 
-    addSection(
-      "Privacy & security",
-      "Password, autofill and ad blocker changes apply to tabs loaded afterwards. The built-in ad blocker filters pages without running an extension, using uBlock Origin's default lists (uBlock filters, EasyList, EasyPrivacy, Peter Lowe's list), which it downloads and keeps up to date. Turn off uBlock Origin under Extensions when you use it, so pages aren't filtered twice."
-    );
+    addSection("Privacy & security", "Password and autofill changes apply to tabs loaded afterwards.");
     addToggle("passwordAutosave", "Save & autofill passwords", true);
     addToggle("generalAutofill", "Autofill addresses & forms", true);
     addToggle("clearHistoryOnExit", "Clear history on exit", false);
     addToggle("allowFileUrls", "Allow local file:// URLs", false);
-    addToggle("builtinAdblock", "Built-in ad blocker (experimental)", false);
-    this.renderContentBlockerStatus(form);
+
+    addSection(
+      "Ad blocking",
+      "The built-in blocker filters pages inside Jello, without an extension, using uBlock Origin's default lists (uBlock filters, EasyList, EasyPrivacy, Peter Lowe's list), which it downloads and keeps up to date. Changes apply to tabs opened afterwards."
+    );
+    this.renderAdBlocking(form, settings);
 
     addSection("Startup & window");
     addToggle("restoreSession", "Restore tabs on startup", false);
@@ -646,20 +656,58 @@ export class ViewsController {
     return layout;
   }
 
-  /// Filter-list state of the built-in ad blocker (content_blocker), with a
-  /// manual update.
-  private renderContentBlockerStatus(form: HTMLElement): void {
-    type Status = { enabled: boolean; ready: boolean; updated: number; blocked: number; lists: number; scriptlets: boolean };
-    const row = document.createElement("div");
-    row.className = "views-setting-row";
+  /// Settings > Ad blocking: which blocker runs, the built-in one's filter
+  /// lists, the sites it is paused on, and the user's own filters.
+  private renderAdBlocking(form: HTMLElement, settings: Record<string, unknown>): void {
+    type Status = { mode: string; ready: boolean; updated: number; blocked: number; lists: number; scriptlets: boolean };
+
+    const choiceRow = document.createElement("label");
+    choiceRow.className = "views-setting-row";
+    const choiceLabel = document.createElement("span");
+    choiceLabel.textContent = "Ad blocker";
+    choiceLabel.style.cssText = "flex:1;";
+    const choice = document.createElement("select");
+    choice.className = "views-search interactive";
+    choice.style.cssText = "flex:0 0 210px;";
+    const options: [string, string][] = [
+      ["builtin", "Built-in (recommended)"],
+      ["ublock", "uBlock Origin extension"],
+      ["off", "Off"],
+    ];
+    const current = typeof settings.adBlocker === "string" ? settings.adBlocker : "builtin";
+    for (const [value, text] of options) {
+      const o = document.createElement("option");
+      o.value = value;
+      o.textContent = text;
+      o.selected = value === current;
+      choice.appendChild(o);
+    }
+    choiceRow.append(choiceLabel, choice);
+    form.appendChild(choiceRow);
+
+    const statusRow = document.createElement("div");
+    statusRow.className = "views-setting-row";
     const status = document.createElement("span");
     status.className = "views-section-sub";
+    status.style.cssText = "flex:1;margin:0;";
     const update = document.createElement("button");
     update.className = "views-btn interactive";
     update.textContent = "Update filters";
-    const show = (st: Status) => {
+    statusRow.append(status, update);
+    form.appendChild(statusRow);
+
+    const showStatus = (st: Status) => {
+      update.hidden = st.mode !== "builtin";
+      if (st.mode === "ublock") {
+        status.textContent = "uBlock Origin filters pages. Manage it under Extensions.";
+        return;
+      }
+      if (st.mode === "off") {
+        status.textContent = "Ads and trackers are not blocked.";
+        return;
+      }
       if (!st.updated) {
-        status.textContent = st.enabled ? "Downloading filter lists…" : "Filter lists download when you turn it on.";
+        status.textContent = "Downloading filter lists…";
         return;
       }
       const when = new Date(st.updated * 1000).toLocaleString();
@@ -668,7 +716,27 @@ export class ViewsController {
         status.textContent += " · uBlock Origin scriptlets couldn't be downloaded, so some video ads may still play";
       }
     };
-    const refresh = () => invoke<Status>("content_blocker_status").then(show).catch(() => {});
+    const refresh = () => invoke<Status>("content_blocker_status").then(showStatus).catch(() => {});
+    refresh();
+
+    choice.addEventListener("change", () => {
+      const mode = choice.value;
+      choice.disabled = true;
+      // Installing uBlock Origin takes a few seconds; say so only if it does.
+      const slow = window.setTimeout(() => {
+        status.textContent = mode === "ublock" ? "Installing uBlock Origin…" : "Switching…";
+      }, 150);
+      invoke("ad_blocker_set", { mode })
+        .catch((e) => {
+          status.textContent = String(e);
+          choice.value = current;
+        })
+        .finally(() => {
+          window.clearTimeout(slow);
+          choice.disabled = false;
+          refresh();
+        });
+    });
     update.addEventListener("click", () => {
       update.disabled = true;
       status.textContent = "Updating filter lists…";
@@ -679,9 +747,95 @@ export class ViewsController {
           refresh();
         });
     });
-    row.append(status, update);
-    form.appendChild(row);
-    refresh();
+
+    // Sites where the built-in blocker is paused (⋯ menu > Pause ad blocking).
+    const pausedRow = document.createElement("div");
+    pausedRow.className = "views-setting-row";
+    pausedRow.style.cssText = "flex-wrap:wrap;cursor:default;";
+    form.appendChild(pausedRow);
+    const renderPaused = (sites: string[]) => {
+      pausedRow.innerHTML = "";
+      const label = document.createElement("span");
+      label.style.cssText = "flex:1 0 100%;";
+      label.textContent = sites.length
+        ? "Paused on these sites:"
+        : "Paused on no sites. To pause ad blocking on a site, open the ⋯ menu while you're on it.";
+      pausedRow.appendChild(label);
+      for (const site of sites) {
+        const chip = document.createElement("button");
+        chip.className = "views-btn interactive";
+        chip.textContent = `${site} ✕`;
+        chip.title = `Resume ad blocking on ${site}`;
+        chip.addEventListener("click", () => {
+          invoke<boolean>("content_blocker_site_toggle", { host: site })
+            .then(() => renderPaused(sites.filter((s) => s !== site)))
+            .catch(console.error);
+        });
+        pausedRow.appendChild(chip);
+      }
+    };
+    const pausedSetting = settings.adblockPausedSites;
+    let paused: string[] = [];
+    if (Array.isArray(pausedSetting)) paused = pausedSetting.map(String);
+    else if (typeof pausedSetting === "string") {
+      try { paused = JSON.parse(pausedSetting); } catch { paused = []; }
+    }
+    renderPaused(paused);
+
+    // My filters: the user's own rules, compiled into the built-in blocker.
+    const filtersLabel = document.createElement("div");
+    filtersLabel.className = "views-section-sub";
+    filtersLabel.textContent =
+      "My filters — one per line, in uBlock Origin / Adblock Plus syntax: example.com##.banner hides, ||ads.example^ blocks, @@||example.com^ allows. Elements you hide with Hide an element… are added here.";
+    form.appendChild(filtersLabel);
+    const editor = document.createElement("textarea");
+    editor.className = "views-search views-filters interactive";
+    editor.spellcheck = false;
+    editor.placeholder = "example.com##.sponsored-banner";
+    form.appendChild(editor);
+    const saveRow = document.createElement("div");
+    saveRow.className = "views-setting-row";
+    const saveStatus = document.createElement("span");
+    saveStatus.className = "views-section-sub";
+    saveStatus.style.cssText = "flex:1;margin:0;";
+    const save = document.createElement("button");
+    save.className = "views-btn interactive";
+    save.textContent = "Save filters";
+    saveRow.append(saveStatus, save);
+    form.appendChild(saveRow);
+    invoke<string>("content_blocker_user_filters_get").then((text) => { editor.value = text; }).catch(() => {});
+    save.addEventListener("click", () => {
+      save.disabled = true;
+      invoke("content_blocker_user_filters_set", { text: editor.value })
+        .then(() => { saveStatus.textContent = "Saved. Applies to pages loaded from now on."; })
+        .catch((e) => { saveStatus.textContent = String(e); })
+        .finally(() => { save.disabled = false; });
+    });
+  }
+
+  /// Requests the built-in blocker stopped on one tab's current page.
+  private async renderBlocked(): Promise<void> {
+    type Stats = { host: string; paused: boolean; blocked: number; log: { url: string; kind: string }[] };
+    const stats = await invoke<Stats | null>("content_blocker_tab_stats", { tabId: this.blockedTabId }).catch(() => null);
+    this.content.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "views-section-sub";
+    if (!stats) {
+      head.textContent = "The built-in ad blocker is not filtering this tab.";
+      this.content.appendChild(head);
+      return;
+    }
+    head.textContent = stats.paused
+      ? `Ad blocking is paused on ${stats.host}.`
+      : `${stats.blocked} request${stats.blocked === 1 ? "" : "s"} blocked on ${stats.host || "this page"}` +
+        (stats.blocked > stats.log.length ? ` (the latest ${stats.log.length} are listed)` : "");
+    this.content.appendChild(head);
+    const list = document.createElement("div");
+    list.className = "views-list";
+    for (const entry of [...stats.log].reverse()) {
+      list.appendChild(this.rowHtml(entry.kind, entry.url));
+    }
+    this.content.appendChild(list);
   }
 
   /// "Open with", file types, and default-browser hookup (file_assoc.rs).

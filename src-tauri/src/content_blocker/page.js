@@ -9,6 +9,18 @@
   if (location.hostname !== cfg.host || (window === window.top) !== cfg.top) return;
   if (window[cfg.key]) return;
 
+  // Requests to /__<key>/… on the page's own origin are answered by Jello
+  // before they reach the network: generic-rule lookups and picked filters.
+  // The native fetch is kept so page scripts that wrap fetch never see them.
+  const nativeFetch = window.fetch.bind(window);
+  const send = (what, data) =>
+    nativeFetch(location.origin + "/__" + cfg.key + "/" + what + "?d=" + encodeURIComponent(JSON.stringify(data)), {
+      credentials: "omit",
+      cache: "no-store",
+    })
+      .then((r) => r.json())
+      .catch(() => []);
+
   const sheet = new CSSStyleSheet();
   const hidden = new Set();
   const adopt = () => {
@@ -16,16 +28,28 @@
       document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
     }
   };
+  const addRule = (rule) => {
+    try {
+      sheet.insertRule(rule, sheet.cssRules.length);
+    } catch (e) {}
+  };
   const hide = (selectors) => {
     for (const s of selectors) {
       if (hidden.has(s)) continue;
       hidden.add(s);
-      try {
-        sheet.insertRule(s + "{display:none!important}", sheet.cssRules.length);
-      } catch (e) {}
+      addRule(s + "{display:none!important}");
     }
     adopt();
   };
+  // Elements whose request was blocked (images, frames, embeds) would leave
+  // an empty box behind; hide them like uBlock Origin's "collapse".
+  hide.collapse = (url) => {
+    for (const el of document.querySelectorAll("img[src],iframe[src],frame[src],embed[src],object[data],video[src],input[type=image][src]")) {
+      if (el.src === url || el.data === url) el.style.setProperty("display", "none", "important");
+    }
+  };
+  // The element picker saves its filter through the same channel.
+  hide.pick = (selector) => send("pick", { s: selector });
   // Bulk load: one parse, and an invalid selector only drops its own rule.
   sheet.replaceSync(cfg.css.map((s) => s + "{display:none!important}").join("\n"));
   cfg.css.forEach((s) => hidden.add(s));
@@ -48,11 +72,12 @@
   };
 
   // Generic rules (`##.ad-banner`) are too many to inject everywhere, so the
-  // page reports the classes and ids it uses and the host answers with the
-  // generic selectors that apply to them. Budget: each added subtree is
-  // scanned once, reports are batched every 30 ms, and at most 50,000
-  // distinct class/id names are reported per document.
-  if (cfg.generic && window.chrome && window.chrome.webview) {
+  // document reports the classes and ids it uses and the host answers with
+  // the generic selectors that apply to them. Budget: each added subtree is
+  // scanned once, reports are batched every 30 ms (at most 1,000 names per
+  // request), and at most 50,000 distinct class/id names are reported per
+  // document.
+  if (cfg.generic && location.origin !== "null") {
     const seen = new Set();
     const classes = new Set();
     const ids = new Set();
@@ -60,9 +85,12 @@
     const flush = () => {
       timer = 0;
       if (!classes.size && !ids.size) return;
-      window.chrome.webview.postMessage({ [cfg.key]: 1, c: [...classes], i: [...ids] });
-      classes.clear();
-      ids.clear();
+      const c = [...classes].slice(0, 1000);
+      const i = [...ids].slice(0, 1000 - c.length);
+      c.forEach((n) => classes.delete(n));
+      i.forEach((n) => ids.delete(n));
+      send("generic", { c, i }).then((selectors) => Array.isArray(selectors) && selectors.length && hide(selectors));
+      if (classes.size || ids.size) timer = setTimeout(flush, 30);
     };
     const note = (el) => {
       if (seen.size > 50000) return;
@@ -97,18 +125,34 @@
     document.addEventListener("DOMContentLoaded", first, { once: true });
   }
 
-  // Procedural filters: `:has-text()`, `:upward()`, `:remove()`, … applied by
-  // walking the DOM, since CSS cannot express them. Budget: one pass over the
-  // page's filters per DOM-change burst, at most every 100 ms.
-  const procedural = cfg.procedural
-    .map((s) => {
-      try {
-        return JSON.parse(s);
-      } catch (e) {
-        return null;
-      }
-    })
-    .filter(Boolean);
+  // Procedural and action filters: `:has-text()`, `:upward()`, `:xpath()`,
+  // `:matches-css()`, `:remove()`, `:style()`, … applied by walking the DOM,
+  // since CSS cannot express them. `:style()` on a plain selector becomes a
+  // stylesheet rule, so it also covers elements added later. Budget: one pass
+  // over the page's filters per DOM-change burst, at most every 100 ms.
+  const procedural = [];
+  for (const raw of cfg.procedural) {
+    let f;
+    try {
+      f = JSON.parse(raw);
+    } catch (e) {
+      continue;
+    }
+    const plain = f.selector.length === 1 && f.selector[0].type === "css-selector";
+    if (plain && f.action && f.action.type === "style") {
+      const decls = f.action.arg
+        .split(";")
+        .map((d) => d.trim())
+        .filter(Boolean)
+        .map((d) => (/!important\s*$/.test(d) ? d : d + " !important"))
+        .join(";");
+      addRule(f.selector[0].arg + "{" + decls + "}");
+      continue;
+    }
+    if (plain && f.action && f.action.type === "remove") hide([f.selector[0].arg]);
+    procedural.push(f);
+  }
+  adopt();
   if (procedural.length) {
     const toRegex = (arg) => {
       const m = /^\/(.+)\/([imsu]*)$/.exec(arg);
@@ -121,9 +165,15 @@
       }
       return { test: (s) => s.includes(arg) };
     };
+    // A `/regex/` argument, or a literal that must match exactly.
+    const exactOrRegex = (arg) => (/^\/.+\/[imsu]*$/.test(arg) ? toRegex(arg) : { test: (s) => s === arg });
+    // `name="value"`, `name=/re/`, `prop: value` or `"name"` (an attribute or
+    // a CSS property and an optional value).
     const pairArg = (arg) => {
-      const m = /^\s*"?([^"=:]+?)"?\s*[=:]\s*"?(.*?)"?\s*$/.exec(arg);
-      return m ? [m[1].trim(), toRegex(m[2])] : [arg.trim(), null];
+      const m = /^\s*(?:"([^"]+)"|([^=:\s]+))\s*(?:[=:]\s*(.+?))?\s*$/.exec(arg);
+      if (!m) return [exactOrRegex(arg.trim()), null];
+      const value = m[3] === undefined ? null : m[3].replace(/^"(.*)"$/, "$1");
+      return [exactOrRegex(m[1] || m[2]), value === null ? null : exactOrRegex(value)];
     };
     // Selectors after the first are relative to the nodes matched so far
     // (` > .x`, ` .x`, ` + .x`, ` ~ .x`).
@@ -156,10 +206,9 @@
       },
       "min-text-length": (nodes, arg) => nodes.filter((n) => (n.textContent || "").length >= Number(arg)),
       "matches-attr": (nodes, arg) => {
-        const [name, re] = pairArg(arg);
-        const nameRe = toRegex(name);
+        const [nameRe, valueRe] = pairArg(arg);
         return nodes.filter((n) =>
-          [...(n.attributes || [])].some((a) => nameRe && nameRe.test(a.name) && (!re || re.test(a.value)))
+          [...(n.attributes || [])].some((a) => nameRe && nameRe.test(a.name) && (!valueRe || valueRe.test(a.value)))
         );
       },
       "matches-path": (nodes, arg) => {
@@ -190,9 +239,12 @@
         return [...out].filter((x) => x.nodeType === 1);
       },
     };
+    // `prop: value`, the value literal or `/regex/`.
     const cssMatcher = (pseudo) => (nodes, arg) => {
-      const [prop, re] = pairArg(arg);
-      return nodes.filter((n) => re && re.test(getComputedStyle(n, pseudo).getPropertyValue(prop)));
+      const m = /^\s*([\w-]+)\s*:\s*(.+?)\s*$/.exec(arg);
+      if (!m) return [];
+      const valueRe = exactOrRegex(m[2]);
+      return nodes.filter((n) => valueRe.test(getComputedStyle(n, pseudo).getPropertyValue(m[1]).trim()));
     };
     ops["matches-css"] = cssMatcher(null);
     ops["matches-css-before"] = cssMatcher("::before");
@@ -235,6 +287,7 @@
       if (!pending) pending = setTimeout(run, 100);
     };
     document.addEventListener("DOMContentLoaded", run, { once: true });
+    window.addEventListener("load", run, { once: true });
     onMutations(later);
   }
 

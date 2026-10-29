@@ -78,3 +78,9 @@ export const camera = svg(`<path d="M3 8a2 2 0 0 1 2-2h2l2-2h6l2 2h2a2 2 0 0 1 2
 export const copy = svg(`<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>`);
 // Ask AI: a four-point sparkle.
 export const sparkle = svg(`<path d="M12 3l1.8 5.4L19 10l-5.2 1.6L12 17l-1.8-5.4L5 10l5.2-1.6z"/><path d="M19 15l.7 2.1L22 18l-2.3.9L19 21l-.7-2.1L16 18l2.3-.9z"/>`);
+// Ad blocking: a shield.
+export const shield = svg(`<path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6z"/>`);
+// Ad blocking paused: a shield with a slash.
+export const shieldOff = svg(`<path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6z"/><path d="M4 4l16 16"/>`);
+// Hide an element: a crosshair.
+export const crosshair = svg(`<circle cx="12" cy="12" r="7"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>`);

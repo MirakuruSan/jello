@@ -40,16 +40,13 @@ export class Wizard {
         defaultSearch: this.val("wiz-search"),
         defaultChatbot: this.val("wiz-chatbot"),
         theme: this.val("wiz-theme"),
-        adblock,
         restoreSession: this.checked("wiz-restore"),
         updateCheck: this.checked("wiz-update"),
       };
       await invoke("settings_set", { patch }).catch(console.error);
       applyTheme(this.val("wiz-theme"));
-      if (adblock) {
-        // Full uBlock Origin (MV2) — far more effective than uBO Lite.
-        invoke("extensions_install_ubo").catch(console.error);
-      }
+      // The built-in blocker, or none; uBlock Origin stays available in Settings.
+      invoke("ad_blocker_set", { mode: adblock ? "builtin" : "off" }).catch(console.error);
     } else {
       await invoke("settings_set", { patch: { wizardComplete: true } }).catch(console.error);
     }
