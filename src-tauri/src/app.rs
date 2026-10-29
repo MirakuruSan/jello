@@ -480,17 +480,13 @@ pub fn attach_window_plumbing(app: &AppHandle, window: Window) {
             }
             tauri::WindowEvent::Resized(_) => {
                 // Minimizing the main window floats a playing video (auto
-                // picture-in-picture); restoring brings it back into the page.
+                // picture-in-picture) and rests the page; restoring brings
+                // both back.
                 if scale_label == "main" {
                     use std::sync::atomic::Ordering;
                     let minimized = resize_window.is_minimized().unwrap_or(false);
                     if minimized != was_minimized.swap(minimized, Ordering::Relaxed) {
-                        let req = if minimized {
-                            crate::engine::PipRequest::Auto
-                        } else {
-                            crate::engine::PipRequest::ExitAuto
-                        };
-                        crate::windows::pip_active_tab(&scale_app, req);
+                        crate::windows::on_main_minimized(&scale_app, minimized);
                     }
                     if minimized {
                         return;
@@ -856,6 +852,8 @@ pub fn run() {
     // Install the file logger FIRST so any startup failure below is captured.
     // Hold the guard for the whole process — it flushes the non-blocking writer.
     let _log_guard = crate::logging::init();
+    // Before any window exists, so every Jello window carries the shortcut's ID.
+    crate::platform::win_identity::set_process_app_id();
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -1222,6 +1220,8 @@ pub fn run() {
             crate::capture::capture_ocr_action,
             crate::capture::capture_cancel,
             crate::capture::capture_ready,
+            crate::windows::window_toggle_fullscreen,
+            crate::windows::window_start_drag,
             crate::data_cmds::history_search,
             crate::data_cmds::history_delete,
             crate::data_cmds::top_sites,

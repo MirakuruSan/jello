@@ -349,6 +349,189 @@ pub fn return_from_pip(app: &AppHandle, tab_id: i32) {
     }
 }
 
+/// Placements of windows that are fullscreen right now, keyed by HWND. A
+/// window that goes fullscreen while maximized keeps its maximized flag in
+/// Tauri, which then clamps the page to the work area (a band is left where the
+/// taskbar would be) and on the way out leaves the window covering the whole
+/// monitor. Jello restores the window on the way in and re-maximizes it on the
+/// way out.
+#[cfg(target_os = "windows")]
+static PRE_FULLSCREEN: std::sync::Mutex<Vec<(isize, windows::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Main thread, before Tauri processes the switch to fullscreen.
+fn remember_placement(window: &tauri::Window) {
+    #[cfg(target_os = "windows")]
+    if let Ok(h) = window.hwnd() {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, IsZoomed, ShowWindow, SW_RESTORE, WINDOWPLACEMENT};
+        let hwnd = HWND(h.0);
+        let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        if unsafe { GetWindowPlacement(hwnd, &mut wp) }.is_ok() {
+            let mut saved = PRE_FULLSCREEN.lock().unwrap();
+            if !saved.iter().any(|(k, _)| *k == h.0 as isize) {
+                saved.push((h.0 as isize, wp));
+            }
+        }
+        // A real restore, not just dropping the style bit: Tauri re-applies
+        // maximize from its own state, which it updates on WM_SIZE.
+        unsafe {
+            if IsZoomed(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+}
+
+/// After the window has left fullscreen: one that was maximized before is
+/// maximized again, with its original restore size.
+fn restore_placement(window: &tauri::Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowPlacement, ShowWindow, SW_RESTORE, SW_SHOWMAXIMIZED};
+        let Ok(h) = window.hwnd() else { return };
+        let saved = {
+            let mut list = PRE_FULLSCREEN.lock().unwrap();
+            let pos = list.iter().position(|(k, _)| *k == h.0 as isize);
+            pos.map(|i| list.remove(i).1)
+        };
+        let Some(wp) = saved else { return };
+        if wp.showCmd != SW_SHOWMAXIMIZED.0 as u32 {
+            return;
+        }
+        // Queue behind Tauri's own exit-fullscreen work on the event loop.
+        let w = window.clone();
+        std::thread::spawn(move || {
+            let w2 = w.clone();
+            let _ = w.run_on_main_thread(move || {
+                if let Ok(h) = w2.hwnd() {
+                    unsafe {
+                        let hwnd = HWND(h.0);
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                        let _ = SetWindowPlacement(hwnd, &wp);
+                    }
+                }
+            });
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+}
+
+/// A page entered or left fullscreen (main thread, from the content webview).
+/// Tauri resizes the window; the toolbar layer hides while a page is fullscreen.
+pub fn on_page_fullscreen(window: &tauri::Window, on: bool) {
+    use tauri::Emitter;
+    if on {
+        remember_placement(window);
+    } else {
+        restore_placement(window);
+    }
+    let _ = window.emit_to(window.label(), "page:fullscreen", on);
+}
+
+/// F11: toggle fullscreen for the calling window.
+#[tauri::command]
+pub async fn window_toggle_fullscreen(window: tauri::Window) -> Result<(), String> {
+    let on = !window.is_fullscreen().unwrap_or(false);
+    let w = window.clone();
+    window
+        .run_on_main_thread(move || {
+            if on {
+                remember_placement(&w);
+            }
+            let _ = w.set_fullscreen(on);
+            if !on {
+                restore_placement(&w);
+            }
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Move the window, or resize it from its top edge, starting from a mousedown
+/// in the toolbar layer at (`x`, `y`) in CSS pixels. Windows anchors the move
+/// at that point rather than wherever the cursor has got to by the time this
+/// command runs, so the window doesn't slip under the cursor.
+#[tauri::command]
+pub async fn window_start_drag(window: tauri::Window, x: f64, y: f64, edge: Option<String>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let w = window.clone();
+        window
+            .run_on_main_thread(move || {
+                use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+                use windows::Win32::Graphics::Gdi::ClientToScreen;
+                use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON};
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    IsZoomed, PostMessageW, HTCAPTION, HTTOP, HTTOPLEFT, HTTOPRIGHT, WM_NCLBUTTONDOWN,
+                };
+                let Ok(h) = w.hwnd() else { return };
+                let hwnd = HWND(h.0);
+                unsafe {
+                    // A quick click is already over: don't start a move that
+                    // would follow the cursor with no button held.
+                    if (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) == 0 {
+                        return;
+                    }
+                    let mut pt = POINT { x: (x * scale).round() as i32, y: (y * scale).round() as i32 };
+                    let _ = ClientToScreen(hwnd, &mut pt);
+                    let hit = if IsZoomed(hwnd).as_bool() {
+                        HTCAPTION
+                    } else {
+                        match edge.as_deref() {
+                            Some("top") => HTTOP,
+                            Some("top-left") => HTTOPLEFT,
+                            Some("top-right") => HTTOPRIGHT,
+                            _ => HTCAPTION,
+                        }
+                    };
+                    let _ = ReleaseCapture();
+                    let lparam = ((pt.y as u32 & 0xffff) << 16) | (pt.x as u32 & 0xffff);
+                    let _ = PostMessageW(Some(hwnd), WM_NCLBUTTONDOWN, WPARAM(hit as usize), LPARAM(lparam as isize));
+                }
+            })
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (x, y, edge);
+        window.start_dragging().map_err(|e| e.to_string())
+    }
+}
+
+/// The main window was minimized or restored. Minimizing floats a playing video
+/// (auto picture-in-picture) and, a moment later, once the video has floated,
+/// hides the page from the engine and trims memory. Restoring undoes both.
+pub fn on_main_minimized(app: &AppHandle, minimized: bool) {
+    let req = if minimized { crate::engine::PipRequest::Auto } else { crate::engine::PipRequest::ExitAuto };
+    pip_active_tab(app, req);
+    let app = app.clone();
+    let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>().inner().clone();
+    std::thread::spawn(move || {
+        if minimized {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            let still_minimized = app.get_window("main").and_then(|w| w.is_minimized().ok()).unwrap_or(false);
+            if !still_minimized {
+                return;
+            }
+        }
+        if let Ok(p) = pool.lock() {
+            p.set_window_minimized(minimized);
+        };
+        // The toolbar layer rests too: its timers throttle and it stops painting.
+        #[cfg(target_os = "windows")]
+        if let Some(overlay) = app.get_webview("main") {
+            let _ = overlay.with_webview(move |w| unsafe {
+                let _ = w.controller().SetIsVisible(!minimized);
+            });
+        }
+    });
+}
+
 /// Send a picture-in-picture request to the active tab without blocking the
 /// caller (window events run on the main thread; the pool may be busy).
 pub fn pip_active_tab(app: &AppHandle, req: crate::engine::PipRequest) {

@@ -627,6 +627,23 @@ impl TabPool {
         }
     }
 
+    /// The window was minimized or restored. While minimized the visible page
+    /// is marked hidden, so it stops painting and its timers are throttled,
+    /// and every view trims its memory. Restoring shows the page again at
+    /// normal memory use; background tabs keep their LOW target.
+    pub fn set_window_minimized(&self, minimized: bool) {
+        if minimized {
+            self.set_memory_target_all(true);
+        } else {
+            self.restore_active_memory_target();
+        }
+        if let Some(id) = self.active_tab_id {
+            if let Some(TabState::Live { view, .. }) = self.tabs.get(&id) {
+                view.set_page_hidden(minimized);
+            }
+        }
+    }
+
     /// Picture-in-picture request for the active tab's page.
     pub fn pip_active(&self, req: crate::engine::PipRequest) -> Result<(), String> {
         self.with_active_view(|v| v.picture_in_picture(req))

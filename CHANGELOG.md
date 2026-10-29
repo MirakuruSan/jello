@@ -4,6 +4,34 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.12] — 2026-10-29
+
+### Added
+- **F11 full screen** for the window, also in the ⋯ menu. While full screen,
+  the maximize button exits it.
+- **Resize from the top edge.** The top few pixels of the window resize it,
+  as in any Windows app.
+
+### Changed
+- **Moving the window.** While the toolbar shows, its empty space works as the
+  title bar: drag to move, double-click to maximize. A move starts at the exact
+  point you grabbed, so the window no longer slips under the cursor, including
+  when dragging a maximized or snapped window away.
+- **A minimized window rests.** Its page stops painting and its timers are
+  throttled, and every tab trims its memory; audio and picture-in-picture keep
+  playing. With a YouTube video floating in picture-in-picture, minimizing cut
+  Jello's memory use by about a fifth.
+
+### Fixed
+- Jello's toolbar no longer appears over a fullscreen video, and the top edge
+  of a fullscreen page is clickable.
+- Going full screen from a maximized window left an empty band at the bottom of
+  the screen, and leaving full screen left the window covering the taskbar.
+- F11 did nothing.
+- The picture-in-picture window shows in the taskbar as part of Jello, with
+  Jello's icon, instead of as a separate Microsoft Edge WebView2 entry.
+- The closed find bar could still be reached with Tab and by screen readers.
+
 ## [0.4.11] — 2026-10-27
 
 ### Changed

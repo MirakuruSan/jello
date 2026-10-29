@@ -373,6 +373,34 @@ impl WebView2ContentView {
                 }
             });
 
+            // Page fullscreen (a video's fullscreen button): Tauri sizes the
+            // window; Jello hides its own toolbar over the page and returns a
+            // maximized window to its maximized state afterwards. This also
+            // watches the browser process so windows it opens on its own, like
+            // picture-in-picture, join Jello's taskbar group.
+            let fs_window = webview.window();
+            let _ = webview.with_webview(move |w| {
+                use webview2_com::ContainsFullScreenElementChangedEventHandler;
+                unsafe {
+                    if let Ok(core) = w.controller().CoreWebView2() {
+                        let mut pid = 0u32;
+                        if core.BrowserProcessId(&mut pid).is_ok() {
+                            crate::platform::win_identity::watch_browser_process(pid);
+                        }
+                        let handler = ContainsFullScreenElementChangedEventHandler::create(Box::new(move |sender, _| {
+                            let mut on = windows::core::BOOL::default();
+                            if let Some(core) = sender {
+                                let _ = core.ContainsFullScreenElement(&mut on);
+                            }
+                            crate::windows::on_page_fullscreen(&fs_window, on.as_bool());
+                            Ok(())
+                        }));
+                        let mut token: i64 = 0;
+                        let _ = core.add_ContainsFullScreenElementChanged(&handler, &mut token);
+                    }
+                }
+            });
+
             // Middle-click / target=_blank / window.open → open in a BACKGROUND
             // tab in the same window instead of a popup. WebView2 fires
             // NewWindowRequested; we take the Uri, mark it handled (no popup), and
@@ -726,6 +754,14 @@ impl ContentView for WebView2ContentView {
             let _ = self.webview.set_position(tauri::LogicalPosition::new(-20000.0, -20000.0));
             let _ = self.webview.set_size(tauri::LogicalSize::new(0.0, 0.0));
         }
+    }
+    fn set_page_hidden(&self, hidden: bool) {
+        #[cfg(target_os = "windows")]
+        let _ = self.webview.with_webview(move |w| unsafe {
+            let _ = w.controller().SetIsVisible(!hidden);
+        });
+        #[cfg(not(target_os = "windows"))]
+        let _ = hidden;
     }
     fn try_suspend(&self, done: Box<dyn FnOnce(bool) + Send>) {
         #[cfg(target_os = "windows")]

@@ -56,6 +56,10 @@ pub trait ContentView {
     /// Hint Chromium to trim memory (true = LOW target, false = NORMAL). Unlike
     /// TrySuspend this does NOT freeze JS/media — safe while hidden.
     fn set_memory_target(&self, _low: bool) {}
+    /// Tell the engine whether anyone can see the page. A hidden page stops
+    /// painting and has its timers throttled; audio and picture-in-picture
+    /// keep playing.
+    fn set_page_hidden(&self, _hidden: bool) {}
     fn close(self: Box<Self>);
     fn is_audio_playing(&self) -> bool { false }
     /// A download this view started is still running (or paused/resumable).

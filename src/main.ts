@@ -33,10 +33,14 @@ function updateHitRects(): void {
   // visuals (toasts, chord HUD) so they stay visible over content.
   // Open panels contribute their whole rect: the backend no longer forces a
   // full-window region while a panel is open (that ate every page click),
-  // so the panel itself must claim its area to stay clickable.
-  const elements = document.querySelectorAll<HTMLElement>(
-    ".interactive, .region-visible, .tab-panel.open, .views-panel.open, .find-bar.open"
-  );
+  // so the panel itself must claim its area to stay clickable. The visible
+  // toolbar claims its whole row, whose empty space moves the window. A page
+  // in fullscreen gets the entire window.
+  const elements = document.body.classList.contains("page-fullscreen")
+    ? []
+    : document.querySelectorAll<HTMLElement>(
+      "#top-bar, .interactive, .region-visible, .tab-panel.open, .views-panel.open, .find-bar.open"
+    );
   const rects: HitRect[] = [];
   for (const el of Array.from(elements)) {
     if (el.closest(".faded, .find-bar:not(.open)")) continue;
@@ -88,7 +92,7 @@ function scheduleToolbarHide(): void {
 
 function showToolbar(): void {
   const topBar = document.getElementById("top-bar");
-  if (!topBar) return;
+  if (!topBar || document.body.classList.contains("page-fullscreen")) return;
   if (topBar.classList.contains("faded")) {
     topBar.classList.remove("faded");
     // Claim the click/paint area now, not on the next layout tick: a late
@@ -100,8 +104,77 @@ function showToolbar(): void {
 
 function handleMouseMove(e: MouseEvent): void {
   const target = e.target as HTMLElement | null;
-  if (target?.closest(".drag-region")) showToolbar();
-  else if (target?.closest("#top-bar")) scheduleToolbarHide();
+  const strip = target?.closest<HTMLElement>(".drag-region");
+  if (strip) {
+    const edge = topEdgeAt(e);
+    strip.style.cursor = edge ? EDGE_CURSORS[edge] : "";
+    showToolbar();
+  } else if (target?.closest("#top-bar")) {
+    scheduleToolbarHide();
+  }
+}
+
+// ===== Window move, resize and state =====
+// The strip along the top edge and the visible toolbar's empty space work as
+// the title bar: drag to move, double-click to maximize. The strip's top few
+// pixels resize the window instead, unless it is maximized or fullscreen.
+// Moves start natively in Rust, anchored at the mousedown point.
+const RESIZE_EDGE_PX = 4;
+const RESIZE_CORNER_PX = 12;
+const EDGE_CURSORS: Record<string, string> = { top: "ns-resize", "top-left": "nwse-resize", "top-right": "nesw-resize" };
+
+function topEdgeAt(e: MouseEvent): string | null {
+  const state = document.body.classList;
+  if (state.contains("window-maximized") || state.contains("window-fullscreen") || e.clientY >= RESIZE_EDGE_PX) {
+    return null;
+  }
+  if (e.clientX < RESIZE_CORNER_PX) return "top-left";
+  if (e.clientX >= window.innerWidth - RESIZE_CORNER_PX) return "top-right";
+  return "top";
+}
+
+function isTitleBarTarget(el: HTMLElement | null): boolean {
+  return !!el && (el.classList.contains("drag-region") || el.id === "top-bar" || el.classList.contains("top-right"));
+}
+
+function handleTitleBarMouseDown(e: MouseEvent): void {
+  if (e.button !== 0 || !isTitleBarTarget(e.target as HTMLElement | null)) return;
+  e.preventDefault();
+  if (e.detail === 2) {
+    toggleMaximize();
+    return;
+  }
+  if (e.detail > 2) return;
+  const edge = (e.target as HTMLElement).classList.contains("drag-region") ? topEdgeAt(e) : null;
+  invoke("window_start_drag", { x: e.clientX, y: e.clientY, edge }).catch(console.error);
+}
+
+function toggleMaximize(): void {
+  if (document.body.classList.contains("window-fullscreen")) toggleFullscreen();
+  else invoke("window_controls", { action: "max" }).catch(console.error);
+}
+
+function toggleFullscreen(): void {
+  invoke("window_toggle_fullscreen").catch(console.error);
+}
+
+// Mirror the window's maximized/fullscreen state onto <body> and the
+// maximize button. Debounced: a resize drag fires many events.
+let windowStateTimer: ReturnType<typeof setTimeout> | null = null;
+function syncWindowState(): void {
+  if (windowStateTimer) clearTimeout(windowStateTimer);
+  windowStateTimer = setTimeout(async () => {
+    const win = getCurrentWebviewWindow();
+    const [maximized, fullscreen] = await Promise.all([win.isMaximized(), win.isFullscreen()]).catch(() => [false, false]);
+    document.body.classList.toggle("window-maximized", maximized);
+    document.body.classList.toggle("window-fullscreen", fullscreen);
+    const btn = document.getElementById("btn-max");
+    if (btn) {
+      btn.innerHTML = maximized || fullscreen ? icons.restore : icons.maximize;
+      btn.title = fullscreen ? "Exit full screen (F11)" : maximized ? "Restore" : "Maximize";
+      btn.setAttribute("aria-label", btn.title);
+    }
+  }, 120);
 }
 
 // Tell the backend whether any overlay panel is open, so the accelerator
@@ -152,6 +225,18 @@ function updateClock(): void {
   if (!el) return;
   const now = new Date();
   el.textContent = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+// The clock only ticks while the new-tab page shows it.
+let clockTimer: ReturnType<typeof setInterval> | null = null;
+function setClockRunning(on: boolean): void {
+  if (on && !clockTimer) {
+    updateClock();
+    clockTimer = setInterval(updateClock, 1000);
+  } else if (!on && clockTimer) {
+    clearInterval(clockTimer);
+    clockTimer = null;
+  }
 }
 
 // ===== Toast =====
@@ -243,6 +328,7 @@ function updateNewtabVisibility(tab: Tab | undefined): void {
   const show = tab?.url === "about:blank" || !tab;
   const wasVisible = newtab.classList.contains("visible");
   newtab.classList.toggle("visible", show);
+  setClockRunning(show);
   // Auto-focus the search/URL pill when a blank tab appears (e.g. Ctrl+T) so
   // typing works immediately without a click.
   if (show && !wasVisible) {
@@ -440,6 +526,7 @@ function keyEventToAction(e: KeyboardEvent): string | null {
   if (!c && !s && !a) {
     if (code === "F5") return "F5";
     if (code === "F6") return "F6";
+    if (code === "F11") return "F11";
     if (code === "Escape") return "Esc";
     return null;
   }
@@ -612,6 +699,9 @@ function handleShortcut(action: string): void {
       break;
     case "Alt+P":
       invoke("pip_toggle").catch(() => showToast("No page to float"));
+      break;
+    case "F11":
+      toggleFullscreen();
       break;
     case "Esc":
       if (findBarOpen) toggleFindBar();
@@ -989,6 +1079,7 @@ function showMainMenu(anchor: HTMLElement): void {
     { render: zoomMenuRow },
     { label: "Picture-in-picture", icon: icons.pip, shortcut: "Alt+P", disabled: !hasPage, onClick: () => handleShortcut("Alt+P") },
     { label: "Take screenshot", icon: icons.camera, shortcut: "Ctrl+Alt+S", onClick: () => invoke("capture_trigger", { mode: "screenshot" }).catch(console.error) },
+    { label: "Full screen", icon: icons.fullscreen, shortcut: "F11", checked: document.body.classList.contains("window-fullscreen"), onClick: () => toggleFullscreen() },
     "separator",
     { label: "Keep window on top", icon: icons.pin, checked: pinnedOnTop, onClick: () => setPinnedOnTop(!pinnedOnTop) },
     { label: "Settings", icon: icons.settings, onClick: () => views?.open("settings") },
@@ -1093,7 +1184,7 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-reload")?.addEventListener("click", () =>
     invoke(pageLoading ? "nav_stop" : "nav_reload", {}).catch(console.error));
   document.getElementById("btn-min")?.addEventListener("click", () => invoke("window_controls", { action: "min" }).catch(console.error));
-  document.getElementById("btn-max")?.addEventListener("click", () => invoke("window_controls", { action: "max" }).catch(console.error));
+  document.getElementById("btn-max")?.addEventListener("click", toggleMaximize);
   document.getElementById("btn-close")?.addEventListener("click", () => invoke("window_controls", { action: "close" }).catch(console.error));
   const menuBtn = document.getElementById("btn-menu");
   menuBtn?.addEventListener("click", () => {
@@ -1212,6 +1303,20 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  // ===== Title bar and window state =====
+  document.addEventListener("mousedown", handleTitleBarMouseDown);
+  window.addEventListener("resize", syncWindowState);
+  syncWindowState();
+  // A page went fullscreen (or back): the toolbar layer steps aside entirely.
+  listen<boolean>("page:fullscreen", (event) => {
+    document.body.classList.toggle("page-fullscreen", event.payload);
+    if (event.payload) {
+      closeContextMenu();
+      document.getElementById("top-bar")?.classList.add("faded");
+    }
+    updateHitRects();
+  });
+
   // ===== Hit-rect tracking =====
   updateHitRects();
   window.addEventListener("resize", updateHitRects);
@@ -1250,8 +1355,7 @@ window.addEventListener("DOMContentLoaded", () => {
   showToolbar();
 
   // ===== Clock + top sites (the new-tab page starts out visible) =====
-  updateClock();
-  setInterval(updateClock, 1000);
+  setClockRunning(document.getElementById("newtab-page")?.classList.contains("visible") ?? true);
   renderTopSites();
 
   // ===== Tauri events =====
