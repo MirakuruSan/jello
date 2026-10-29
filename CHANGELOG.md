@@ -4,6 +4,25 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+- **The built-in ad blocker works from the first launch.** Jello now ships
+  with a copy of the filter lists and uBlock Origin's scriptlets and updates
+  them in the background. A page that opens while the blocker is still
+  starting waits for it (a few seconds at most) instead of loading unfiltered.
+  The shipped filter data keeps its own licenses; see `THIRD_PARTY_NOTICES.md`.
+
+### Fixed
+- Scriptlets against video ads and anti-adblock walls now take effect before
+  a page's own scripts also after going back or forward, after a redirect to
+  another site, after submitting a form and after a reload.
+- Scriptlets that answer with one of uBlock Origin's placeholder files (such as
+  an empty video ad response) now receive it, so those players behave as they
+  do with the uBlock Origin extension.
+- Pages can no longer see the ad blocker's element-hiding lookups in their
+  performance data: the lookups no longer go over the network.
+
 ## [0.4.13] — 2026-10-30
 
 ### Added

@@ -1,0 +1,2 @@
+# Third-party filter data is shipped byte for byte as published.
+src-tauri/resources/content-blocker/** -text

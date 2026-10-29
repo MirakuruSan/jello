@@ -1,0 +1,13 @@
+{
+    "taken":  "2026-10-29",
+    "ublockOrigin":  "1.75.0",
+    "lists":  {
+                  "ublock-filters":  "https://ublockorigin.github.io/uAssets/filters/filters.txt",
+                  "ublock-badware":  "https://ublockorigin.github.io/uAssets/filters/badware.txt",
+                  "ublock-privacy":  "https://ublockorigin.github.io/uAssets/filters/privacy.txt",
+                  "ublock-quick-fixes":  "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt",
+                  "ublock-unbreak":  "https://ublockorigin.github.io/uAssets/filters/unbreak.txt",
+                  "easylist":  "https://easylist.to/easylist/easylist.txt",
+                  "easyprivacy":  "https://easylist.to/easylist/easyprivacy.txt"
+              }
+}

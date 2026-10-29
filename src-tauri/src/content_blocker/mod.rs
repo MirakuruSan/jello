@@ -5,8 +5,11 @@
 //! The engine lives in the Jello process; content webviews route their
 //! requests through it (`page.rs`). Lists are cached on disk, compiled once
 //! into `engine.dat` (reloaded at startup without reparsing) and refreshed in
-//! the background when their `! Expires:` interval runs out.
+//! the background when their `! Expires:` interval runs out. On first launch
+//! the cache starts from the snapshot shipped in `resources/content-blocker`,
+//! so pages are filtered before anything has been downloaded.
 
+mod channel;
 mod filters;
 pub mod page;
 mod resources;
@@ -39,6 +42,9 @@ static BLOCKED: AtomicU64 = AtomicU64::new(0);
 static ENGINE_VERSION: AtomicU64 = AtomicU64::new(0);
 /// Serializes refreshes (the scheduled one and "Update now").
 static REFRESH: Mutex<()> = Mutex::new(());
+/// Redirect resources by name and alias (`noop-vast3.xml`, …): MIME type and
+/// bytes, served to scriptlets that ask for them (`war:` directives).
+static WAR: RwLock<Option<HashMap<String, (String, Arc<Vec<u8>>)>>> = RwLock::new(None);
 
 /// The engine, once lists are loaded.
 pub fn engine() -> Option<Arc<Engine>> {
@@ -81,6 +87,81 @@ struct CacheState {
 
 fn cache_dir(app: &AppHandle) -> PathBuf {
     app.path().app_data_dir().unwrap_or_default().join("content-blocker")
+}
+
+/// The filter snapshot installed with Jello (see its README.md).
+fn bundled_dir(app: &AppHandle) -> Option<PathBuf> {
+    let dir = without_verbatim_prefix(app.path().resource_dir().ok()?).join("content-blocker");
+    dir.join("snapshot.json").exists().then_some(dir)
+}
+
+/// `C:\…` for a `\\?\C:\…` path. WebView2's folder mapping (used to read the
+/// bundled uBlock Origin files) does not accept the verbatim form.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+/// The uBlock Origin release the bundled scriptlet files come from.
+fn bundled_ubo_version(bundle: &Path) -> String {
+    std::fs::read(bundle.join("snapshot.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["ublockOrigin"].as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Copy lists missing from the cache out of the bundled snapshot. They are
+/// recorded as never downloaded, so the next refresh replaces them.
+fn seed_from_bundle(dir: &Path, bundle: &Path) {
+    let _ = std::fs::create_dir_all(dir.join("lists"));
+    let mut state = read_state(dir);
+    let mut seeded = 0;
+    for src in filters::LISTS {
+        let path = list_path(dir, src.id);
+        if path.exists() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(bundle.join("lists").join(format!("{}.txt", src.id))) else {
+            continue;
+        };
+        if std::fs::write(&path, &text).is_ok() {
+            state.lists.insert(src.id.to_string(), ListState { fetched: 0, max_age: max_age(&text) });
+            seeded += 1;
+        }
+    }
+    if seeded > 0 {
+        // The lists changed under engine.dat; compile them on load.
+        state.engine_format = 0;
+        write_state(dir, &state);
+        tracing::info!("content blocker: {seeded} filter lists from the bundled snapshot");
+    }
+}
+
+/// Assemble scriptlet resources from the bundled uBlock Origin files when no
+/// copy is cached yet. Recorded as never downloaded, like seeded lists.
+fn resources_from_bundle(app: &AppHandle, dir: &Path, bundle: &Path) -> bool {
+    if dir.join("resources.json").exists() {
+        return false;
+    }
+    match resources::assemble_local(app, &bundle.join("ublock-origin")) {
+        Ok(json) => {
+            if std::fs::write(dir.join("resources.json"), json).is_err() {
+                return false;
+            }
+            let mut state = read_state(dir);
+            state.resources_fetched = 0;
+            state.resources_version = bundled_ubo_version(bundle);
+            write_state(dir, &state);
+            true
+        }
+        Err(e) => {
+            tracing::warn!("content blocker: bundled scriptlet resources failed: {e}");
+            false
+        }
+    }
 }
 
 fn read_state(dir: &Path) -> CacheState {
@@ -162,9 +243,37 @@ fn load_engine(dir: &Path, state: &CacheState) -> Option<Engine> {
 }
 
 fn publish(mut engine: Engine, dir: &Path) {
-    engine.use_resources(read_resources(dir));
+    let resources = read_resources(dir);
+    *WAR.write().unwrap() = Some(war_map(&resources));
+    engine.use_resources(resources);
     *ENGINE.write().unwrap() = Some(Arc::new(engine));
     ENGINE_VERSION.fetch_add(1, Ordering::SeqCst);
+    page::engine_published();
+}
+
+/// Redirect resources (not scriptlets) by name and alias.
+fn war_map(resources: &[Resource]) -> HashMap<String, (String, Arc<Vec<u8>>)> {
+    use adblock::resources::ResourceType;
+    use base64::Engine as _;
+    let mut map = HashMap::new();
+    for r in resources {
+        let ResourceType::Mime(mime) = &r.kind else { continue };
+        let mime: &str = mime.into();
+        if mime.starts_with("fn/") {
+            continue;
+        }
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&r.content) else { continue };
+        let entry = (mime.to_string(), Arc::new(bytes));
+        for name in std::iter::once(&r.name).chain(r.aliases.iter()) {
+            map.insert(name.clone(), entry.clone());
+        }
+    }
+    map
+}
+
+/// A redirect resource for a scriptlet's `war:` request: MIME type and bytes.
+pub(crate) fn war_resource(name: &str) -> Option<(String, Arc<Vec<u8>>)> {
+    WAR.read().ok()?.as_ref()?.get(name).cloned()
 }
 
 /// A download is only kept when it reads like a filter list; a captive portal
@@ -267,10 +376,21 @@ pub fn start(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         let dir = cache_dir(&app);
+        let bundle = bundled_dir(&app);
+        if let Some(bundle) = &bundle {
+            seed_from_bundle(&dir, bundle);
+        }
         let state = read_state(&dir);
         if let Some(engine) = load_engine(&dir, &state) {
             publish(engine, &dir);
-            tracing::info!("content blocker: engine loaded from cache");
+            tracing::info!("content blocker: engine loaded");
+        }
+        if let Some(bundle) = &bundle {
+            if resources_from_bundle(&app, &dir, bundle) {
+                if let Some(engine) = load_engine(&dir, &read_state(&dir)) {
+                    publish(engine, &dir);
+                }
+            }
         }
         loop {
             if crate::prefs::builtin_adblock() {
@@ -465,6 +585,14 @@ mod tests {
         assert_eq!(max_age("! Expires: 1 hour\n"), LIST_MIN_AGE);
         assert_eq!(max_age("! Expires: 14 days\n"), LIST_MAX_AGE);
         assert_eq!(max_age("||a^\n"), LIST_DEFAULT_AGE);
+    }
+
+    #[test]
+    fn verbatim_paths_lose_their_prefix() {
+        let plain = |p: &str| without_verbatim_prefix(PathBuf::from(p));
+        assert_eq!(plain(r"\\?\C:\Program Files\Jello"), PathBuf::from(r"C:\Program Files\Jello"));
+        assert_eq!(plain(r"\\?\UNC\server\share\Jello"), PathBuf::from(r"\\?\UNC\server\share\Jello"));
+        assert_eq!(plain(r"C:\Jello"), PathBuf::from(r"C:\Jello"));
     }
 
     #[test]

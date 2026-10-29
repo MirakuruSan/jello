@@ -1,17 +1,34 @@
 //! Hooks the built-in ad blocker into one content webview: its network
 //! requests are checked against the engine, and each document gets its
 //! cosmetic filters and scriptlets injected when it is created.
+//!
+//! Scripts registered with `AddScriptToExecuteOnDocumentCreated` only reach
+//! documents created after the registration completes, and WebView2 holds a
+//! registration back until a pending navigation commits. So a top-level
+//! navigation whose scripts are not in place yet is cancelled, the scripts are
+//! registered, and the same navigation is started again: a new document or a
+//! redirect with its original request headers, a back/forward step as the same
+//! history entry, a reload as a reload, and a form post with the body it sent.
+//! The same hold keeps pages from loading unfiltered while the engine itself
+//! is still loading.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 const PAGE_JS: &str = include_str!("page.js");
 const PICKER_JS: &str = include_str!("picker.js");
+const BOOTSTRAP_JS: &str = include_str!("bootstrap.js");
 /// Blocked requests kept per page for the request log.
 const LOG_LIMIT: usize = 200;
+/// The longest a navigation is held for its scripts or the engine.
+const HOLD_LIMIT: Duration = Duration::from_secs(5);
+/// Form posts with a larger body are not held (they load unchanged).
+const POST_BODY_LIMIT: usize = 32 << 20;
 
-/// Random per-session name for the page <-> host cosmetic channel, so pages
-/// cannot rely on a fixed global to detect or disable it.
+/// Random per-session name for the page channel, the hand-over property the
+/// document-start script uses, and the path redirect resources are served
+/// under, so pages cannot rely on a fixed name to detect or disable them.
 fn channel_key() -> &'static str {
     static KEY: OnceLock<String> = OnceLock::new();
     KEY.get_or_init(|| {
@@ -45,10 +62,21 @@ struct PageState {
     host_script: bool,
     /// Engine version the host script was built from.
     script_version: u64,
-    /// Counts top-level navigations; registrations belong to one of them.
+    /// Counts top-level navigations (a redirect continues its navigation).
     generation: u64,
-    /// A navigation held back until its scripts are registered.
-    restart: Option<Restart>,
+    /// Registrations made for `generation` that have not completed yet.
+    inflight: u32,
+    /// The document-start script every document gets is registered.
+    ready: bool,
+    /// A cancelled navigation to start again once its scripts are in place.
+    held: Option<Held>,
+    /// A form post whose body is being kept to post it again.
+    capture: Option<Capture>,
+    /// URL of a navigation started again after a hold; it is never held twice.
+    replaying: Option<String>,
+    /// The current page's scripts may have been registered too late (its
+    /// navigation could not be held), so they also run at ContentLoading.
+    late: bool,
     /// The top-level URL and engine version the `$csp` script was made for.
     csp_url: String,
     csp_version: u64,
@@ -61,21 +89,48 @@ struct PageState {
     /// Requests blocked since the current page started loading, newest last.
     blocked: u32,
     log: VecDeque<BlockedRequest>,
+    /// The element picker is open on this page.
+    picking: bool,
 }
 
-/// A cancelled top-level navigation to start again once `pending`
-/// registrations of navigation `generation` have completed.
-struct Restart {
+struct Held {
+    generation: u64,
+    replay: Replay,
+}
+
+/// How a held navigation is started again.
+enum Replay {
+    /// A new document or a redirect: the same request with its headers.
+    Get { url: String, headers: String },
+    /// A form post, with the body captured on its way out.
+    Post { url: String, headers: String, body: Vec<u8> },
+    /// Back or forward: the same history entry.
+    History { url: String },
+    Reload { url: String },
+}
+
+impl Replay {
+    fn url(&self) -> &str {
+        match self {
+            Replay::Get { url, .. } | Replay::Post { url, .. } | Replay::History { url } | Replay::Reload { url } => url,
+        }
+    }
+}
+
+/// A form post being held. Its request is answered with a redirect to the same
+/// URL and the body is kept; the navigation is cancelled at that redirect and
+/// posted again once the page's scripts are registered.
+struct Capture {
     generation: u64,
     url: String,
-    /// The original request headers, "Name: value" lines.
-    headers: String,
-    pending: u32,
+    body: Option<Vec<u8>>,
 }
 
 /// What a document-creation script is for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScriptKind {
+    /// Hands the page channel to Jello's scripts; registered once per webview.
+    Bootstrap,
     /// Cosmetics and scriptlets for the top-level page's host.
     Host,
     /// `$csp` policy for one top-level URL.
@@ -115,6 +170,45 @@ fn page(tab: i32) -> Option<(Arc<Mutex<PageState>>, tauri::Webview<tauri::Wry>)>
     pages.iter().rev().find(|p| p.tab == tab).and_then(|p| Some((p.state.upgrade()?, p.webview.clone())))
 }
 
+/// A new engine is in place: start navigations that were waiting for one.
+pub(super) fn engine_published() {
+    let live: Vec<_> = {
+        let pages = PAGES.lock().unwrap();
+        pages.iter().filter_map(|p| Some((p.state.upgrade()?, p.webview.clone()))).collect()
+    };
+    for (state, webview) in live {
+        resume(&state, &webview, None);
+    }
+}
+
+/// Start the held navigation again if nothing holds it any more: its scripts
+/// are registered, the document-start script is in place and the engine is
+/// loaded. `expired` names a hold generation whose time limit ran out.
+fn resume(state: &Arc<Mutex<PageState>>, webview: &tauri::Webview<tauri::Wry>, expired: Option<u64>) {
+    let replay = {
+        let Ok(mut s) = state.lock() else { return };
+        let Some(held) = s.held.as_ref() else { return };
+        let expired = expired == Some(held.generation);
+        let wait_engine = crate::prefs::builtin_adblock()
+            && !crate::prefs::ad_blocking_paused(&s.top_host)
+            && super::engine().is_none();
+        if !expired && (s.inflight > 0 || !s.ready || wait_engine) {
+            return;
+        }
+        let Some(held) = s.held.take() else { return };
+        s.replaying = Some(held.replay.url().to_string());
+        held.replay
+    };
+    #[cfg(target_os = "windows")]
+    let _ = webview.with_webview(move |w| unsafe {
+        if let Ok(core) = w.controller().CoreWebView2() {
+            start_again(&core, replay);
+        }
+    });
+    #[cfg(not(target_os = "windows"))]
+    let _ = (webview, replay);
+}
+
 /// What the built-in blocker did on a tab's current page.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,11 +230,76 @@ pub fn tab_stats(tab: i32) -> Option<TabStats> {
     })
 }
 
-/// Start the element picker on a tab's page.
+/// Start the element picker on a tab's page. It runs as a DevTools evaluation
+/// that resolves with the picked selector, which is saved to My filters.
 pub fn pick_element(tab: i32) -> Result<(), String> {
-    let (_, webview) = page(tab).ok_or_else(|| "ad blocking is not active on this tab".to_string())?;
-    let key = serde_json::to_string(channel_key()).unwrap_or_default();
-    webview.eval(format!("{PICKER_JS}({key})")).map_err(|e| e.to_string())
+    let (state, webview) = page(tab).ok_or_else(|| "ad blocking is not active on this tab".to_string())?;
+    {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        if s.picking {
+            return Ok(());
+        }
+        s.picking = true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use tauri::Manager;
+        let app = webview.app_handle().clone();
+        let params = serde_json::json!({
+            "expression": PICKER_JS,
+            "awaitPromise": true,
+            "returnByValue": true,
+        })
+        .to_string();
+        let failed = state.clone();
+        let res = webview.with_webview(move |w| unsafe {
+            use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+            use windows::core::HSTRING;
+            let Ok(core) = w.controller().CoreWebView2() else {
+                if let Ok(mut s) = state.lock() {
+                    s.picking = false;
+                }
+                return;
+            };
+            let done_state = state.clone();
+            let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |_, json: String| {
+                let host = match done_state.lock() {
+                    Ok(mut s) => {
+                        s.picking = false;
+                        s.top_host.trim_start_matches("www.").to_string()
+                    }
+                    Err(_) => return Ok(()),
+                };
+                let reply: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                let filter = reply.pointer("/result/value").and_then(|v| v.as_str()).and_then(|s| picked_filter(&host, s));
+                if let Some(filter) = filter {
+                    super::add_user_filter(&app, &filter);
+                    use tauri::Emitter;
+                    let _ = app.emit("toast:show", format!("Hidden on {host}. Undo in Settings › Ad blocking › My filters"));
+                }
+                Ok(())
+            }));
+            if core
+                .CallDevToolsProtocolMethod(&HSTRING::from("Runtime.evaluate"), &HSTRING::from(params), &handler)
+                .is_err()
+            {
+                if let Ok(mut s) = state.lock() {
+                    s.picking = false;
+                }
+            }
+        });
+        if res.is_err() {
+            if let Ok(mut s) = failed.lock() {
+                s.picking = false;
+            }
+        }
+        res.map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = webview;
+        Err("unsupported platform".to_string())
+    }
 }
 
 fn hostname(url: &str) -> Option<String> {
@@ -200,6 +359,36 @@ const CSP_JS: &str = r#"(function (url, policy) {
   }
 })"#;
 
+/// Hides the elements whose request was blocked (images, frames, embeds), so
+/// they leave no empty box behind, like uBlock Origin's "collapse". The
+/// preload scanner can request an image before its element exists, so a
+/// document still loading is checked again once parsed.
+const COLLAPSE_JS: &str = r#"(function (url) {
+  const collapse = () => {
+    for (const el of document.querySelectorAll("img[src],iframe[src],frame[src],embed[src],object[data],video[src],input[type=image][src]")) {
+      if (el.src === url || el.data === url) el.style.setProperty("display", "none", "important");
+    }
+  };
+  collapse();
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", collapse, { once: true });
+})"#;
+
+/// Path prefix scriptlets fetch redirect resources from (`war:` directives),
+/// on the page's own origin; Jello answers these requests itself.
+fn war_prefix() -> String {
+    format!("/__{}/war/", channel_key())
+}
+
+/// The resource name of a scriptlet's redirect-resource request, if `url` is one.
+fn war_request(url: &str) -> Option<String> {
+    if !url.contains(channel_key()) {
+        return None;
+    }
+    let parsed = tauri::Url::parse(url).ok()?;
+    let name = parsed.path().strip_prefix(&war_prefix())?;
+    (!name.is_empty() && !name.contains('/')).then(|| name.to_string())
+}
+
 /// The script that applies a document's scriptlets and cosmetic filters, or
 /// None when nothing applies.
 fn document_script(url: &str, top: bool) -> Option<String> {
@@ -221,14 +410,14 @@ fn document_script(url: &str, top: bool) -> Option<String> {
     });
     let mut js = String::with_capacity(PAGE_JS.len() + res.injected_script.len() + 256);
     if !res.injected_script.is_empty() {
-        // Scriptlets must run before the page's own scripts, in its world,
-        // and once per document even if a stale copy of this script remains.
+        // Scriptlets run in the page's world, before its own scripts.
         // uBlock Origin's scriptlets read a `scriptletGlobals` object that its
-        // injector defines; without it they throw and do nothing.
-        let once = serde_json::to_string(&format!("{}s", channel_key())).ok()?;
+        // injector defines (without it they throw and do nothing); its
+        // `warOrigin` is where they fetch redirect resources from.
+        let war = serde_json::to_string(&war_prefix().trim_end_matches('/')).ok()?;
         js.push_str(&format!(
-            "(function(){{if(location.hostname!=={host_json}||(window===window.top)!=={top}||window[{once}])return;\
-             Object.defineProperty(window,{once},{{value:1}});\nconst scriptletGlobals={{}};\n{}\n}})();\n",
+            "(function(){{if(location.hostname!=={host_json}||(window===window.top)!=={top})return;\
+             const scriptletGlobals=/^https?:$/.test(location.protocol)?{{warOrigin:location.origin+{war}}}:{{}};\n{}\n}})();\n",
             res.injected_script
         ));
     }
@@ -237,54 +426,35 @@ fn document_script(url: &str, top: bool) -> Option<String> {
     Some(js)
 }
 
-/// A request on the page channel (`<origin>/__<key>/<what>?d=<json>`, see
-/// page.js): what is asked, and its data. None for any other URL.
-fn channel_request(url: &str, key: &str) -> Option<(String, serde_json::Value)> {
-    if !url.contains(key) {
-        return None;
+/// The channel's answer for a document at `document_url`: the generic
+/// selectors for the classes and ids it reported (`{"c": [...], "i": [...]}`),
+/// as a JSON array.
+fn generic_reply(state: &Weak<Mutex<PageState>>, document_url: &str, data: &str) -> String {
+    const NONE: &str = "[]";
+    if !crate::prefs::builtin_adblock() {
+        return NONE.to_string();
     }
-    let parsed = tauri::Url::parse(url).ok()?;
-    let what = parsed.path().strip_prefix(&format!("/__{key}/"))?.to_string();
-    let data = parsed
-        .query_pairs()
-        .find(|(k, _)| k == "d")
-        .and_then(|(_, v)| serde_json::from_str(&v).ok())
-        .unwrap_or(serde_json::Value::Null);
-    Some((what, data))
-}
-
-/// The answer to a channel request from the document at `document_url`:
-/// generic selectors for the classes and ids it reported, or the filter it
-/// picked saved to My filters. Returns the JSON response body.
-fn channel_reply(what: &str, data: &serde_json::Value, document_url: &str, app: &tauri::AppHandle) -> String {
-    match what {
-        "generic" => {
-            let Some(engine) = super::engine() else { return "[]".to_string() };
-            let res = engine.url_cosmetic_resources(document_url);
-            if res.generichide {
-                return "[]".to_string();
-            }
-            let take = |field: &str| -> Vec<String> {
-                data[field]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str()).take(1000).map(str::to_string).collect())
-                    .unwrap_or_default()
-            };
-            let selectors = engine.hidden_class_id_selectors(take("c"), take("i"), &res.exceptions);
-            serde_json::to_string(&selectors).unwrap_or_else(|_| "[]".to_string())
-        }
-        "pick" => {
-            let host = hostname(document_url).unwrap_or_default();
-            let host = host.trim_start_matches("www.");
-            if let Some(filter) = data["s"].as_str().and_then(|s| picked_filter(host, s)) {
-                super::add_user_filter(app, &filter);
-                use tauri::Emitter;
-                let _ = app.emit("toast:show", format!("Hidden on {host}. Undo in Settings › Ad blocking › My filters"));
-            }
-            "[]".to_string()
-        }
-        _ => "[]".to_string(),
+    let paused = state
+        .upgrade()
+        .and_then(|s| s.lock().ok().map(|s| crate::prefs::ad_blocking_paused(&s.top_host)))
+        .unwrap_or(true);
+    if paused {
+        return NONE.to_string();
     }
+    let Some(engine) = super::engine() else { return NONE.to_string() };
+    let res = engine.url_cosmetic_resources(document_url);
+    if res.generichide {
+        return NONE.to_string();
+    }
+    let data: serde_json::Value = serde_json::from_str(data).unwrap_or_default();
+    let take = |field: &str| -> Vec<String> {
+        data[field]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).take(1000).map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let selectors = engine.hidden_class_id_selectors(take("c"), take("i"), &res.exceptions);
+    serde_json::to_string(&selectors).unwrap_or_else(|_| NONE.to_string())
 }
 
 /// A picked element's selector as a filter for `host`, or None when the
@@ -300,22 +470,42 @@ fn picked_filter(host: &str, selector: &str) -> Option<String> {
     valid.then(|| format!("{host}##{selector}"))
 }
 
+/// The id of the history entry for `url` nearest to the current entry, from a
+/// `Page.getNavigationHistory` reply.
+fn history_entry(reply: &str, url: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(reply).ok()?;
+    let current = v["currentIndex"].as_i64()?;
+    v["entries"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| *i as i64 != current && e["url"].as_str() == Some(url))
+        .min_by_key(|(i, _)| (*i as i64 - current).abs())
+        .and_then(|(_, e)| e["id"].as_i64())
+}
+
+/// Whether "Name: value" header lines include `name`.
+fn has_header(headers: &str, name: &str) -> bool {
+    headers
+        .lines()
+        .any(|l| l.split_once(':').is_some_and(|(n, _)| n.trim().eq_ignore_ascii_case(name)))
+}
+
 /// Route one content webview (tab `tab`) through the built-in blocker.
 pub fn attach(webview: &tauri::Webview<tauri::Wry>, tab: i32) {
     #[cfg(target_os = "windows")]
     {
-        use tauri::Manager;
         let state = Arc::new(Mutex::new(PageState::default()));
         register(tab, &state, webview);
-        let app = webview.app_handle().clone();
-        let _ = webview.with_webview(move |w| unsafe { hook(w, state, app) });
+        let handle = webview.clone();
+        let _ = webview.with_webview(move |w| unsafe { hook(w, state, handle) });
     }
     #[cfg(not(target_os = "windows"))]
     let _ = (webview, tab);
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>, app: tauri::AppHandle) {
+unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>, webview: tauri::Webview<tauri::Wry>) {
     use webview2_com::Microsoft::Web::WebView2::Win32::*;
     use webview2_com::{
         AddScriptToExecuteOnDocumentCreatedCompletedHandler, ContentLoadingEventHandler, ExecuteScriptCompletedHandler,
@@ -346,17 +536,34 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         let _ = core.ExecuteScript(&HSTRING::from(js), &done);
     };
     let collapse = move |core: &ICoreWebView2, url: &str| {
-        let key = serde_json::to_string(channel_key()).unwrap_or_default();
         let url = serde_json::to_string(url).unwrap_or_default();
-        run_script(core, format!("window[{key}]&&window[{key}].collapse({url})"));
+        run_script(core, format!("{COLLAPSE_JS}({url})"));
     };
 
-    // Restarted navigations are created from the environment too.
-    let script_env = env.clone();
+    // The page channel (channel.rs), reachable only by Jello's own scripts.
+    // Host objects reach the top-level document; frames get theirs as they
+    // are created, nested frames included.
+    let reply_state = Arc::downgrade(&state);
+    let channel = super::channel::new(Box::new(move |url, data| generic_reply(&reply_state, url, data)));
+    let mut object = super::channel::variant(&channel);
+    if core.AddHostObjectToScript(&HSTRING::from(channel_key()), &mut object).is_err() {
+        tracing::warn!("content blocker: page channel unavailable");
+    }
+    let _ = windows::Win32::System::Variant::VariantClear(&mut object);
+    if let Ok(core4) = core.cast::<ICoreWebView2_4>() {
+        let handler = webview2_com::FrameCreatedEventHandler::create(Box::new(move |_, args| {
+            if let Some(frame) = args.and_then(|a| a.Frame().ok()) {
+                expose_channel(&frame, &channel);
+            }
+            Ok(())
+        }));
+        let mut token: i64 = 0;
+        let _ = core4.add_FrameCreated(&handler, &mut token);
+    }
 
-    // Network requests, and the page channel (see channel_request).
+    // Network requests, and redirect resources requested by scriptlets.
     let req_state = state.clone();
-    let req_app = app.clone();
+    let req_env = env.clone();
     let on_request = WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {
         let Some(args) = args else { return Ok(()) };
         let Ok(req) = args.Request() else { return Ok(()) };
@@ -366,21 +573,19 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
                 .map(|h| take_string(|p| h.GetHeader(&HSTRING::from(name), p)))
                 .unwrap_or_default()
         };
-        if let Some((what, data)) = channel_request(&url, channel_key()) {
-            // Answered here so it never reaches the site, even while the
-            // blocker is switched off.
-            let referer = header("Referer");
-            let body = channel_reply(&what, &data, if referer.is_empty() { &url } else { &referer }, &req_app);
-            let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(body.as_bytes()));
-            let headers = "Content-Type: application/json\r\nCache-Control: no-store";
-            if let Ok(response) =
-                env.CreateWebResourceResponse(stream.as_ref(), 200, &HSTRING::from("OK"), &HSTRING::from(headers))
-            {
+        if let Some(name) = war_request(&url) {
+            // Answered here so it never reaches the site.
+            let response = match super::war_resource(&name) {
+                Some((mime, bytes)) => {
+                    let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(&bytes));
+                    let headers = format!("Content-Type: {mime}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store");
+                    req_env.CreateWebResourceResponse(stream.as_ref(), 200, &HSTRING::from("OK"), &HSTRING::from(headers))
+                }
+                None => req_env.CreateWebResourceResponse(None, 404, &HSTRING::from("Not Found"), &HSTRING::from("")),
+            };
+            if let Ok(response) = response {
                 let _ = args.SetResponse(&response);
             }
-            return Ok(());
-        }
-        if !crate::prefs::builtin_adblock() {
             return Ok(());
         }
         if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("wss://") || url.starts_with("ws://")) {
@@ -388,12 +593,46 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         }
         let mut ctx = COREWEBVIEW2_WEB_RESOURCE_CONTEXT::default();
         let _ = args.ResourceContext(&mut ctx);
-        let (top_url, top_host) = req_state.lock().map(|s| (s.top_url.clone(), s.top_host.clone())).unwrap_or_default();
+        let method = take_string(|p| req.Method(p));
         // Documents are decided by the navigation events below: top-level pages
-        // always load, frames are cancelled at FrameNavigationStarting.
+        // always load, frames are cancelled at FrameNavigationStarting. A form
+        // post being held has its body kept here and is redirected to its own
+        // URL, where the navigation handler cancels it (see Capture).
         if ctx == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT {
+            if method.eq_ignore_ascii_case("POST") {
+                if let Ok(mut s) = req_state.lock() {
+                    let generation = s.generation;
+                    let wanted = s
+                        .capture
+                        .as_ref()
+                        .is_some_and(|c| c.generation == generation && c.url == url && c.body.is_none());
+                    if wanted {
+                        match req.Content().ok().and_then(|stream| read_stream(&stream, POST_BODY_LIMIT)) {
+                            Some(body) => {
+                                if let Some(c) = s.capture.as_mut() {
+                                    c.body = Some(body);
+                                }
+                                let headers = format!("Location: {url}\r\nCache-Control: no-store");
+                                if let Ok(response) = req_env.CreateWebResourceResponse(
+                                    None,
+                                    307,
+                                    &HSTRING::from("Temporary Redirect"),
+                                    &HSTRING::from(headers),
+                                ) {
+                                    let _ = args.SetResponse(&response);
+                                }
+                            }
+                            None => s.capture = None,
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
+        if !crate::prefs::builtin_adblock() {
+            return Ok(());
+        }
+        let (top_url, top_host) = req_state.lock().map(|s| (s.top_url.clone(), s.top_host.clone())).unwrap_or_default();
         if crate::prefs::ad_blocking_paused(&top_host) {
             return Ok(());
         }
@@ -402,7 +641,6 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         // with no-referrer policy falls back to the top-level document.
         let referer = header("Referer");
         let source = if referer.is_empty() { top_url } else { referer };
-        let method = take_string(|p| req.Method(p));
         let kind = request_type(ctx);
         let Ok(request) = adblock::request::Request::new(&url, &source, kind, &method) else {
             return Ok(());
@@ -422,11 +660,11 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
                 Some((mime, body)) => {
                     let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(&body));
                     let headers = format!("Content-Type: {mime}\r\nAccess-Control-Allow-Origin: *");
-                    env.CreateWebResourceResponse(stream.as_ref(), 200, &HSTRING::from("OK"), &HSTRING::from(headers))
+                    req_env.CreateWebResourceResponse(stream.as_ref(), 200, &HSTRING::from("OK"), &HSTRING::from(headers))
                 }
                 // A redirect to a data: URL is refused by the browser, so the
                 // page sees a network error, as with an extension's block.
-                None => env.CreateWebResourceResponse(
+                None => req_env.CreateWebResourceResponse(
                     None,
                     307,
                     &HSTRING::from("Blocked"),
@@ -440,7 +678,7 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
             let headers = format!(
                 "Location: {clean}\r\nAccess-Control-Allow-Origin: {allow}\r\nAccess-Control-Allow-Credentials: true"
             );
-            env.CreateWebResourceResponse(None, 307, &HSTRING::from("Temporary Redirect"), &HSTRING::from(headers))
+            req_env.CreateWebResourceResponse(None, 307, &HSTRING::from("Temporary Redirect"), &HSTRING::from(headers))
         } else {
             return Ok(());
         };
@@ -454,47 +692,27 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
 
     // Adds a document-creation script and records its id: frame and host
     // scripts are removed when the top-level page moves to another host, the
-    // `$csp` script when the top-level URL changes. When the navigation of
-    // `generation` was held back for this registration (see below), the last
-    // completion starts it again.
+    // `$csp` script when the top-level URL changes. The last registration of
+    // a held navigation's generation starts it again.
     let add_script = {
         let state = state.clone();
-        let env = script_env;
+        let webview = webview.clone();
         move |core: &ICoreWebView2, js: String, kind: ScriptKind, generation: u64| {
             let done_state = state.clone();
-            let done_core = core.clone();
-            let done_env = env.clone();
+            let done_webview = webview.clone();
             let finish = move |id: Option<String>| {
-                let mut resume = None;
                 if let Ok(mut s) = done_state.lock() {
-                    if let Some(id) = id {
-                        match kind {
-                            ScriptKind::Csp => s.csp_script = Some(id),
-                            _ => s.scripts.push(id),
-                        }
+                    match (kind, id) {
+                        (ScriptKind::Bootstrap, _) => s.ready = true,
+                        (ScriptKind::Csp, Some(id)) => s.csp_script = Some(id),
+                        (_, Some(id)) => s.scripts.push(id),
+                        _ => {}
                     }
-                    if let Some(restart) = s.restart.as_mut().filter(|r| r.generation == generation) {
-                        restart.pending = restart.pending.saturating_sub(1);
-                        if restart.pending == 0 {
-                            resume = s.restart.take();
-                        }
+                    if kind != ScriptKind::Bootstrap && kind != ScriptKind::Frame && generation == s.generation {
+                        s.inflight = s.inflight.saturating_sub(1);
                     }
                 }
-                if let Some(restart) = resume {
-                    let request = done_env.cast::<ICoreWebView2Environment2>().and_then(|env2| {
-                        env2.CreateWebResourceRequest(
-                            &HSTRING::from(restart.url.as_str()),
-                            &HSTRING::from("GET"),
-                            None,
-                            &HSTRING::from(restart.headers.as_str()),
-                        )
-                    });
-                    let resumed = request
-                        .and_then(|r| done_core.cast::<ICoreWebView2_2>().and_then(|c| c.NavigateWithWebResourceRequest(&r)));
-                    if resumed.is_err() {
-                        let _ = done_core.Navigate(&HSTRING::from(restart.url.as_str()));
-                    }
-                }
+                resume(&done_state, &done_webview, None);
             };
             let on_done = finish.clone();
             let done = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(move |hr, id: String| {
@@ -508,19 +726,17 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         }
     };
 
+    // The document-start script runs first in every document from now on.
+    let key = serde_json::to_string(channel_key()).unwrap_or_default();
+    add_script(&core, format!("{BOOTSTRAP_JS}({key});"), ScriptKind::Bootstrap, 0);
+
     // Top-level navigations. A host's scripts stay registered while the page
     // stays on that host, so reloads and in-site navigation reuse them; moving
     // to another host replaces them. The `$csp` script depends on the full URL.
     // Navigations without a host (about:blank) leave everything alone.
-    //
-    // A script registered here would arrive too late for the document this
-    // navigation creates, so a new-document GET navigation that needs one is
-    // cancelled and started again, with the same request headers, once the
-    // registration has completed; the second pass finds everything in place.
-    // Back/forward, redirects and form posts cannot be replayed that way; they
-    // rely on the copy run at ContentLoading.
     let nav_state = state.clone();
     let nav_add = add_script.clone();
+    let nav_webview = webview.clone();
     let on_navigation = NavigationStartingEventHandler::create(Box::new(move |sender, args| {
         let (Some(core), Some(args)) = (sender, args) else { return Ok(()) };
         let url = take_string(|p| args.Uri(p));
@@ -528,81 +744,134 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         let enabled = crate::prefs::builtin_adblock();
         let paused = host.as_deref().is_some_and(crate::prefs::ad_blocking_paused);
         let active = enabled && !paused;
-        if active {
-            if let Some(clean) = removeparam_target(&url, &args) {
+        let headers = request_headers(&args);
+        let posted = headers.as_deref().is_some_and(|h| has_header(h, "Content-Type"));
+        if active && !posted {
+            if let Some(clean) = removeparam_target(&url) {
                 let _ = args.SetCancel(true);
                 let _ = core.Navigate(&HSTRING::from(clean));
                 return Ok(());
             }
         }
-        let (in_place, keep_csp, generation, old) = match nav_state.lock() {
-            Ok(mut s) => {
-                s.top_url = url.clone();
-                let Some(host) = host.clone() else { return Ok(()) };
-                s.generation += 1;
-                s.restart = None;
-                s.blocked = 0;
-                s.log.clear();
-                let keep_csp = active && s.csp_url == url && s.csp_version == super::engine_version();
-                let mut old = Vec::new();
-                if !keep_csp {
-                    old.extend(s.csp_script.take());
-                    s.csp_url.clear();
-                }
-                let in_place =
-                    active && s.top_host == host && s.host_script && s.script_version == super::engine_version();
-                if !in_place {
-                    s.top_host = host;
-                    s.host_script = false;
-                    s.frame_hosts.clear();
-                    old.append(&mut s.scripts);
-                }
-                (in_place, keep_csp, s.generation, old)
+        let mut redirected = windows::core::BOOL::default();
+        let _ = args.IsRedirected(&mut redirected);
+        let redirected = redirected.as_bool();
+        let mut kind = COREWEBVIEW2_NAVIGATION_KIND::default();
+        if let Ok(args3) = args.cast::<ICoreWebView2NavigationStartingEventArgs3>() {
+            let _ = args3.NavigationKind(&mut kind);
+        }
+
+        let Ok(mut s) = nav_state.lock() else { return Ok(()) };
+        s.top_url = url.clone();
+        let Some(host) = host else { return Ok(()) };
+        let replayed = s.replaying.take().is_some_and(|u| u == url);
+        if !redirected {
+            s.generation += 1;
+            s.inflight = 0;
+            s.held = None;
+            s.blocked = 0;
+            s.log.clear();
+            if !posted {
+                s.capture = None;
             }
-            Err(_) => return Ok(()),
-        };
+        }
+        let generation = s.generation;
+        s.late = false;
+        let keep_csp = active && s.csp_url == url && s.csp_version == super::engine_version();
+        let mut old = Vec::new();
+        if !keep_csp {
+            old.extend(s.csp_script.take());
+            s.csp_url.clear();
+        }
+        let in_place = active && s.top_host == host && s.host_script && s.script_version == super::engine_version();
+        if !in_place {
+            s.top_host = host;
+            s.host_script = false;
+            s.frame_hosts.clear();
+            old.append(&mut s.scripts);
+        }
+
+        let host_js = if active && !in_place { document_script(&url, true) } else { None };
+        let csp_js = if active && !keep_csp { csp_script(&url) } else { None };
+        let needs_scripts = host_js.is_some() || csp_js.is_some();
+        let wait_engine = active && super::engine().is_none();
+        // A redirect continues a navigation whose registrations may still be
+        // pending (a held form post reaches here through its redirect).
+        if (needs_scripts || s.inflight > 0 || wait_engine || !s.ready) && !replayed {
+            let replay = if posted {
+                match s.capture.take() {
+                    Some(Capture { generation: g, url: u, body: Some(body) }) if redirected && g == generation && u == url => {
+                        headers.map(|headers| Replay::Post { url: url.clone(), headers, body })
+                    }
+                    _ => {
+                        if !redirected {
+                            // Held at the redirect the request handler answers with.
+                            s.capture = Some(Capture { generation, url: url.clone(), body: None });
+                        }
+                        None
+                    }
+                }
+            } else if kind == COREWEBVIEW2_NAVIGATION_KIND_BACK_OR_FORWARD {
+                Some(Replay::History { url: url.clone() })
+            } else if kind == COREWEBVIEW2_NAVIGATION_KIND_RELOAD {
+                Some(Replay::Reload { url: url.clone() })
+            } else {
+                headers.map(|headers| Replay::Get { url: url.clone(), headers })
+            };
+            match replay {
+                Some(replay) => {
+                    let _ = args.SetCancel(true);
+                    s.held = Some(Held { generation, replay });
+                    let timer_state = nav_state.clone();
+                    let timer_webview = nav_webview.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(HOLD_LIMIT);
+                        resume(&timer_state, &timer_webview, Some(generation));
+                    });
+                }
+                None => s.late = needs_scripts,
+            }
+        } else if needs_scripts {
+            s.late = true;
+        }
+        if host_js.is_some() {
+            s.host_script = true;
+            s.script_version = super::engine_version();
+            s.inflight += 1;
+        }
+        if csp_js.is_some() {
+            s.csp_url = url.clone();
+            s.csp_version = super::engine_version();
+            s.inflight += 1;
+        }
+        let held = s.held.is_some();
+        drop(s);
+
         for id in old {
             let _ = core.RemoveScriptToExecuteOnDocumentCreated(&HSTRING::from(id));
         }
-        if !active {
-            return Ok(());
-        }
-        let host_js = if in_place { None } else { document_script(&url, true) };
-        let csp_js = if keep_csp { None } else { csp_script(&url) };
-        let pending = host_js.is_some() as u32 + csp_js.is_some() as u32;
-        if pending > 0 {
-            if let Some(headers) = replayable_headers(&args) {
-                let _ = args.SetCancel(true);
-                if let Ok(mut s) = nav_state.lock() {
-                    s.restart = Some(Restart { generation, url: url.clone(), headers, pending });
-                }
-            }
-        }
         if let Some(js) = host_js {
-            if let Ok(mut s) = nav_state.lock() {
-                s.host_script = true;
-                s.script_version = super::engine_version();
-            }
             nav_add(&core, js, ScriptKind::Host, generation);
         }
         if let Some(js) = csp_js {
-            if let Ok(mut s) = nav_state.lock() {
-                s.csp_url = url.clone();
-                s.csp_version = super::engine_version();
-            }
             nav_add(&core, js, ScriptKind::Csp, generation);
+        }
+        if held {
+            // Nothing left to register: it may only be waiting for the engine.
+            resume(&nav_state, &nav_webview, None);
         }
         Ok(())
     }));
     let _ = core.add_NavigationStarting(&on_navigation, &mut token);
 
-    // A cross-host redirect lands on a host whose script was not registered
-    // in time, and a navigation can start before the engine is loaded, so the
-    // committed document also gets its script through ExecuteScript. The
-    // script's own guards make this copy a no-op when the registered one ran.
+    // A navigation that could not be held (a form post with no readable body,
+    // a redirected post) gets its scripts through ExecuteScript once its
+    // document exists, which may be after the page's first scripts.
+    let content_state = state.clone();
     let on_content = ContentLoadingEventHandler::create(Box::new(move |sender, _args| {
         let Some(core) = sender else { return Ok(()) };
-        if !crate::prefs::builtin_adblock() {
+        let late = content_state.lock().map(|mut s| std::mem::take(&mut s.late)).unwrap_or(false);
+        if !late || !crate::prefs::builtin_adblock() {
             return Ok(());
         }
         let url = take_string(|p| core.Source(p));
@@ -659,22 +928,96 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
     let _ = core.add_FrameNavigationStarting(&on_frame, &mut token);
 }
 
-/// The request headers of a navigation that can be cancelled and started
-/// again unchanged: a new document (not back/forward or reload), not a
-/// redirect, and not a form post (whose body cannot be replayed).
+/// Add the page channel to a frame, and to the frames it creates in turn.
 #[cfg(target_os = "windows")]
-unsafe fn replayable_headers(
+unsafe fn expose_channel(
+    frame: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Frame,
+    channel: &windows::Win32::System::Com::IDispatch,
+) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::*;
+    use windows::core::{Interface, HSTRING, PCWSTR};
+    let mut object = super::channel::variant(channel);
+    let any = HSTRING::from("*");
+    let origins = [PCWSTR(any.as_ptr())];
+    let _ = frame.AddHostObjectToScriptWithOrigins(&HSTRING::from(channel_key()), &mut object, 1, origins.as_ptr());
+    let _ = windows::Win32::System::Variant::VariantClear(&mut object);
+    if let Ok(frame7) = frame.cast::<ICoreWebView2Frame7>() {
+        let channel = channel.clone();
+        let handler = webview2_com::FrameChildFrameCreatedEventHandler::create(Box::new(move |_, args| {
+            if let Some(child) = args.and_then(|a| a.Frame().ok()) {
+                expose_channel(&child, &channel);
+            }
+            Ok(())
+        }));
+        let mut token: i64 = 0;
+        let _ = frame7.add_FrameCreated(&handler, &mut token);
+    }
+}
+
+/// Start a held navigation again (see `Replay`).
+#[cfg(target_os = "windows")]
+unsafe fn start_again(core: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2, replay: Replay) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::*;
+    use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+    use windows::core::{Interface, HSTRING};
+
+    let request = |url: &str, method: &str, headers: &str, body: Option<&[u8]>| -> windows::core::Result<()> {
+        let env = core.cast::<ICoreWebView2_2>()?.Environment()?.cast::<ICoreWebView2Environment2>()?;
+        let stream = body.and_then(|b| windows::Win32::UI::Shell::SHCreateMemStream(Some(b)));
+        let request = env.CreateWebResourceRequest(
+            &HSTRING::from(url),
+            &HSTRING::from(method),
+            stream.as_ref(),
+            &HSTRING::from(headers),
+        )?;
+        core.cast::<ICoreWebView2_2>()?.NavigateWithWebResourceRequest(&request)
+    };
+    match replay {
+        Replay::Get { url, headers } => {
+            if request(&url, "GET", &headers, None).is_err() {
+                let _ = core.Navigate(&HSTRING::from(url));
+            }
+        }
+        Replay::Post { url, headers, body } => {
+            let _ = request(&url, "POST", &headers, Some(&body));
+        }
+        Replay::Reload { .. } => {
+            let _ = core.Reload();
+        }
+        Replay::History { url } => {
+            let nav_core = core.clone();
+            let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, reply: String| {
+                let entry = hr.ok().and_then(|_| history_entry(&reply, &url));
+                match entry {
+                    Some(id) => {
+                        let params = serde_json::json!({ "entryId": id }).to_string();
+                        let done = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(())));
+                        let _ = nav_core.CallDevToolsProtocolMethod(
+                            &HSTRING::from("Page.navigateToHistoryEntry"),
+                            &HSTRING::from(params),
+                            &done,
+                        );
+                    }
+                    None => {
+                        let _ = nav_core.Navigate(&HSTRING::from(url));
+                    }
+                }
+                Ok(())
+            }));
+            let _ = core.CallDevToolsProtocolMethod(
+                &HSTRING::from("Page.getNavigationHistory"),
+                &HSTRING::from("{}"),
+                &handler,
+            );
+        }
+    }
+}
+
+/// A navigation's request headers as "Name: value" lines.
+#[cfg(target_os = "windows")]
+unsafe fn request_headers(
     args: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2NavigationStartingEventArgs,
 ) -> Option<String> {
-    use webview2_com::Microsoft::Web::WebView2::Win32::*;
-    use windows::core::Interface;
-    let mut kind = COREWEBVIEW2_NAVIGATION_KIND::default();
-    args.cast::<ICoreWebView2NavigationStartingEventArgs3>().ok()?.NavigationKind(&mut kind).ok()?;
-    let mut redirected = windows::core::BOOL::default();
-    let _ = args.IsRedirected(&mut redirected);
-    if kind != COREWEBVIEW2_NAVIGATION_KIND_NEW_DOCUMENT || redirected.as_bool() {
-        return None;
-    }
     let headers = args.RequestHeaders().ok()?;
     let iter = headers.GetIterator().ok()?;
     let mut out = String::new();
@@ -692,9 +1035,6 @@ unsafe fn replayable_headers(
                 *p = value;
                 Ok(())
             });
-            if name.eq_ignore_ascii_case("content-type") {
-                return None;
-            }
             out.push_str(&format!("{name}: {value}\r\n"));
         }
         let mut next = windows::core::BOOL::default();
@@ -706,25 +1046,36 @@ unsafe fn replayable_headers(
     Some(out)
 }
 
+/// The whole of a request body, or None when it cannot be read or is larger
+/// than `limit`.
+#[cfg(target_os = "windows")]
+unsafe fn read_stream(stream: &windows::Win32::System::Com::IStream, limit: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let mut read = 0u32;
+        let hr = stream.Read(buf.as_mut_ptr().cast(), buf.len() as u32, Some(&mut read as *mut u32));
+        if hr.is_err() {
+            return None;
+        }
+        if read == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(&buf[..read as usize]);
+        if out.len() > limit {
+            return None;
+        }
+    }
+}
+
 /// Response headers for a blocked request (see the request handler).
 const BLOCKED_HEADERS: &str = "Location: data:,\r\nCache-Control: no-store";
 
-/// `$removeparam` on the page URL itself: the cleaned URL to load instead, for
-/// plain GET navigations (a form post carries a Content-Type and is left
-/// alone, since navigating again would turn it into a GET).
-#[cfg(target_os = "windows")]
-unsafe fn removeparam_target(
-    url: &str,
-    args: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2NavigationStartingEventArgs,
-) -> Option<String> {
+/// `$removeparam` on the page URL itself: the cleaned URL to load instead.
+fn removeparam_target(url: &str) -> Option<String> {
     let engine = super::engine()?;
     let request = adblock::request::Request::new(url, url, "document", "GET").ok()?;
-    let clean = engine.check_network_request(&request).rewritten_url.filter(|u| u != url)?;
-    let posted = args
-        .RequestHeaders()
-        .map(|h| !take_string(|p| h.GetHeader(&windows::core::HSTRING::from("Content-Type"), p)).is_empty())
-        .unwrap_or(false);
-    (!posted).then_some(clean)
+    engine.check_network_request(&request).rewritten_url.filter(|u| u != url)
 }
 
 /// Read a string out-parameter from WebView2 and free it (the API allocates
@@ -774,20 +1125,35 @@ mod tests {
     }
 
     #[test]
-    fn channel_requests_are_recognised_by_key_and_path() {
-        let key = "_0123456789abcdef";
-        let (what, data) =
-            channel_request("https://news.example/___0123456789abcdef/generic?d=%7B%22c%22%3A%5B%22ad%22%5D%7D", key)
-                .unwrap();
-        assert_eq!(what, "generic");
-        assert_eq!(data["c"][0], "ad");
-        // The key elsewhere in the URL, or another path, is not the channel.
-        assert!(channel_request("https://news.example/page?x=_0123456789abcdef", key).is_none());
-        assert!(channel_request("https://news.example/other/_0123456789abcdef/generic", key).is_none());
-        assert!(channel_request("https://news.example/generic", key).is_none());
-        // Bad data still answers (with nothing), it is not passed to the site.
-        let (_, data) = channel_request("https://news.example/___0123456789abcdef/pick?d=not-json", key).unwrap();
-        assert!(data.is_null());
+    fn war_requests_are_recognised_by_key_and_path() {
+        let prefix = war_prefix();
+        let url = format!("https://news.example{prefix}noop-vast3.xml?secret=x");
+        assert_eq!(war_request(&url).as_deref(), Some("noop-vast3.xml"));
+        assert!(war_request(&format!("https://news.example{prefix}")).is_none());
+        assert!(war_request(&format!("https://news.example{prefix}a/b.js")).is_none());
+        assert!(war_request("https://news.example/__other/war/noop.js").is_none());
+        assert!(war_request(&format!("https://news.example/page?u={prefix}noop.js")).is_none());
+    }
+
+    #[test]
+    fn history_entries_are_found_nearest_the_current_one() {
+        let reply = r#"{"currentIndex":3,"entries":[
+            {"id":10,"url":"https://a.example/"},
+            {"id":11,"url":"https://b.example/"},
+            {"id":12,"url":"https://a.example/"},
+            {"id":13,"url":"https://c.example/"},
+            {"id":14,"url":"https://b.example/"}]}"#;
+        assert_eq!(history_entry(reply, "https://a.example/"), Some(12));
+        assert_eq!(history_entry(reply, "https://b.example/"), Some(14));
+        assert_eq!(history_entry(reply, "https://c.example/"), None);
+        assert_eq!(history_entry(reply, "https://d.example/"), None);
+        assert_eq!(history_entry("not json", "https://a.example/"), None);
+    }
+
+    #[test]
+    fn form_posts_are_recognised_by_content_type() {
+        assert!(has_header("Referer: https://a.example/\r\ncontent-type: application/x-www-form-urlencoded\r\n", "Content-Type"));
+        assert!(!has_header("Referer: https://a.example/content-type\r\nAccept: */*\r\n", "Content-Type"));
     }
 
     #[test]

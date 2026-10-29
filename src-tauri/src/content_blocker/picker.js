@@ -1,11 +1,8 @@
 // Element picker. Hovering outlines the element under the pointer; a click
-// picks it and offers a hiding filter that Jello saves to My filters. Esc or
-// Cancel ends picking without changes. Called with the page channel key.
-(function (key) {
-  const busy = key + "picker";
-  if (window[busy]) return;
-  Object.defineProperty(window, busy, { value: true, configurable: true });
-
+// picks it and offers a hiding filter. Resolves with the selector to save to
+// My filters (the element is hidden right away), or null when Esc or Cancel
+// ends picking without changes.
+(() => new Promise((resolve) => {
   const root = document.createElement("div");
   root.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none";
   const shadow = root.attachShadow({ mode: "closed" });
@@ -54,12 +51,12 @@
     const r = el.getBoundingClientRect();
     Object.assign(box.style, { display: "block", left: r.left + "px", top: r.top + "px", width: r.width + "px", height: r.height + "px" });
   };
-  const finish = () => {
+  const finish = (selector = null) => {
     document.removeEventListener("mousemove", onMove, true);
     document.removeEventListener("click", onClick, true);
     document.removeEventListener("keydown", onKey, true);
     root.remove();
-    delete window[busy];
+    resolve(selector);
   };
   const onMove = (e) => {
     if (picked) return;
@@ -106,17 +103,10 @@
       } catch (err) {
         return;
       }
-      if (window[key]) {
-        window[key]([selector]);
-        window[key].pick(selector);
-      } else {
-        // No filtering script on this page: hide inline, save through the channel.
-        document.querySelectorAll(selector).forEach((el) => el.style.setProperty("display", "none", "important"));
-        fetch(location.origin + "/__" + key + "/pick?d=" + encodeURIComponent(JSON.stringify({ s: selector })), { credentials: "omit" }).catch(() => {});
-      }
-      finish();
+      document.querySelectorAll(selector).forEach((el) => el.style.setProperty("display", "none", "important"));
+      finish(selector);
     });
-    bar.append(input, count, wider, hide, button("Cancel", "", finish));
+    bar.append(input, count, wider, hide, button("Cancel", "", () => finish()));
     recount();
     input.focus();
   };
@@ -139,4 +129,4 @@
   document.addEventListener("mousemove", onMove, true);
   document.addEventListener("click", onClick, true);
   document.addEventListener("keydown", onKey, true);
-})
+}))()

@@ -1,25 +1,25 @@
 // Cosmetic filtering for one document, injected at document creation with a
 // config built by the host for the document's hostname:
 //   host, top        which document this copy is for
-//   key              random per-session name for the host <-> page channel
+//   key              per-session name the host channel is handed over under
 //   css              hostname-specific selectors to hide
 //   procedural       JSON-encoded procedural/action filters
 //   generic          look up generic class/id rules as the DOM grows
 (function (cfg) {
   if (location.hostname !== cfg.host || (window === window.top) !== cfg.top) return;
-  if (window[cfg.key]) return;
 
-  // Requests to /__<key>/… on the page's own origin are answered by Jello
-  // before they reach the network: generic-rule lookups and picked filters.
-  // The native fetch is kept so page scripts that wrap fetch never see them.
-  const nativeFetch = window.fetch.bind(window);
-  const send = (what, data) =>
-    nativeFetch(location.origin + "/__" + cfg.key + "/" + what + "?d=" + encodeURIComponent(JSON.stringify(data)), {
-      credentials: "omit",
-      cache: "no-store",
-    })
-      .then((r) => r.json())
-      .catch(() => []);
+  // The host channel left by the document-start script (bootstrap.js). Calls
+  // go to Jello directly, not over the network.
+  const channel = window[cfg.key];
+  if (channel !== undefined) delete window[cfg.key];
+  const parse = JSON.parse;
+  const stringify = JSON.stringify;
+  const lookup = (data) =>
+    channel
+      ? Promise.resolve(channel.generic(location.href, stringify(data)))
+          .then((text) => parse(text))
+          .catch(() => [])
+      : Promise.resolve([]);
 
   const sheet = new CSSStyleSheet();
   const hidden = new Set();
@@ -41,20 +41,10 @@
     }
     adopt();
   };
-  // Elements whose request was blocked (images, frames, embeds) would leave
-  // an empty box behind; hide them like uBlock Origin's "collapse".
-  hide.collapse = (url) => {
-    for (const el of document.querySelectorAll("img[src],iframe[src],frame[src],embed[src],object[data],video[src],input[type=image][src]")) {
-      if (el.src === url || el.data === url) el.style.setProperty("display", "none", "important");
-    }
-  };
-  // The element picker saves its filter through the same channel.
-  hide.pick = (selector) => send("pick", { s: selector });
   // Bulk load: one parse, and an invalid selector only drops its own rule.
   sheet.replaceSync(cfg.css.map((s) => s + "{display:none!important}").join("\n"));
   cfg.css.forEach((s) => hidden.add(s));
   adopt();
-  Object.defineProperty(window, cfg.key, { value: hide });
   // A page that replaces document.adoptedStyleSheets drops the sheet.
   document.addEventListener("DOMContentLoaded", adopt, { once: true });
   window.addEventListener("load", adopt, { once: true });
@@ -77,7 +67,7 @@
   // scanned once, reports are batched every 30 ms (at most 1,000 names per
   // request), and at most 50,000 distinct class/id names are reported per
   // document.
-  if (cfg.generic && location.origin !== "null") {
+  if (cfg.generic && channel) {
     const seen = new Set();
     const classes = new Set();
     const ids = new Set();
@@ -89,7 +79,7 @@
       const i = [...ids].slice(0, 1000 - c.length);
       c.forEach((n) => classes.delete(n));
       i.forEach((n) => ids.delete(n));
-      send("generic", { c, i }).then((selectors) => Array.isArray(selectors) && selectors.length && hide(selectors));
+      lookup({ c, i }).then((selectors) => Array.isArray(selectors) && selectors.length && hide(selectors));
       if (classes.size || ids.size) timer = setTimeout(flush, 30);
     };
     const note = (el) => {

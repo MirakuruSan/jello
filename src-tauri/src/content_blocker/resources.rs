@@ -3,9 +3,9 @@
 //! They are published as ES modules, so a hidden window loads them and
 //! serializes them (`resources.js`). The source is the jsDelivr mirror of the
 //! latest uBlock Origin release, or, when that fails, the release's own zip
-//! from GitHub served to the window from disk. They are downloaded rather
-//! than shipped with Jello because uBlock Origin is GPL-licensed. This runs
-//! when the cached copy is a week old; a failed run keeps the last good copy.
+//! from GitHub served to the window from disk. On first launch the files
+//! shipped in the filter snapshot are used the same way. This runs when the
+//! cached copy is a week old; a failed run keeps the last good copy.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -73,13 +73,28 @@ pub fn assemble(app: &AppHandle) -> Result<(String, String), String> {
             run_in_window(app, &format!("https://{LOCAL_HOST}/"), Some(&folder))?
         }
     };
+    let count = check(&json)?;
+    tracing::info!("content blocker: {count} resources from uBlock Origin {}", release.tag);
+    Ok((release.tag, json))
+}
+
+/// Resources JSON from uBlock Origin files already on disk (`js/` and
+/// `web_accessible_resources/`).
+pub fn assemble_local(app: &AppHandle, folder: &Path) -> Result<String, String> {
+    let json = run_in_window(app, &format!("https://{LOCAL_HOST}/"), Some(folder))?;
+    let count = check(&json)?;
+    tracing::info!("content blocker: {count} resources from the bundled uBlock Origin files");
+    Ok(json)
+}
+
+/// The number of resources in an assembled JSON array, or why it is unusable.
+fn check(json: &str) -> Result<usize, String> {
     let resources: Vec<adblock::resources::Resource> =
-        serde_json::from_str(&json).map_err(|e| format!("bad resources: {e}"))?;
+        serde_json::from_str(json).map_err(|e| format!("bad resources: {e}"))?;
     if resources.len() < 50 {
         return Err(format!("only {} resources", resources.len()));
     }
-    tracing::info!("content blocker: {} resources from uBlock Origin {}", resources.len(), release.tag);
-    Ok((release.tag, json))
+    Ok(resources.len())
 }
 
 /// Download the release zip and keep the files resources.js reads: `js/` and

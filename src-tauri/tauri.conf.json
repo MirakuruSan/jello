@@ -37,6 +37,10 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/content-blocker/": "content-blocker/",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+    },
     "windows": {
       "nsis": {
         "installerHooks": "./windows/hooks.nsh"
