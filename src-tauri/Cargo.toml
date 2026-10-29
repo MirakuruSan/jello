@@ -33,6 +33,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+# Without `single-thread` the engine is Send + Sync and can be shared across webviews.
+adblock = { version = "0.13.5", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+base64 = "0.22"
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Registry", "Win32_Security", "Win32_System_Power", "Win32_System_Threading"] }
 
 # Dev builds keep line tables for readable backtraces and skip debug info for

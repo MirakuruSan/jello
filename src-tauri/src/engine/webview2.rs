@@ -197,7 +197,13 @@ impl WebView2ContentView {
         }
     }
 
-    pub fn new(id: ViewId, serial: u64, webview: tauri::Webview<tauri::Wry>, is_incognito: bool) -> Self {
+    pub fn new(
+        id: ViewId,
+        serial: u64,
+        webview: tauri::Webview<tauri::Wry>,
+        is_incognito: bool,
+        content_blocking: bool,
+    ) -> Self {
         use tauri::Manager;
         // Bound before the windows-only handler block below: the event-driven
         // title/URL handlers capture it, and it also backs the ContentView.
@@ -596,6 +602,9 @@ impl WebView2ContentView {
             });
         }
 
+        if content_blocking {
+            crate::content_blocker::page::attach(&webview);
+        }
         let visible = Arc::new(AtomicBool::new(true));
         let alive = Arc::new(AtomicBool::new(true));
 

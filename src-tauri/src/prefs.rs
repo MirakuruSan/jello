@@ -13,6 +13,7 @@ static AUTO_PIP: AtomicBool = AtomicBool::new(true);
 static PASSWORD_AUTOSAVE: AtomicBool = AtomicBool::new(true);
 static GENERAL_AUTOFILL: AtomicBool = AtomicBool::new(true);
 static CLEAR_HISTORY_ON_EXIT: AtomicBool = AtomicBool::new(false);
+static BUILTIN_ADBLOCK: AtomicBool = AtomicBool::new(false);
 
 /// Webviews kept alive at once; the least-recently-used one is unloaded when a
 /// new tab would exceed it. 0 in the setting means unlimited.
@@ -52,6 +53,12 @@ pub fn general_autofill() -> bool {
 
 pub fn clear_history_on_exit() -> bool {
     CLEAR_HISTORY_ON_EXIT.load(Ordering::Relaxed)
+}
+
+/// Jello's built-in ad blocker (content_blocker). Tabs opened while it is on
+/// route their requests through it; switching it off stops blocking at once.
+pub fn builtin_adblock() -> bool {
+    BUILTIN_ADBLOCK.load(Ordering::Relaxed)
 }
 
 fn minutes(m: u32) -> Option<Duration> {
@@ -96,11 +103,12 @@ pub fn apply(key: &str, value: &serde_json::Value) {
                 DISCARD_AFTER_MINS.store(n, Ordering::Relaxed);
             }
         }
-        "autoPip" | "passwordAutosave" | "generalAutofill" | "clearHistoryOnExit" => {
+        "autoPip" | "passwordAutosave" | "generalAutofill" | "clearHistoryOnExit" | "builtinAdblock" => {
             let flag = match key {
                 "autoPip" => &AUTO_PIP,
                 "passwordAutosave" => &PASSWORD_AUTOSAVE,
                 "generalAutofill" => &GENERAL_AUTOFILL,
+                "builtinAdblock" => &BUILTIN_ADBLOCK,
                 _ => &CLEAR_HISTORY_ON_EXIT,
             };
             if let Some(b) = as_bool(value) {
@@ -158,6 +166,12 @@ mod tests {
         assert!(clear_history_on_exit());
         apply("clearHistoryOnExit", &json!(false));
         assert!(!clear_history_on_exit());
+
+        assert!(!builtin_adblock());
+        apply("builtinAdblock", &json!("true"));
+        assert!(builtin_adblock());
+        apply("builtinAdblock", &json!(false));
+        assert!(!builtin_adblock());
 
         apply("unrelatedKey", &json!("x"));
     }

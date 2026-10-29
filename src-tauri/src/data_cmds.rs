@@ -122,10 +122,17 @@ pub async fn settings_get(db: State<'_, DbState>) -> Result<serde_json::Value, S
 
 /// Upsert a batch of settings from a JSON object { key: value }.
 #[command]
-pub async fn settings_set(patch: serde_json::Value, db: State<'_, DbState>) -> Result<(), String> {
+pub async fn settings_set(
+    patch: serde_json::Value,
+    db: State<'_, DbState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let obj = patch.as_object().cloned().ok_or_else(|| "patch must be an object".to_string())?;
     for (k, v) in &obj {
         crate::prefs::apply(k, v);
+    }
+    if obj.contains_key("builtinAdblock") && crate::prefs::builtin_adblock() {
+        crate::content_blocker::start(&app);
     }
     db_call(&db, move |conn| {
         let tx = conn.transaction()?;

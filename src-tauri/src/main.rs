@@ -24,6 +24,7 @@ pub mod deeplink;
 pub mod file_assoc;
 pub mod prefs;
 pub mod appearance;
+pub mod content_blocker;
 
 fn main() {
     app::run();

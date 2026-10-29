@@ -364,11 +364,16 @@ export class ViewsController {
 
 
 
-    addSection("Privacy & security", "Password and autofill changes apply to tabs loaded afterwards. Ad blocking is the uBlock Origin entry under Extensions.");
+    addSection(
+      "Privacy & security",
+      "Password, autofill and ad blocker changes apply to tabs loaded afterwards. The built-in ad blocker filters pages without running an extension, using uBlock Origin's default lists (uBlock filters, EasyList, EasyPrivacy, Peter Lowe's list), which it downloads and keeps up to date. Turn off uBlock Origin under Extensions when you use it, so pages aren't filtered twice."
+    );
     addToggle("passwordAutosave", "Save & autofill passwords", true);
     addToggle("generalAutofill", "Autofill addresses & forms", true);
     addToggle("clearHistoryOnExit", "Clear history on exit", false);
     addToggle("allowFileUrls", "Allow local file:// URLs", false);
+    addToggle("builtinAdblock", "Built-in ad blocker (experimental)", false);
+    this.renderContentBlockerStatus(form);
 
     addSection("Startup & window");
     addToggle("restoreSession", "Restore tabs on startup", false);
@@ -639,6 +644,44 @@ export class ViewsController {
     requestAnimationFrame(sync);
     layout.append(nav, form);
     return layout;
+  }
+
+  /// Filter-list state of the built-in ad blocker (content_blocker), with a
+  /// manual update.
+  private renderContentBlockerStatus(form: HTMLElement): void {
+    type Status = { enabled: boolean; ready: boolean; updated: number; blocked: number; lists: number; scriptlets: boolean };
+    const row = document.createElement("div");
+    row.className = "views-setting-row";
+    const status = document.createElement("span");
+    status.className = "views-section-sub";
+    const update = document.createElement("button");
+    update.className = "views-btn interactive";
+    update.textContent = "Update filters";
+    const show = (st: Status) => {
+      if (!st.updated) {
+        status.textContent = st.enabled ? "Downloading filter lists…" : "Filter lists download when you turn it on.";
+        return;
+      }
+      const when = new Date(st.updated * 1000).toLocaleString();
+      status.textContent = `${st.lists} filter lists, updated ${when} · ${st.blocked} requests blocked this session`;
+      if (!st.scriptlets) {
+        status.textContent += " · uBlock Origin scriptlets couldn't be downloaded, so some video ads may still play";
+      }
+    };
+    const refresh = () => invoke<Status>("content_blocker_status").then(show).catch(() => {});
+    update.addEventListener("click", () => {
+      update.disabled = true;
+      status.textContent = "Updating filter lists…";
+      invoke("content_blocker_update")
+        .catch((e) => { status.textContent = String(e); })
+        .finally(() => {
+          update.disabled = false;
+          refresh();
+        });
+    });
+    row.append(status, update);
+    form.appendChild(row);
+    refresh();
   }
 
   /// "Open with", file types, and default-browser hookup (file_assoc.rs).

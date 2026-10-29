@@ -1037,6 +1037,11 @@ pub fn run() {
             let staged = crate::extensions::rebuild_active_extensions(app.handle(), &db_state);
             tracing::info!("staged {} browser extension(s) for loading", staged);
 
+            // Built-in ad blocker: load the cached engine before tabs restore.
+            if crate::prefs::builtin_adblock() {
+                crate::content_blocker::start(app.handle());
+            }
+
             // Purge stale PROFILE extensions: AddBrowserExtension persists in the
             // shared WebView2 profile across sessions, so an extension disabled or
             // removed only in the DB + staging would keep running (stacked ad
@@ -1204,6 +1209,8 @@ pub fn run() {
             crate::extensions::extensions_open_options,
             crate::extensions::extensions_restart_app,
             crate::extensions::extensions_install_file,
+            crate::content_blocker::content_blocker_status,
+            crate::content_blocker::content_blocker_update,
             crate::extensions::extensions_install_file_dialog,
             crate::palette::palette_show,
             crate::palette::palette_hide,
