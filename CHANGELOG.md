@@ -15,7 +15,8 @@ All notable changes to Jello are documented here. This project adheres to
   slots, runs uBlock Origin's scriptlets against video ads and anti-adblock
   walls, strips tracking parameters (`$removeparam`) and applies `$csp`
   filters. It also works in InPrivate windows. On the tested sites it blocks
-  as much as the uBlock Origin extension while using about 75 MB less memory.
+  as much as the uBlock Origin extension with no extension process running,
+  using about 80–150 MB less memory and slightly less CPU.
 - **Settings > Ad blocking**: choose Built-in (recommended), the uBlock Origin
   extension, or Off. Only one ad blocker runs at a time, so switching to the
   built-in one turns uBlock Origin off, and choosing uBlock Origin installs it
