@@ -20,10 +20,13 @@ licenses, unmodified. The folder's `README.md` lists each file with its source, 
 Jello also downloads these lists, and Peter Lowe's ad server list
 (https://pgl.yoyo.org/adservers/), at runtime to keep them current.
 
-## Libraries compiled into Jello
+## Libraries and data compiled into Jello
 
 - **adblock-rust** (`adblock` crate) by Brave Software: MPL-2.0.
   https://github.com/brave/adblock-rust
+- **Public Suffix List** by Mozilla, used by fingerprinting protection to tell
+  sites apart: MPL-2.0. The unmodified list is at
+  `src-tauri/src/fingerprint/public_suffix_list.dat`. https://publicsuffix.org/
 
 Other Rust and npm dependencies are listed in `src-tauri/Cargo.lock` and
 `package-lock.json` with their licenses.

@@ -378,6 +378,7 @@ export class ViewsController {
     addToggle("generalAutofill", "Autofill addresses & forms", true);
     addToggle("clearHistoryOnExit", "Clear history on exit", false);
     addToggle("allowFileUrls", "Allow local file:// URLs", false);
+    this.renderFingerprinting(form, settings);
 
     addSection(
       "Ad blocking",
@@ -654,6 +655,68 @@ export class ViewsController {
     requestAnimationFrame(sync);
     layout.append(nav, form);
     return layout;
+  }
+
+  /// Settings > Privacy & security: fingerprinting protection and the sites
+  /// exempted from it.
+  private renderFingerprinting(form: HTMLElement, settings: Record<string, unknown>): void {
+    const row = document.createElement("label");
+    row.className = "views-setting-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "interactive";
+    cb.checked = settings.fingerprintProtection === undefined ? true : settings.fingerprintProtection !== false && settings.fingerprintProtection !== "false";
+    const text = document.createElement("span");
+    text.textContent = "Fingerprinting protection";
+    row.append(cb, text);
+    form.appendChild(row);
+
+    const sub = document.createElement("div");
+    sub.className = "views-section-sub";
+    sub.textContent =
+      "Sites see a common graphics card and screen placement, and slightly varied canvas, audio and hardware details, which change for every site and every time Jello starts. They can't use these to recognize you across sites or visits. Applies to pages loaded afterwards.";
+    form.appendChild(sub);
+
+    const exemptRow = document.createElement("div");
+    exemptRow.className = "views-setting-row";
+    exemptRow.style.cssText = "flex-wrap:wrap;cursor:default;";
+    form.appendChild(exemptRow);
+    const renderExempt = (sites: string[]) => {
+      exemptRow.innerHTML = "";
+      exemptRow.hidden = !cb.checked;
+      const label = document.createElement("span");
+      label.style.cssText = "flex:1 0 100%;";
+      label.textContent = sites.length
+        ? "Turned off on these sites:"
+        : "On for every site. If a site doesn't work right, turn it off there from the ⋯ menu.";
+      exemptRow.appendChild(label);
+      for (const site of sites) {
+        const chip = document.createElement("button");
+        chip.className = "views-btn interactive";
+        chip.textContent = `${site} ✕`;
+        chip.title = `Protect ${site} again`;
+        chip.addEventListener("click", () => {
+          invoke<boolean>("fingerprint_site_toggle", { host: site })
+            .then(() => {
+              exempt = exempt.filter((s) => s !== site);
+              renderExempt(exempt);
+            })
+            .catch(console.error);
+        });
+        exemptRow.appendChild(chip);
+      }
+    };
+    const stored = settings.fingerprintAllowedSites;
+    let exempt: string[] = [];
+    if (Array.isArray(stored)) exempt = stored.map(String);
+    else if (typeof stored === "string") {
+      try { exempt = JSON.parse(stored); } catch { exempt = []; }
+    }
+    renderExempt(exempt);
+    cb.addEventListener("change", () => {
+      invoke("fingerprint_protection_set", { enabled: cb.checked }).catch(console.error);
+      renderExempt(exempt);
+    });
   }
 
   /// Settings > Ad blocking: which blocker runs, the built-in one's filter

@@ -1048,6 +1048,9 @@ pub fn run() {
             if crate::prefs::builtin_adblock() {
                 crate::content_blocker::start(app.handle());
             }
+            // Fingerprinting protection reports the browser's client hints
+            // without the WebView2 brand; read them from Jello's own window.
+            crate::fingerprint::start(app.handle());
 
             // Purge stale PROFILE extensions: AddBrowserExtension persists in the
             // shared WebView2 profile across sessions, so an extension disabled or
@@ -1224,6 +1227,8 @@ pub fn run() {
             crate::content_blocker::content_blocker_user_filters_set,
             crate::content_blocker::content_blocker_tab_stats,
             crate::content_blocker::content_blocker_pick_element,
+            crate::fingerprint::fingerprint_protection_set,
+            crate::fingerprint::fingerprint_site_toggle,
             crate::extensions::extensions_install_file_dialog,
             crate::palette::palette_show,
             crate::palette::palette_hide,

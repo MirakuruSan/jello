@@ -145,15 +145,18 @@ const PIP_JS: &str = r#"(async (mode) => {
   pool.sort((a, b) => b.videoWidth * b.videoHeight - a.videoWidth * a.videoHeight);
   const video = pool[0];
   await video.requestPictureInPicture();
-  // Tell Jello how PiP ended: "Back to tab" keeps the video playing, the
-  // window's close button pauses it.
-  video.addEventListener("leavepictureinpicture", () => {
-    setTimeout(() => {
-      const playing = !video.paused && !video.ended;
-      window.chrome?.webview?.postMessage(playing ? "jello:pip-return" : "jello:pip-closed");
-    }, 200);
-  }, { once: true });
   return "entered";
+})"#;
+
+/// Resolves when the floating video leaves picture-in-picture: "return" when
+/// it is still playing ("Back to tab"), "closed" when the window's close
+/// button paused it.
+const PIP_WATCH_JS: &str = r#"new Promise((resolve) => {
+  const video = document.pictureInPictureElement;
+  if (!video) return resolve("closed");
+  video.addEventListener("leavepictureinpicture", () => {
+    setTimeout(() => resolve(!video.paused && !video.ended ? "return" : "closed"), 200);
+  }, { once: true });
 })"#;
 
 impl WebView2ContentView {
@@ -202,7 +205,6 @@ impl WebView2ContentView {
         serial: u64,
         webview: tauri::Webview<tauri::Wry>,
         is_incognito: bool,
-        content_blocking: bool,
     ) -> Self {
         use tauri::Manager;
         // Bound before the windows-only handler block below: the event-driven
@@ -340,41 +342,6 @@ impl WebView2ContentView {
                         if let Ok(core4) = core.cast::<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4>() {
                             let _ = core4.add_DownloadStarting(&handler, &mut token as *mut i64);
                         }
-                    }
-                }
-            });
-
-            // Picture-in-picture endings reported by PIP_JS. "Back to tab" brings
-            // Jello forward on this tab. Honored only while this view has a video
-            // in PiP, so a page can't use the message to pull Jello to the front.
-            let msg_app = webview.app_handle().clone();
-            let msg_pip = pip_active.clone();
-            let msg_auto = pip_auto.clone();
-            let msg_tab = id.0 as i32;
-            let _ = webview.with_webview(move |w| {
-                use webview2_com::WebMessageReceivedEventHandler;
-                use windows::core::PWSTR;
-                unsafe {
-                    if let Ok(core) = w.controller().CoreWebView2() {
-                        let handler = WebMessageReceivedEventHandler::create(Box::new(move |_s, args| {
-                            let Some(args) = args else { return Ok(()) };
-                            let mut raw = PWSTR::null();
-                            if args.TryGetWebMessageAsString(&mut raw).is_err() || raw.is_null() {
-                                return Ok(());
-                            }
-                            let msg = raw.to_string().unwrap_or_default();
-                            if msg != "jello:pip-return" && msg != "jello:pip-closed" {
-                                return Ok(());
-                            }
-                            msg_auto.store(false, Ordering::Relaxed);
-                            if msg_pip.swap(false, Ordering::Relaxed) && msg == "jello:pip-return" {
-                                let app = msg_app.clone();
-                                std::thread::spawn(move || crate::windows::return_from_pip(&app, msg_tab));
-                            }
-                            Ok(())
-                        }));
-                        let mut token: i64 = 0;
-                        let _ = core.add_WebMessageReceived(&handler, &mut token);
                     }
                 }
             });
@@ -602,9 +569,8 @@ impl WebView2ContentView {
             });
         }
 
-        if content_blocking {
-            crate::content_blocker::page::attach(&webview, id.0 as i32);
-        }
+        // Ad blocking and fingerprinting protection, before the first page.
+        crate::content_blocker::page::attach(&webview, id.0 as i32);
         let visible = Arc::new(AtomicBool::new(true));
         let alive = Arc::new(AtomicBool::new(true));
 
@@ -983,11 +949,13 @@ impl ContentView for WebView2ContentView {
             let pip_active = self.pip_active.clone();
             let pip_auto = self.pip_auto.clone();
             let app = self.webview.app_handle().clone();
+            let tab = self.id.0 as i32;
             let _ = self.webview.with_webview(move |w| {
                 use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
                 use windows::core::HSTRING;
                 unsafe {
                     let Ok(core) = w.controller().CoreWebView2() else { return };
+                    let watch_core = core.clone();
                     let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
                         move |_hr, json: String| {
                             let outcome = serde_json::from_str::<serde_json::Value>(&json)
@@ -998,6 +966,37 @@ impl ContentView for WebView2ContentView {
                                 "entered" => {
                                     pip_active.store(true, Ordering::Relaxed);
                                     pip_auto.store(mode == "auto", Ordering::Relaxed);
+                                    // How it ends: "Back to tab" brings Jello forward
+                                    // on this tab. A page that navigates away ends it
+                                    // too (the evaluation fails).
+                                    let watch_active = pip_active.clone();
+                                    let watch_auto = pip_auto.clone();
+                                    let watch_app = app.clone();
+                                    let params = serde_json::json!({
+                                        "expression": PIP_WATCH_JS,
+                                        "awaitPromise": true,
+                                        "returnByValue": true,
+                                    })
+                                    .to_string();
+                                    let ended = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                                        move |_hr, json: String| {
+                                            let how = serde_json::from_str::<serde_json::Value>(&json)
+                                                .ok()
+                                                .and_then(|v| v.pointer("/result/value").and_then(|r| r.as_str()).map(str::to_string))
+                                                .unwrap_or_default();
+                                            watch_auto.store(false, Ordering::Relaxed);
+                                            if watch_active.swap(false, Ordering::Relaxed) && how == "return" {
+                                                let app = watch_app.clone();
+                                                std::thread::spawn(move || crate::windows::return_from_pip(&app, tab));
+                                            }
+                                            Ok(())
+                                        },
+                                    ));
+                                    let _ = watch_core.CallDevToolsProtocolMethod(
+                                        &HSTRING::from("Runtime.evaluate"),
+                                        &HSTRING::from(params.as_str()),
+                                        &ended,
+                                    );
                                 }
                                 "exited" | "none" => {
                                     pip_active.store(false, Ordering::Relaxed);

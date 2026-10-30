@@ -1066,13 +1066,22 @@ function zoomMenuRow(): HTMLElement {
 }
 
 /// What the built-in ad blocker did on a tab's page (content_blocker_tab_stats).
-interface AdBlockStats { host: string; paused: boolean; blocked: number; log: unknown[] }
+interface AdBlockStats {
+  host: string;
+  blocking: boolean;
+  paused: boolean;
+  blocked: number;
+  log: unknown[];
+  site: string;
+  fingerprintProtection: boolean;
+  fingerprintExempt: boolean;
+}
 
 /// The ⋯ menu's ad-blocking entries for the active tab: its blocked count
 /// (opens the request list), pausing the blocker on the site, and the
 /// element picker. Empty when the built-in blocker isn't filtering the tab.
 function adBlockMenuEntries(stats: AdBlockStats | null): MenuEntry[] {
-  if (!stats || !stats.host) return [];
+  if (!stats || !stats.host || !stats.blocking) return [];
   const site = stats.host.replace(/^www\./, "");
   const tabId = activeTabId;
   return [
@@ -1099,6 +1108,33 @@ function adBlockMenuEntries(stats: AdBlockStats | null): MenuEntry[] {
   ];
 }
 
+/// The ⋯ menu's fingerprinting entry: exempt the site when protection breaks
+/// it, or protect it again. Reloads the page so the change applies.
+function fingerprintMenuEntries(stats: AdBlockStats | null): MenuEntry[] {
+  if (!stats || !stats.host || !stats.site || !stats.fingerprintProtection) return [];
+  return [
+    {
+      label: stats.fingerprintExempt
+        ? `Protect ${stats.site} from fingerprinting`
+        : `Turn off fingerprinting protection on ${stats.site}`,
+      icon: stats.fingerprintExempt ? icons.shield : icons.shieldOff,
+      onClick: () => {
+        invoke("fingerprint_site_toggle", { host: stats.host })
+          .then(() => invoke("nav_reload", {}))
+          .catch(console.error);
+      },
+    },
+  ];
+}
+
+/// Ad blocking and fingerprinting entries as one group of the ⋯ menu.
+function protectionMenuEntries(stats: AdBlockStats | null): MenuEntry[] {
+  const adBlock = adBlockMenuEntries(stats);
+  const fingerprint = fingerprintMenuEntries(stats);
+  if (adBlock.length) return [...adBlock, ...fingerprint];
+  return fingerprint.length ? ["separator", ...fingerprint] : [];
+}
+
 async function showMainMenu(anchor: HTMLElement): Promise<void> {
   const hasPage = !!activeTab() && activeTab()?.url !== "about:blank";
   const stats = hasPage
@@ -1117,7 +1153,7 @@ async function showMainMenu(anchor: HTMLElement): Promise<void> {
     { label: "Picture-in-picture", icon: icons.pip, shortcut: "Alt+P", disabled: !hasPage, onClick: () => handleShortcut("Alt+P") },
     { label: "Take screenshot", icon: icons.camera, shortcut: "Ctrl+Alt+S", onClick: () => invoke("capture_trigger", { mode: "screenshot" }).catch(console.error) },
     { label: "Full screen", icon: icons.fullscreen, shortcut: "F11", checked: document.body.classList.contains("window-fullscreen"), onClick: () => toggleFullscreen() },
-    ...adBlockMenuEntries(stats),
+    ...protectionMenuEntries(stats),
     "separator",
     { label: "Keep window on top", icon: icons.pin, checked: pinnedOnTop, onClick: () => setPinnedOnTop(!pinnedOnTop) },
     { label: "Settings", icon: icons.settings, onClick: () => views?.open("settings") },

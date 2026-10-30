@@ -6,7 +6,23 @@ All notable changes to Jello are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Fingerprinting protection, on by default.** Sites no longer see your
+  graphics card (WebGL and WebGPU report a common one), where your window sits
+  on screen or your battery state. Canvas, WebGL, audio, text and layout
+  measurements and hardware details come back slightly varied instead of
+  exact. The variations differ for every site and every time Jello starts, so
+  sites can't use your device to recognize you across sites or visits. This
+  covers embedded frames and web workers too. If a site doesn't work right,
+  turn the protection off there from the ⋯ menu; Settings > Privacy &
+  security lists those sites and switches the protection.
+- Pages see Jello as the Edge browser it is built on: they can no longer
+  detect the embedded WebView2 or Jello's own internals, client hints no
+  longer mention WebView2, and pages are told one preferred language.
+
 ### Changed
+- Edge's tracking prevention runs at its strict level, which keeps known
+  trackers from storing data on sites they are embedded in.
 - **The built-in ad blocker works from the first launch.** Jello now ships
   with a copy of the filter lists and uBlock Origin's scriptlets and updates
   them in the background. A page that opens while the blocker is still
@@ -16,7 +32,8 @@ All notable changes to Jello are documented here. This project adheres to
 ### Fixed
 - Scriptlets against video ads and anti-adblock walls now take effect before
   a page's own scripts also after going back or forward, after a redirect to
-  another site, after submitting a form and after a reload.
+  another site, after submitting a form and after a reload, and in embedded
+  frames from other sites.
 - Scriptlets that answer with one of uBlock Origin's placeholder files (such as
   an empty video ad response) now receive it, so those players behave as they
   do with the uBlock Origin extension.

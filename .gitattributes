@@ -1,2 +1,3 @@
-# Third-party filter data is shipped byte for byte as published.
+# Third-party data is shipped byte for byte as published.
 src-tauri/resources/content-blocker/** -text
+src-tauri/src/fingerprint/public_suffix_list.dat -text

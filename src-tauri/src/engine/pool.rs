@@ -364,10 +364,9 @@ impl TabPool {
         let serial = VIEW_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let label = format!("content_tab_{}_{}", id, serial);
         let is_incognito = crate::incognito::is_incognito_window(db_tab.window_id);
-        // The built-in ad blocker hooks the webview after creation, so a
-        // blocked tab starts on about:blank and navigates once hooked;
-        // otherwise its first page would load unfiltered.
-        let content_blocking = crate::prefs::builtin_adblock();
+        // Content tabs are hooked after creation (ad blocking, fingerprinting
+        // protection), so a tab starts on about:blank and navigates once
+        // hooked; its first page then waits for the hooks' scripts.
 
         // Webview creation MUST happen on the main thread — add_child from a
         // worker thread segfaults (WebView2 controller creation is tied to the
@@ -377,7 +376,7 @@ impl TabPool {
         let (tx, rx) = std::sync::mpsc::channel();
         {
             let window = window.clone();
-            let url = if content_blocking { "about:blank".to_string() } else { db_tab.url.clone() };
+            let url = "about:blank".to_string();
             let label = label.clone();
             let pos = LogicalPosition::new(rect.x as f64, rect.y as f64);
             let size = LogicalSize::new(rect.width as f64, rect.height as f64);
@@ -418,13 +417,11 @@ impl TabPool {
         // add_child had just created at a larger (e.g. maximized) size. Seed the
         // real creation rect FIRST so a page opened while the window is already
         // maximized fills it (no Resized event fires afterward to correct it).
-        let view = Box::new(WebView2ContentView::new(ViewId(id as u32), serial, webview, is_incognito, content_blocking));
+        let view = Box::new(WebView2ContentView::new(ViewId(id as u32), serial, webview, is_incognito));
         view.set_bounds(rect);
         view.set_visible(true);
         view.focus();
-        if content_blocking {
-            view.navigate(&db_tab.url);
-        }
+        view.navigate(&db_tab.url);
 
         // Restore scroll position after DOMContentLoaded
         if db_tab.scroll_y > 0.0 {

@@ -1,6 +1,7 @@
-//! Hooks the built-in ad blocker into one content webview: its network
-//! requests are checked against the engine, and each document gets its
-//! cosmetic filters and scriptlets injected when it is created.
+//! Hooks one content webview: its network requests are checked against the
+//! built-in blocker's engine, each document gets its cosmetic filters and
+//! scriptlets injected when it is created, and every document starts with
+//! the fingerprinting protection script (see crate::fingerprint).
 //!
 //! Scripts registered with `AddScriptToExecuteOnDocumentCreated` only reach
 //! documents created after the registration completes, and WebView2 holds a
@@ -25,6 +26,8 @@ const LOG_LIMIT: usize = 200;
 const HOLD_LIMIT: Duration = Duration::from_secs(5);
 /// Form posts with a larger body are not held (they load unchanged).
 const POST_BODY_LIMIT: usize = 32 << 20;
+/// Cross-site frame hosts per page whose scripts are kept for their frames.
+const CROSS_FRAME_LIMIT: usize = 8;
 
 /// Random per-session name for the page channel, the hand-over property the
 /// document-start script uses, and the path redirect resources are served
@@ -68,6 +71,10 @@ struct PageState {
     inflight: u32,
     /// The document-start script every document gets is registered.
     ready: bool,
+    /// Id and version (see `document_start_version`) of the registered
+    /// document-start script.
+    document_start: Option<String>,
+    document_start_version: u64,
     /// A cancelled navigation to start again once its scripts are in place.
     held: Option<Held>,
     /// A form post whose body is being kept to post it again.
@@ -86,6 +93,10 @@ struct PageState {
     csp_script: Option<String>,
     /// Frame hostnames that already have their script on this site.
     frame_hosts: HashSet<String>,
+    /// Scripts for the cross-site frame hosts of this page, newest last. Such
+    /// frames run in their own process; each one gets these registered on its
+    /// own DevTools session while it is held at start.
+    cross_frame_scripts: VecDeque<(String, String)>,
     /// Requests blocked since the current page started loading, newest last.
     blocked: u32,
     log: VecDeque<BlockedRequest>,
@@ -181,6 +192,46 @@ pub(super) fn engine_published() {
     }
 }
 
+/// Bumped when the document-start script changes (fingerprinting protection
+/// switched, a site exempted); pages register the new one at their next
+/// navigation.
+static DOCUMENT_START_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn document_start_changed() {
+    DOCUMENT_START_VERSION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn document_start_version() -> u64 {
+    DOCUMENT_START_VERSION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The script registered for every document: fingerprinting protection, then
+/// the page channel hand-over.
+fn document_start_script() -> String {
+    let key = serde_json::to_string(channel_key()).unwrap_or_default();
+    let mut js = crate::fingerprint::document_script().unwrap_or_default();
+    js.push_str(&format!("\n{BOOTSTRAP_JS}({key});"));
+    js
+}
+
+/// The browser's client hints are known (or could not be read): report them
+/// on every live page, then start navigations that waited for them.
+pub fn client_hints_learned() {
+    let live: Vec<_> = {
+        let pages = PAGES.lock().unwrap();
+        pages.iter().filter_map(|p| Some((p.state.upgrade()?, p.webview.clone()))).collect()
+    };
+    for (state, webview) in live {
+        #[cfg(target_os = "windows")]
+        let _ = webview.with_webview(|w| unsafe {
+            if let Ok(core) = w.controller().CoreWebView2() {
+                crate::fingerprint::apply_client_hints(&core);
+            }
+        });
+        resume(&state, &webview, None);
+    }
+}
+
 /// Start the held navigation again if nothing holds it any more: its scripts
 /// are registered, the document-start script is in place and the engine is
 /// loaded. `expired` names a hold generation whose time limit ran out.
@@ -192,7 +243,8 @@ fn resume(state: &Arc<Mutex<PageState>>, webview: &tauri::Webview<tauri::Wry>, e
         let wait_engine = crate::prefs::builtin_adblock()
             && !crate::prefs::ad_blocking_paused(&s.top_host)
             && super::engine().is_none();
-        if !expired && (s.inflight > 0 || !s.ready || wait_engine) {
+        let wait_hints = crate::fingerprint::client_hints_pending();
+        if !expired && (s.inflight > 0 || !s.ready || wait_engine || wait_hints) {
             return;
         }
         let Some(held) = s.held.take() else { return };
@@ -209,24 +261,38 @@ fn resume(state: &Arc<Mutex<PageState>>, webview: &tauri::Webview<tauri::Wry>, e
     let _ = (webview, replay);
 }
 
-/// What the built-in blocker did on a tab's current page.
+/// What the built-in blocker did on a tab's current page, and whether
+/// fingerprinting protection covers it.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabStats {
     host: String,
+    /// The built-in blocker is the selected ad blocker.
+    blocking: bool,
     paused: bool,
     blocked: u32,
     log: Vec<BlockedRequest>,
+    /// The site fingerprinting exceptions apply to (registrable domain).
+    site: String,
+    /// Fingerprinting protection is on.
+    fingerprint_protection: bool,
+    /// The site is exempted from it.
+    fingerprint_exempt: bool,
 }
 
 pub fn tab_stats(tab: i32) -> Option<TabStats> {
     let (state, _) = page(tab)?;
     let s = state.lock().ok()?;
+    let site = crate::fingerprint::registrable(&s.top_host);
     Some(TabStats {
         host: s.top_host.clone(),
+        blocking: crate::prefs::builtin_adblock(),
         paused: crate::prefs::ad_blocking_paused(&s.top_host),
         blocked: s.blocked,
         log: s.log.iter().cloned().collect(),
+        fingerprint_protection: crate::prefs::fingerprint_protection(),
+        fingerprint_exempt: crate::prefs::fingerprint_allowed_sites().contains(&site),
+        site,
     })
 }
 
@@ -491,7 +557,7 @@ fn has_header(headers: &str, name: &str) -> bool {
         .any(|l| l.split_once(':').is_some_and(|(n, _)| n.trim().eq_ignore_ascii_case(name)))
 }
 
-/// Route one content webview (tab `tab`) through the built-in blocker.
+/// Hook one content webview (tab `tab`), before its first navigation.
 pub fn attach(webview: &tauri::Webview<tauri::Wry>, tab: i32) {
     #[cfg(target_os = "windows")]
     {
@@ -515,21 +581,29 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
 
     let Ok(core) = w.controller().CoreWebView2() else { return };
     let Some(env) = core.cast::<ICoreWebView2_2>().ok().and_then(|c| c.Environment().ok()) else { return };
-    // The source-kinds filter also covers requests made inside cross-site
-    // iframes and by workers; the plain filter only sees the top document's.
     let Ok(core22) = core.cast::<ICoreWebView2_22>() else {
-        tracing::warn!("content blocker: WebView2 runtime too old for request filtering");
+        tracing::warn!("content blocker: WebView2 runtime too old for content tab hooks");
         return;
     };
+    // Tabs opened while the built-in blocker is selected route their requests
+    // through it; other tabs only intercept marked shared worker scripts
+    // (fingerprinting protection). The source-kinds filter
+    // also covers requests made inside cross-site iframes and by workers; the
+    // plain filter only sees the top document's.
     let kinds = COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_DOCUMENT
         | COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_SHARED_WORKER
         | COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_SERVICE_WORKER;
-    if core22
-        .AddWebResourceRequestedFilterWithRequestSourceKinds(&HSTRING::from("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, kinds)
-        .is_err()
-    {
-        return;
-    }
+    let pattern = if crate::prefs::builtin_adblock() {
+        "*".to_string()
+    } else {
+        // Only shared worker scripts marked by fingerprinting protection.
+        format!("*{}", crate::fingerprint::shared_worker_marker())
+    };
+    let _ = core22.AddWebResourceRequestedFilterWithRequestSourceKinds(
+        &HSTRING::from(pattern),
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+        kinds,
+    );
 
     let run_script = |core: &ICoreWebView2, js: String| {
         let done = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
@@ -539,6 +613,8 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         let url = serde_json::to_string(url).unwrap_or_default();
         run_script(core, format!("{COLLAPSE_JS}({url})"));
     };
+
+    remove_framework_scripts(&core);
 
     // The page channel (channel.rs), reachable only by Jello's own scripts.
     // Host objects reach the top-level document; frames get theirs as they
@@ -594,6 +670,20 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         let mut ctx = COREWEBVIEW2_WEB_RESOURCE_CONTEXT::default();
         let _ = args.ResourceContext(&mut ctx);
         let method = take_string(|p| req.Method(p));
+        // A shared worker's main script gets fingerprinting protection first
+        // (see fingerprint::shared_worker_script).
+        if let Some(original) = crate::fingerprint::shared_worker_original(&url) {
+            if let Some(js) = crate::fingerprint::shared_worker_script(&original) {
+                let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(js.as_bytes()));
+                let headers = "Content-Type: text/javascript\r\nCache-Control: no-store";
+                if let Ok(response) =
+                    req_env.CreateWebResourceResponse(stream.as_ref(), 200, &HSTRING::from("OK"), &HSTRING::from(headers))
+                {
+                    let _ = args.SetResponse(&response);
+                }
+                return Ok(());
+            }
+        }
         // Documents are decided by the navigation events below: top-level pages
         // always load, frames are cancelled at FrameNavigationStarting. A form
         // post being held has its body kept here and is redirected to its own
@@ -703,7 +793,10 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
             let finish = move |id: Option<String>| {
                 if let Ok(mut s) = done_state.lock() {
                     match (kind, id) {
-                        (ScriptKind::Bootstrap, _) => s.ready = true,
+                        (ScriptKind::Bootstrap, id) => {
+                            s.ready = true;
+                            s.document_start = id;
+                        }
                         (ScriptKind::Csp, Some(id)) => s.csp_script = Some(id),
                         (_, Some(id)) => s.scripts.push(id),
                         _ => {}
@@ -727,8 +820,29 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
     };
 
     // The document-start script runs first in every document from now on.
-    let key = serde_json::to_string(channel_key()).unwrap_or_default();
-    add_script(&core, format!("{BOOTSTRAP_JS}({key});"), ScriptKind::Bootstrap, 0);
+    if let Ok(mut s) = state.lock() {
+        s.document_start_version = document_start_version();
+    }
+    add_script(&core, document_start_script(), ScriptKind::Bootstrap, 0);
+
+    // Workers and cross-site frames: held at start and prepared through the
+    // DevTools protocol (fingerprinting protection, client hints, and the
+    // scriptlets of cross-site frames, which run in their own process).
+    let origin_state = state.clone();
+    let frames_state = state.clone();
+    crate::fingerprint::attach(
+        &core,
+        move || {
+            let url = origin_state.lock().map(|s| s.top_url.clone()).unwrap_or_default();
+            tauri::Url::parse(&url).map(|u| u.origin().ascii_serialization()).unwrap_or_else(|_| "null".to_string())
+        },
+        move || {
+            frames_state
+                .lock()
+                .map(|s| s.cross_frame_scripts.iter().map(|(_, js)| js.clone()).collect())
+                .unwrap_or_default()
+        },
+    );
 
     // Top-level navigations. A host's scripts stay registered while the page
     // stays on that host, so reloads and in-site navigation reuse them; moving
@@ -777,6 +891,15 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         }
         let generation = s.generation;
         s.late = false;
+        // A changed document-start script (protection settings) replaces the
+        // registered one; the navigation waits for it like for host scripts.
+        let mut stale_document_start = None;
+        let renew_document_start = s.document_start_version != document_start_version();
+        if renew_document_start {
+            stale_document_start = s.document_start.take();
+            s.ready = false;
+            s.document_start_version = document_start_version();
+        }
         let keep_csp = active && s.csp_url == url && s.csp_version == super::engine_version();
         let mut old = Vec::new();
         if !keep_csp {
@@ -788,6 +911,7 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
             s.top_host = host;
             s.host_script = false;
             s.frame_hosts.clear();
+            s.cross_frame_scripts.clear();
             old.append(&mut s.scripts);
         }
 
@@ -795,9 +919,10 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         let csp_js = if active && !keep_csp { csp_script(&url) } else { None };
         let needs_scripts = host_js.is_some() || csp_js.is_some();
         let wait_engine = active && super::engine().is_none();
+        let wait_hints = crate::fingerprint::client_hints_pending();
         // A redirect continues a navigation whose registrations may still be
         // pending (a held form post reaches here through its redirect).
-        if (needs_scripts || s.inflight > 0 || wait_engine || !s.ready) && !replayed {
+        if (needs_scripts || s.inflight > 0 || wait_engine || wait_hints || !s.ready) && !replayed {
             let replay = if posted {
                 match s.capture.take() {
                     Some(Capture { generation: g, url: u, body: Some(body) }) if redirected && g == generation && u == url => {
@@ -847,8 +972,11 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         let held = s.held.is_some();
         drop(s);
 
-        for id in old {
+        for id in old.into_iter().chain(stale_document_start) {
             let _ = core.RemoveScriptToExecuteOnDocumentCreated(&HSTRING::from(id));
+        }
+        if renew_document_start {
+            nav_add(&core, document_start_script(), ScriptKind::Bootstrap, generation);
         }
         if let Some(js) = host_js {
             nav_add(&core, js, ScriptKind::Host, generation);
@@ -917,15 +1045,50 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
             }
         }
         let Some(host) = hostname(&url) else { return Ok(()) };
-        if !frame_state.lock().map(|mut s| s.frame_hosts.insert(host)).unwrap_or(false) {
+        if !frame_state.lock().map(|mut s| s.frame_hosts.insert(host.clone())).unwrap_or(false) {
             return Ok(());
         }
-        if let Some(js) = document_script(&url, false) {
+        let Some(js) = document_script(&url, false) else { return Ok(()) };
+        // A frame from another site runs in a process of its own, which a
+        // registration made now can miss; it gets the script on its own
+        // DevTools session while held at start (fingerprint::attach).
+        let cross_site = crate::fingerprint::registrable(&host) != crate::fingerprint::registrable(&top_host);
+        if cross_site {
+            if let Ok(mut s) = frame_state.lock() {
+                if s.cross_frame_scripts.len() == CROSS_FRAME_LIMIT {
+                    s.cross_frame_scripts.pop_front();
+                }
+                s.cross_frame_scripts.push_back((host, js));
+            }
+        } else {
             frame_add(&core, js, ScriptKind::Frame, 0);
         }
         Ok(())
     }));
     let _ = core.add_FrameNavigationStarting(&on_frame, &mut token);
+}
+
+/// Remove the scripts the window framework registered while the webview was
+/// created: content pages never use them, and they would show every site the
+/// framework's globals. Script ids count up per webview from "1". WebView2
+/// registers its own `chrome.webview` setup first, as id 1, when the webview
+/// is created; the framework's scripts follow, and a marker script
+/// registered now gets the id after their last one. Ids 2 up to the marker
+/// are removed.
+#[cfg(target_os = "windows")]
+unsafe fn remove_framework_scripts(core: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2) {
+    use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
+    use windows::core::HSTRING;
+    let marker_core = core.clone();
+    let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(move |hr, id: String| {
+        if let Some(marker) = hr.ok().and_then(|_| id.parse::<u32>().ok()) {
+            for older in 2..=marker {
+                let _ = marker_core.RemoveScriptToExecuteOnDocumentCreated(&HSTRING::from(older.to_string()));
+            }
+        }
+        Ok(())
+    }));
+    let _ = core.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(";"), &handler);
 }
 
 /// Add the page channel to a frame, and to the frames it creates in turn.

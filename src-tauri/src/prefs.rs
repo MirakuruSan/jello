@@ -16,6 +16,8 @@ static GENERAL_AUTOFILL: AtomicBool = AtomicBool::new(true);
 static CLEAR_HISTORY_ON_EXIT: AtomicBool = AtomicBool::new(false);
 static AD_BLOCKER: AtomicU8 = AtomicU8::new(AdBlocker::Builtin as u8);
 static AD_BLOCKING_PAUSED: RwLock<Vec<String>> = RwLock::new(Vec::new());
+static FINGERPRINT_PROTECTION: AtomicBool = AtomicBool::new(true);
+static FINGERPRINT_ALLOWED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
 /// Which ad blocker filters pages (`adBlocker` setting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +115,25 @@ pub fn ad_blocking_paused_sites() -> Vec<String> {
     AD_BLOCKING_PAUSED.read().unwrap().clone()
 }
 
+/// Fingerprinting protection is on (the default).
+pub fn fingerprint_protection() -> bool {
+    FINGERPRINT_PROTECTION.load(Ordering::Relaxed)
+}
+
+/// Sites (registrable domains) exempted from fingerprinting protection, the
+/// `fingerprintAllowedSites` list.
+pub fn fingerprint_allowed_sites() -> Vec<String> {
+    FINGERPRINT_ALLOWED.read().unwrap().clone()
+}
+
+fn site_list(value: &serde_json::Value) -> Option<Vec<String>> {
+    let parsed = match value {
+        serde_json::Value::String(s) => serde_json::from_str::<Vec<String>>(s).ok(),
+        other => serde_json::from_value::<Vec<String>>(other.clone()).ok(),
+    }?;
+    Some(parsed.into_iter().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect())
+}
+
 fn minutes(m: u32) -> Option<Duration> {
     (m > 0).then(|| Duration::from_secs(m as u64 * 60))
 }
@@ -161,20 +182,21 @@ pub fn apply(key: &str, value: &serde_json::Value) {
             }
         }
         "adblockPausedSites" => {
-            let parsed = match value {
-                serde_json::Value::String(s) => serde_json::from_str::<Vec<String>>(s).ok(),
-                other => serde_json::from_value::<Vec<String>>(other.clone()).ok(),
-            };
-            if let Some(sites) = parsed {
-                *AD_BLOCKING_PAUSED.write().unwrap() =
-                    sites.into_iter().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+            if let Some(sites) = site_list(value) {
+                *AD_BLOCKING_PAUSED.write().unwrap() = sites;
             }
         }
-        "autoPip" | "passwordAutosave" | "generalAutofill" | "clearHistoryOnExit" => {
+        "fingerprintAllowedSites" => {
+            if let Some(sites) = site_list(value) {
+                *FINGERPRINT_ALLOWED.write().unwrap() = sites;
+            }
+        }
+        "autoPip" | "passwordAutosave" | "generalAutofill" | "clearHistoryOnExit" | "fingerprintProtection" => {
             let flag = match key {
                 "autoPip" => &AUTO_PIP,
                 "passwordAutosave" => &PASSWORD_AUTOSAVE,
                 "generalAutofill" => &GENERAL_AUTOFILL,
+                "fingerprintProtection" => &FINGERPRINT_PROTECTION,
                 _ => &CLEAR_HISTORY_ON_EXIT,
             };
             if let Some(b) = as_bool(value) {
@@ -253,6 +275,17 @@ mod tests {
         assert!(ad_blocking_paused("news.example"));
         assert!(!ad_blocking_paused("example.com"));
         apply("adblockPausedSites", &json!([]));
+
+        // Fingerprinting protection is on unless switched off; exceptions are
+        // stored as registrable domains.
+        assert!(fingerprint_protection());
+        apply("fingerprintProtection", &json!("false"));
+        assert!(!fingerprint_protection());
+        apply("fingerprintProtection", &json!(true));
+        assert!(fingerprint_protection());
+        apply("fingerprintAllowedSites", &json!("[\"Maps.Example\", \"\"]"));
+        assert_eq!(fingerprint_allowed_sites(), vec!["maps.example".to_string()]);
+        apply("fingerprintAllowedSites", &json!([]));
 
         apply("unrelatedKey", &json!("x"));
     }
