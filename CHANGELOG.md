@@ -4,6 +4,32 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- **Tabs come back with their history.** Each tab keeps its back and forward
+  pages and where you were scrolled on each. After restarting Jello,
+  unloading a tab to save memory, reopening a closed tab or duplicating one,
+  Back and Forward work as before and pages open where you left them.
+
+### Changed
+- **Pages rest while you can't see them.** When Jello's window is completely
+  covered by other windows, on another virtual desktop, hidden in the tray or
+  behind the lock screen, its pages stop drawing and videos stop decoding
+  frames, as when the window is minimized. Audio keeps playing, and pages are
+  back the moment the window is in view.
+- **YouTube's Ambient mode is off by default.** The glow it draws behind
+  videos keeps the whole page redrawing at the display's refresh rate;
+  without it, YouTube used over a third less CPU during playback in our
+  tests. Allow it again in Settings > Media.
+
+### Fixed
+- Fingerprinting protection now also hides installed fonts that a page names
+  in its own style sheets (`@font-face` rules with `local()`), whether the
+  rules are in the page, added by a script, or in a style sheet file from the
+  same site. Style sheet files from other sites can't be read by the page and
+  are left as they are.
+
 ## [0.4.14] — 2026-10-30
 
 ### Added

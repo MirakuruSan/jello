@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, WebviewBuilder, WebviewUrl, LogicalPosition, LogicalSize};
 use crate::engine::ContentView;
+use crate::engine::history::{Entry, History};
 use crate::engine::webview2::WebView2ContentView;
 use crate::ipc_types::ViewId;
 use crate::db::tabs_repo;
@@ -29,6 +30,9 @@ pub struct TabPool {
     /// unfinished. WebView2 cancels a download when its view closes, so these
     /// stay alive, hidden, until reap_parked() finds them idle.
     parked: Vec<Box<dyn ContentView + Send + Sync>>,
+    /// The window is hidden from view (see set_window_hidden); a page
+    /// activated meanwhile starts hidden too.
+    window_hidden: std::sync::atomic::AtomicBool,
 }
 
 /// Unique suffix for content webview labels: tab ids are reused by SQLite, and
@@ -221,26 +225,82 @@ impl TabPool {
     /// Cold (it reloads from the saved state on next activation).
     fn unload_to_cold(&mut self, db: &crate::db::DbState, id: i32) {
         if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.remove(&id) {
-            let snapshot = view.snapshot();
-            // A view still on about:blank never committed its page; keep the
-            // stored URL rather than overwriting it with the blank document.
-            if !snapshot.url.is_empty() && snapshot.url != "about:blank" {
-                if id < 0 {
-                    crate::incognito::update_incognito_tab(id, snapshot.url, Some(snapshot.title), snapshot.scroll_y);
-                } else {
-                    db.execute(move |conn| {
-                        if let Ok(Some(mut db_tab)) = tabs_repo::get_tab(conn, id) {
-                            db_tab.url = snapshot.url;
-                            db_tab.title = Some(snapshot.title);
-                            db_tab.scroll_y = snapshot.scroll_y;
-                            let _ = tabs_repo::update_tab(conn, &db_tab);
-                        }
-                    });
-                }
-            }
+            Self::save_view(db, id, view.as_ref());
             self.retire(view);
         }
         self.tabs.insert(id, TabState::Cold);
+    }
+
+    /// Write a loaded tab's page, scroll position and back/forward entries
+    /// to its row (or the incognito store), so it comes back as it is now.
+    fn save_view(db: &crate::db::DbState, id: i32, view: &(dyn ContentView + Send + Sync)) {
+        let snapshot = view.snapshot();
+        // A view still on about:blank never committed its page; keep the
+        // stored URL rather than overwriting it with the blank document.
+        if snapshot.url.is_empty() || snapshot.url == "about:blank" {
+            return;
+        }
+        if id < 0 {
+            crate::incognito::update_incognito_tab(id, snapshot.url, Some(snapshot.title), snapshot.scroll_y);
+            return;
+        }
+        let history = view.history().map(|h| h.to_json());
+        db.execute(move |conn| {
+            if let Ok(Some(mut db_tab)) = tabs_repo::get_tab(conn, id) {
+                db_tab.url = snapshot.url;
+                db_tab.title = Some(snapshot.title);
+                db_tab.scroll_y = snapshot.scroll_y;
+                let _ = tabs_repo::update_tab(conn, &db_tab);
+                if let Some(history) = history {
+                    let _ = tabs_repo::set_history(conn, id, Some(&history));
+                }
+            }
+        });
+    }
+
+    /// Save tab `id`'s current state if it is loaded (before it is closed or
+    /// duplicated).
+    pub fn save_tab(&self, db: &crate::db::DbState, id: i32) {
+        if let Some(TabState::Live { view, .. } | TabState::Suspended { view, .. }) = self.tabs.get(&id) {
+            Self::save_view(db, id, view.as_ref());
+        }
+    }
+
+    /// Save every loaded tab's state (on exit).
+    pub fn save_all(&self, db: &crate::db::DbState) {
+        for (&id, state) in &self.tabs {
+            if let TabState::Live { view, .. } | TabState::Suspended { view, .. } = state {
+                Self::save_view(db, id, view.as_ref());
+            }
+        }
+    }
+
+    /// The history a cold tab comes back with: its saved entries, or just its
+    /// page and scroll position. A stored URL that is not the saved current
+    /// entry (the tab was sent somewhere while unloaded) becomes a new entry.
+    fn saved_history(db: &crate::db::DbState, tab: &crate::ipc_types::Tab) -> History {
+        let stored = if tab.id < 0 {
+            None
+        } else {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let id = tab.id;
+            db.execute(move |conn| {
+                let _ = tx.send(tabs_repo::get_history(conn, id).ok().flatten());
+            });
+            rx.recv().ok().flatten()
+        };
+        match stored.as_deref().and_then(History::parse) {
+            Some(h) if h.current().is_some_and(|e| e.url == tab.url) => h,
+            Some(h) if crate::engine::history::is_restorable(&tab.url) => h.navigated(&tab.url),
+            _ => History {
+                index: 0,
+                entries: vec![Entry {
+                    url: tab.url.clone(),
+                    title: tab.title.clone().unwrap_or_default(),
+                    scroll: tab.scroll_y,
+                }],
+            },
+        }
     }
 
     pub fn activate_tab(&mut self, db: &crate::db::DbState, id: i32, app: &AppHandle) -> Result<(), String> {
@@ -318,6 +378,9 @@ impl TabPool {
         }
 
         let rect = crate::windows::content_rect(&window);
+        // A page shown while the window is out of sight rests until it is seen;
+        // one that was the visible page when the window was hidden wakes now.
+        let hidden = self.window_hidden.load(std::sync::atomic::Ordering::Relaxed);
 
         // If it's already Live, update timestamp, resize it, and make visible
         if let Some(TabState::Live { last_active, view }) = self.tabs.get_mut(&id) {
@@ -325,6 +388,7 @@ impl TabPool {
             view.set_bounds(rect);
             view.set_visible(true);
             view.set_memory_target(false);
+            view.set_page_hidden(hidden);
             view.picture_in_picture(crate::engine::PipRequest::ExitAuto);
             // Activation = the user is switching to this page: move keyboard
             // focus into it so accelerators/typing work without a click.
@@ -341,6 +405,7 @@ impl TabPool {
                 view.set_bounds(rect);
                 view.set_visible(true);
                 view.set_memory_target(false);
+                view.set_page_hidden(hidden);
                 view.picture_in_picture(crate::engine::PipRequest::ExitAuto);
                 view.focus();
                 self.tabs.insert(id, TabState::Live {
@@ -410,8 +475,6 @@ impl TabPool {
         let webview = rx.recv_timeout(Duration::from_secs(15))
             .map_err(|_| "webview creation timed out on main thread".to_string())??;
 
-        let webview_clone = webview.clone();
-
         // Create ContentView wrapper. Its internal bounds default to 800x600 and
         // set_visible re-applies that default — which shrank a webview that
         // add_child had just created at a larger (e.g. maximized) size. Seed the
@@ -420,17 +483,13 @@ impl TabPool {
         let view = Box::new(WebView2ContentView::new(ViewId(id as u32), serial, webview, is_incognito));
         view.set_bounds(rect);
         view.set_visible(true);
-        view.focus();
-        view.navigate(&db_tab.url);
-
-        // Restore scroll position after DOMContentLoaded
-        if db_tab.scroll_y > 0.0 {
-            let scroll_js = format!("window.scrollTo(0, {})", db_tab.scroll_y);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(500));
-                let _ = webview_clone.eval(&scroll_js);
-            });
+        if hidden {
+            view.set_page_hidden(true);
+            view.set_memory_target(true);
         }
+        view.focus();
+        // Its page, scroll position and back/forward entries as they were.
+        view.restore(&Self::saved_history(db, &db_tab));
 
         self.tabs.insert(id, TabState::Live {
             view: view as Box<dyn ContentView + Send + Sync>,
@@ -631,19 +690,21 @@ impl TabPool {
         }
     }
 
-    /// The window was minimized or restored. While minimized the visible page
-    /// is marked hidden, so it stops painting and its timers are throttled,
-    /// and every view trims its memory. Restoring shows the page again at
-    /// normal memory use; background tabs keep their LOW target.
-    pub fn set_window_minimized(&self, minimized: bool) {
-        if minimized {
+    /// The window was hidden from view (minimized, covered, on another
+    /// desktop) or shown again. While hidden the visible page is marked
+    /// hidden, so it stops painting and its timers are throttled, and every
+    /// view trims its memory. Showing brings the page back at normal memory
+    /// use; background tabs keep their LOW target.
+    pub fn set_window_hidden(&self, hidden: bool) {
+        self.window_hidden.store(hidden, std::sync::atomic::Ordering::Relaxed);
+        if hidden {
             self.set_memory_target_all(true);
         } else {
             self.restore_active_memory_target();
         }
         if let Some(id) = self.active_tab_id {
             if let Some(TabState::Live { view, .. }) = self.tabs.get(&id) {
-                view.set_page_hidden(minimized);
+                view.set_page_hidden(hidden);
             }
         }
     }

@@ -306,7 +306,11 @@ pub fn tabs_close_impl(
         rx_win.recv().unwrap_or(0)
     };
 
-    // Snapshot the tab for the undo stack before removing it.
+    // Snapshot the tab for the undo stack before removing it, with its page,
+    // scroll position and back/forward entries as they are now.
+    if remember {
+        pool.lock().unwrap().save_tab(db, id);
+    }
     let closing_tab = if !remember {
         None
     } else if id < 0 {
@@ -570,9 +574,11 @@ pub async fn tabs_set_muted(
 pub async fn tabs_duplicate(
     id: i32,
     db: State<'_, DbState>,
-    _pool: State<'_, Arc<Mutex<TabPool>>>,
+    pool: State<'_, Arc<Mutex<TabPool>>>,
     app: AppHandle,
 ) -> Result<Tab, String> {
+    // The duplicate starts with the source's page and back/forward entries.
+    pool.lock().unwrap().save_tab(&db, id);
     let source_tab = if id < 0 {
         crate::incognito::get_incognito_tab(id)
             .ok_or_else(|| "Source tab not found".to_string())?
@@ -635,8 +641,10 @@ pub async fn tabs_duplicate(
         let db_clone2 = db.clone();
         db_clone2.execute(move |conn| {
             let res = (|| -> rusqlite::Result<Tab> {
-                let id = tabs_repo::insert_tab(conn, &duplicate_tab)?;
-                let tab = tabs_repo::get_tab(conn, id)?.unwrap();
+                let history = tabs_repo::get_history(conn, id)?;
+                let new_id = tabs_repo::insert_tab(conn, &duplicate_tab)?;
+                tabs_repo::set_history(conn, new_id, history.as_deref())?;
+                let tab = tabs_repo::get_tab(conn, new_id)?.unwrap();
                 Ok(tab)
             })();
             let _ = tx_ins.send(res);
@@ -689,8 +697,9 @@ pub async fn tabs_reopen_closed(
     });
     let popped = rx.recv().unwrap_or(Ok(None)).map_err(|e| e.to_string())?;
 
-    if let Some(mut t) = popped {
-        // Re-insert as a new row (fresh id), preserving url/title/order/pinned.
+    if let Some((mut t, history)) = popped {
+        // Re-insert as a new row (fresh id), preserving url/title/order/pinned
+        // and its back/forward entries.
         t.id = 0;
         t.last_active = None;
         let insert_tab = t.clone();
@@ -699,6 +708,7 @@ pub async fn tabs_reopen_closed(
         db_ins.execute(move |conn| {
             let res = (|| -> rusqlite::Result<Tab> {
                 let id = tabs_repo::insert_tab(conn, &insert_tab)?;
+                tabs_repo::set_history(conn, id, history.as_deref())?;
                 Ok(tabs_repo::get_tab(conn, id)?.unwrap())
             })();
             let _ = tx2.send(res);

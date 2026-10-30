@@ -75,6 +75,12 @@ pub async fn session_restore_last(
 /// "Clear history on exit" is on. Wired from the RunEvent handler.
 pub fn on_exit(app: &AppHandle) {
     let db = app.state::<DbState>();
+    // Loaded tabs keep their page, scroll position and back/forward entries
+    // (their history is saved as it changes, so a busy pool only costs the
+    // latest scroll positions).
+    if let Ok(pool) = app.state::<Arc<Mutex<TabPool>>>().try_lock() {
+        pool.save_all(&db);
+    }
     save_session(&db);
     if crate::prefs::clear_history_on_exit() {
         let (tx, rx) = std::sync::mpsc::channel();

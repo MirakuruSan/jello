@@ -1,5 +1,5 @@
 use tauri::{AppHandle, WebviewUrl, WebviewWindowBuilder, Manager};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 /// Raw Win32 HWND of the "main" window, stored at creation on the main thread
 /// (`window.hwnd()` is safe there). Used by the self-healing show/hide helpers
@@ -503,6 +503,13 @@ pub async fn window_start_drag(window: tauri::Window, x: f64, y: f64, edge: Opti
     }
 }
 
+/// Why the main window's pages are resting: minimized, or nobody can see the
+/// window (platform::win_occlusion). `MAIN_HIDDEN` is what was last applied.
+static MAIN_MINIMIZED: AtomicBool = AtomicBool::new(false);
+static MAIN_OCCLUDED: AtomicBool = AtomicBool::new(false);
+static MAIN_HIDDEN: AtomicBool = AtomicBool::new(false);
+static MAIN_HIDDEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The main window was minimized or restored. Minimizing floats a playing video
 /// (auto picture-in-picture) and, a moment later, once the video has floated,
 /// hides the page from the engine and trims memory. Restoring undoes both.
@@ -510,7 +517,6 @@ pub fn on_main_minimized(app: &AppHandle, minimized: bool) {
     let req = if minimized { crate::engine::PipRequest::Auto } else { crate::engine::PipRequest::ExitAuto };
     pip_active_tab(app, req);
     let app = app.clone();
-    let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>().inner().clone();
     std::thread::spawn(move || {
         if minimized {
             std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -519,17 +525,41 @@ pub fn on_main_minimized(app: &AppHandle, minimized: bool) {
                 return;
             }
         }
-        if let Ok(p) = pool.lock() {
-            p.set_window_minimized(minimized);
-        };
-        // The toolbar layer rests too: its timers throttle and it stops painting.
-        #[cfg(target_os = "windows")]
-        if let Some(overlay) = app.get_webview("main") {
-            let _ = overlay.with_webview(move |w| unsafe {
-                let _ = w.controller().SetIsVisible(!minimized);
-            });
-        }
+        MAIN_MINIMIZED.store(minimized, Ordering::SeqCst);
+        apply_main_hidden(&app);
     });
+}
+
+/// Nobody can see the main window any more (covered, on another desktop,
+/// hidden, locked screen), or someone can again. Its pages rest meanwhile,
+/// as while minimized, but no video is floated: the user put something else
+/// in front on purpose.
+pub fn on_main_occluded(app: &AppHandle, occluded: bool) {
+    MAIN_OCCLUDED.store(occluded, Ordering::SeqCst);
+    let app = app.clone();
+    std::thread::spawn(move || apply_main_hidden(&app));
+}
+
+/// Rest or wake the main window's pages: the visible page is hidden from the
+/// engine and every view trims its memory, and the toolbar layer's timers
+/// throttle and it stops painting.
+fn apply_main_hidden(app: &AppHandle) {
+    let _serial = MAIN_HIDDEN_LOCK.lock();
+    let hidden = MAIN_MINIMIZED.load(Ordering::SeqCst) || MAIN_OCCLUDED.load(Ordering::SeqCst);
+    if MAIN_HIDDEN.swap(hidden, Ordering::SeqCst) == hidden {
+        return;
+    }
+    tracing::info!("main window pages {}", if hidden { "resting" } else { "shown" });
+    let pool = app.state::<std::sync::Arc<std::sync::Mutex<crate::engine::pool::TabPool>>>().inner().clone();
+    if let Ok(p) = pool.lock() {
+        p.set_window_hidden(hidden);
+    };
+    #[cfg(target_os = "windows")]
+    if let Some(overlay) = app.get_webview("main") {
+        let _ = overlay.with_webview(move |w| unsafe {
+            let _ = w.controller().SetIsVisible(!hidden);
+        });
+    }
 }
 
 /// Send a picture-in-picture request to the active tab without blocking the

@@ -217,13 +217,24 @@ mod tests {
         assert!(tabs_repo::pop_closed_tab(&conn, 1).unwrap().is_none());
 
         tabs_repo::push_closed_tab(&conn, &tab).unwrap();
-        let restored = tabs_repo::pop_closed_tab(&conn, 1).unwrap().unwrap();
+        let (restored, history) = tabs_repo::pop_closed_tab(&conn, 1).unwrap().unwrap();
         assert_eq!(restored.url, "https://reopen.test/path");
         assert_eq!(restored.order_key, "a5");
         assert!(restored.pinned);
+        assert!(history.is_none());
 
         // Stack is now empty again (popped).
         assert!(tabs_repo::pop_closed_tab(&conn, 1).unwrap().is_none());
+
+        // A closed tab keeps its back/forward entries.
+        let id = tabs_repo::insert_tab(&conn, &tab).unwrap();
+        let saved = r#"{"index":0,"entries":[{"url":"https://reopen.test/path","title":"","scroll":0.0}]}"#;
+        tabs_repo::set_history(&conn, id, Some(saved)).unwrap();
+        tabs_repo::push_closed_tab(&conn, &Tab { id, ..tab.clone() }).unwrap();
+        let (_, history) = tabs_repo::pop_closed_tab(&conn, 1).unwrap().unwrap();
+        assert_eq!(history.as_deref(), Some(saved));
+        assert_eq!(tabs_repo::get_history(&conn, id).unwrap().as_deref(), Some(saved));
+        tabs_repo::delete_tab(&conn, id).unwrap();
 
         // Cap at 25 per window.
         for i in 0..30 {

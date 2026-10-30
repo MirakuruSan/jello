@@ -467,6 +467,7 @@ export class ViewsController {
 
     addSection("Media");
     addToggle("autoPip", "Float a playing video in picture-in-picture when you switch tabs or minimize (Alt+P toggles it any time)", true);
+    addToggle("youtubeAmbientMode", "Allow YouTube's Ambient mode (its glow behind videos costs CPU and GPU, so Jello turns it off unless this is on)", false);
 
     this.renderFilesSection(form, addSection);
 

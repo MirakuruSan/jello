@@ -1,5 +1,7 @@
+use crate::engine::history::{self, History};
 use crate::engine::{ContentView, PipRequest, Rect, TabRuntimeState};
 use crate::ipc_types::ViewId;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +40,117 @@ struct JsSnapshot {
 
 /// Scroll position only — polled slowly since there is no scroll event.
 const SCROLL_JS: &str = "(window.scrollY||0).toString()";
+
+/// Scrolls a restored page back to where it was, retrying while the page is
+/// still growing, until the user scrolls or presses a key.
+const SCROLL_RESTORE_JS: &str = r#"((y) => {
+  let tries = 0;
+  const stop = () => (tries = 40);
+  for (const type of ["wheel", "keydown", "mousedown", "touchstart"]) {
+    addEventListener(type, stop, { once: true, capture: true, passive: true });
+  }
+  const step = () => {
+    if (tries++ >= 40) return;
+    scrollTo(0, y);
+    if (Math.abs(scrollY - y) > 1) setTimeout(step, 250);
+  };
+  step();
+})"#;
+
+/// The view's session history between HistoryChanged events: the last one
+/// read, the current entry while it is a page whose scroll position is kept,
+/// and the scroll positions recorded per entry.
+#[derive(Default)]
+struct NavState {
+    history: Option<History>,
+    current_id: Option<i64>,
+    scroll: HashMap<i64, f64>,
+    /// A restored page to scroll once it has loaded.
+    pending_scroll: Option<PendingScroll>,
+    /// A history to build in the restore page once it has loaded.
+    pending_restore: Option<History>,
+}
+
+struct PendingScroll {
+    url: String,
+    y: f64,
+    /// The navigation loading `url`, once it has started.
+    navigation: Option<u64>,
+}
+
+impl NavState {
+    fn record_scroll(&mut self, y: f64) {
+        let Some(id) = self.current_id else { return };
+        self.scroll.insert(id, y);
+        if let Some(entry) = self.history.as_mut().and_then(|h| h.entries.get_mut(h.index)) {
+            entry.scroll = y;
+        }
+    }
+
+    fn record_title(&mut self, title: &str) {
+        if self.current_id.is_none() {
+            return;
+        }
+        if let Some(entry) = self.history.as_mut().and_then(|h| h.entries.get_mut(h.index)) {
+            entry.title = title.to_string();
+        }
+    }
+
+    /// Take in a `Page.getNavigationHistory` reply. Returns the history to
+    /// save when the current entry is a page; while the restore page is
+    /// still building or replacing itself, the last history stands.
+    fn update(&mut self, reply: &serde_json::Value) -> Option<History> {
+        let entries = reply.get("entries")?.as_array()?;
+        let ids: std::collections::HashSet<i64> =
+            entries.iter().filter_map(|e| e.get("id").and_then(|v| v.as_i64())).collect();
+        self.scroll.retain(|id, _| ids.contains(id));
+        let current = reply.get("currentIndex").and_then(|i| i.as_u64()).and_then(|i| entries.get(i as usize));
+        self.current_id = current
+            .filter(|e| e.get("url").and_then(|u| u.as_str()).is_some_and(history::is_restorable))
+            .and_then(|e| e.get("id").and_then(|v| v.as_i64()));
+        self.current_id?;
+        let saved = History::from_navigation(reply, |id| self.scroll.get(&id).copied())?;
+        self.history = Some(saved.clone());
+        Some(saved)
+    }
+}
+
+/// Run `steps` (history::build_steps) in the page one after another, each
+/// waiting for the one before, with a user gesture where it asks for one.
+#[cfg(target_os = "windows")]
+fn run_steps(
+    core: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    mut steps: std::collections::VecDeque<(String, bool)>,
+) {
+    let Some((expression, gesture)) = steps.pop_front() else { return };
+    let params = serde_json::json!({ "expression": expression, "userGesture": gesture }).to_string();
+    let next = core.clone();
+    let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, _reply: String| {
+        if hr.is_ok() {
+            run_steps(next.clone(), std::mem::take(&mut steps));
+        }
+        Ok(())
+    }));
+    unsafe {
+        let _ = core.CallDevToolsProtocolMethod(
+            &windows::core::HSTRING::from("Runtime.evaluate"),
+            &windows::core::HSTRING::from(params),
+            &handler,
+        );
+    }
+}
+
+/// Reads a COM string out-parameter and frees it.
+#[cfg(target_os = "windows")]
+fn take_string(get: impl FnOnce(*mut windows::core::PWSTR) -> windows::core::Result<()>) -> String {
+    let mut p = windows::core::PWSTR::null();
+    if get(&mut p).is_err() || p.is_null() {
+        return String::new();
+    }
+    let s = unsafe { p.to_string() }.unwrap_or_default();
+    unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _)) };
+    s
+}
 
 /// Write a tab's freshly-changed URL and/or title through to the DB (or the
 /// incognito store) and emit `tab:updated` so the overlay + tab panel refresh
@@ -124,6 +237,7 @@ pub struct WebView2ContentView {
     /// the user) put it there.
     pip_active: Arc<AtomicBool>,
     pip_auto: Arc<AtomicBool>,
+    nav: Arc<Mutex<NavState>>,
 }
 
 /// Picks the video to float and enters/leaves picture-in-picture. Runs through
@@ -166,8 +280,12 @@ impl WebView2ContentView {
     fn spawn_cache_refresh(&self) {
         let cache = self.cache.clone();
         let js_cache = cache.clone();
+        let js_nav = self.nav.clone();
         let _ = self.webview.eval_with_callback(SNAPSHOT_JS, move |res| {
             if let Ok(parsed) = serde_json::from_str::<JsSnapshot>(&res) {
+                if let Ok(mut n) = js_nav.lock() {
+                    n.record_scroll(parsed.scroll_y);
+                }
                 if let Ok(mut c) = js_cache.lock() {
                     c.title = parsed.title;
                     c.favicon_url = parsed.favicon_url;
@@ -175,9 +293,9 @@ impl WebView2ContentView {
                 }
             }
         });
-        if let Ok(u) = self.webview.url() {
+        if let Some(u) = self.page_url() {
             if let Ok(mut c) = cache.lock() {
-                c.url = u.to_string();
+                c.url = u;
             }
         }
         #[cfg(target_os = "windows")]
@@ -198,6 +316,19 @@ impl WebView2ContentView {
                 }
             });
         }
+    }
+
+    /// The page the view shows. While the restore page is up, that is the
+    /// page it is about to replace itself with.
+    fn page_url(&self) -> Option<String> {
+        let url = self.webview.url().ok()?.to_string();
+        if !history::is_restore_url(&url) {
+            return Some(url);
+        }
+        history::entry_of_restore_url(&url).map(|e| e.url).or_else(|| {
+            let n = self.nav.lock().ok()?;
+            n.history.as_ref()?.current().map(|e| e.url.clone())
+        })
     }
 
     pub fn new(
@@ -221,6 +352,7 @@ impl WebView2ContentView {
         let download_seen = Arc::new(AtomicBool::new(false));
         let pip_active = Arc::new(AtomicBool::new(false));
         let pip_auto = Arc::new(AtomicBool::new(false));
+        let nav = Arc::new(Mutex::new(NavState::default()));
         #[cfg(target_os = "windows")]
         {
             let app_handle = webview.app_handle().clone();
@@ -441,6 +573,7 @@ impl WebView2ContentView {
             let meta_incog = is_incognito;
             let meta_cache = cache.clone();
             let meta_nav_pending = nav_pending_since.clone();
+            let meta_nav = nav.clone();
             let _ = webview.with_webview(move |w| {
                 use webview2_com::{DocumentTitleChangedEventHandler, SourceChangedEventHandler, FaviconChangedEventHandler};
                 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_15;
@@ -448,15 +581,21 @@ impl WebView2ContentView {
                 use tauri::Emitter;
                 unsafe {
                     if let Ok(core) = w.controller().CoreWebView2() {
-                        // Title changes
+                        // Title changes. The restore page's titles belong to the
+                        // pages it stands for, which report their own next.
                         let t_app = meta_app.clone();
                         let t_cache = meta_cache.clone();
+                        let t_nav = meta_nav.clone();
                         let title_handler = DocumentTitleChangedEventHandler::create(Box::new(move |sender, _args| {
                             if let Some(core) = sender {
+                                if history::is_restore_url(&take_string(|p| core.Source(p))) {
+                                    return Ok(());
+                                }
                                 let mut title = PWSTR::null();
                                 if core.DocumentTitle(&mut title).is_ok() && !title.is_null() {
                                     let title_str = title.to_string().unwrap_or_default();
                                     if let Ok(mut c) = t_cache.lock() { c.title = title_str.clone(); }
+                                    if let Ok(mut n) = t_nav.lock() { n.record_title(&title_str); }
                                     persist_tab_meta(&t_app, meta_view_id, None, Some(title_str), meta_incog);
                                 }
                             }
@@ -465,7 +604,9 @@ impl WebView2ContentView {
                         let mut tok: i64 = 0;
                         let _ = core.add_DocumentTitleChanged(&title_handler, &mut tok as *mut i64);
 
-                        // URL (Source) changes
+                        // URL (Source) changes. The restore page's entries are
+                        // not visits: the tab keeps the URL of the page it is
+                        // restoring until that page replaces them.
                         let s_app = meta_app.clone();
                         let s_cache = meta_cache.clone();
                         let src_handler = SourceChangedEventHandler::create(Box::new(move |sender, _args| {
@@ -473,7 +614,7 @@ impl WebView2ContentView {
                                 let mut src = PWSTR::null();
                                 if core.Source(&mut src).is_ok() && !src.is_null() {
                                     let url = src.to_string().unwrap_or_default();
-                                    if !url.is_empty() {
+                                    if !url.is_empty() && !history::is_restore_url(&url) {
                                         if let Ok(mut c) = s_cache.lock() { c.url = url.clone(); }
                                         persist_tab_meta(&s_app, meta_view_id, Some(url), None, meta_incog);
                                     }
@@ -535,12 +676,33 @@ impl WebView2ContentView {
                         use webview2_com::{NavigationStartingEventHandler, NavigationCompletedEventHandler};
                         let ns_app = meta_app.clone();
                         let ns_pending = meta_nav_pending.clone();
-                        let ns_handler = NavigationStartingEventHandler::create(Box::new(move |_s, a| {
+                        let ns_nav = meta_nav.clone();
+                        let ns_handler = NavigationStartingEventHandler::create(Box::new(move |s, a| {
                             ns_pending.store(now_millis(), Ordering::Relaxed);
                             if let Some(a) = a {
-                                let mut urip = windows::core::PWSTR::null();
-                                let url = a.Uri(&mut urip).ok().and_then(|_| urip.to_string().ok()).unwrap_or_default();
+                                let url = take_string(|p| a.Uri(p));
                                 tracing::info!("nav starting tab {}: {}", meta_view_id, url);
+                                let mut navigation = 0u64;
+                                let _ = a.NavigationId(&mut navigation);
+                                let source = s.map(|core| take_string(|p| core.Source(p))).unwrap_or_default();
+                                if let Ok(mut n) = ns_nav.lock() {
+                                    // The page being left keeps the scroll position last recorded.
+                                    n.current_id = None;
+                                    // A restore page entry replacing itself with its page,
+                                    // or a restored page opened directly: scroll it back to
+                                    // where it was once it has loaded.
+                                    match history::entry_of_restore_url(&source) {
+                                        Some(entry) if entry.url == url && entry.scroll > 0.0 => {
+                                            n.pending_scroll =
+                                                Some(PendingScroll { url, y: entry.scroll, navigation: Some(navigation) });
+                                        }
+                                        _ => {
+                                            if let Some(p) = n.pending_scroll.as_mut().filter(|p| p.url == url) {
+                                                p.navigation = Some(navigation);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             let _ = ns_app.emit("nav:loading", serde_json::json!({"tabId": meta_view_id, "loading": true}));
                             Ok(())
@@ -550,7 +712,8 @@ impl WebView2ContentView {
 
                         let nc_app = meta_app.clone();
                         let nc_pending = meta_nav_pending.clone();
-                        let nc_handler = NavigationCompletedEventHandler::create(Box::new(move |_s, a| {
+                        let nc_nav = meta_nav.clone();
+                        let nc_handler = NavigationCompletedEventHandler::create(Box::new(move |s, a| {
                             nc_pending.store(0, Ordering::Relaxed);
                             if let Some(a) = a {
                                 let mut ok = windows::core::BOOL::default();
@@ -558,12 +721,110 @@ impl WebView2ContentView {
                                 let _ = a.IsSuccess(&mut ok);
                                 let _ = a.WebErrorStatus(&mut status);
                                 tracing::info!("nav completed tab {}: success={:?} status={:?}", meta_view_id, ok.as_bool(), status);
+                                let mut navigation = 0u64;
+                                let _ = a.NavigationId(&mut navigation);
+                                let source = s.as_ref().map(|core| take_string(|p| core.Source(p))).unwrap_or_default();
+                                let (scroll, restore) = nc_nav
+                                    .lock()
+                                    .map(|mut n| {
+                                        let scroll = n.pending_scroll.as_ref().filter(|p| p.navigation == Some(navigation)).map(|p| p.y);
+                                        if scroll.is_some() {
+                                            n.pending_scroll = None;
+                                        }
+                                        // The restore page is up: build the saved history in it.
+                                        let restore = (ok.as_bool() && source == history::start_url())
+                                            .then(|| n.pending_restore.take())
+                                            .flatten();
+                                        (scroll.filter(|_| ok.as_bool()), restore)
+                                    })
+                                    .unwrap_or((None, None));
+                                if let (Some(y), Some(core)) = (scroll, s.as_ref()) {
+                                    let done = webview2_com::ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
+                                    let _ = core.ExecuteScript(
+                                        &windows::core::HSTRING::from(format!("{SCROLL_RESTORE_JS}({y})")),
+                                        &done,
+                                    );
+                                }
+                                if let (Some(saved), Some(core)) = (restore, s) {
+                                    run_steps(core, history::build_steps(&saved).into());
+                                }
                             }
                             let _ = nc_app.emit("nav:loading", serde_json::json!({"tabId": meta_view_id, "loading": false}));
                             Ok(())
                         }));
                         let mut tok5: i64 = 0;
                         let _ = core.add_NavigationCompleted(&nc_handler, &mut tok5 as *mut i64);
+
+                        // Session history: read it whenever it changes and keep it
+                        // with the tab, so the tab comes back with it.
+                        let h_nav = meta_nav.clone();
+                        let h_app = meta_app.clone();
+                        let history_handler = webview2_com::HistoryChangedEventHandler::create(Box::new(move |sender, _| {
+                            let Some(core) = sender else { return Ok(()) };
+                            let nav = h_nav.clone();
+                            let app = h_app.clone();
+                            let done = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                                move |hr, reply: String| {
+                                    if hr.is_err() {
+                                        return Ok(());
+                                    }
+                                    let Ok(reply) = serde_json::from_str::<serde_json::Value>(&reply) else { return Ok(()) };
+                                    let saved = nav.lock().ok().and_then(|mut n| n.update(&reply));
+                                    if let Some(saved) = saved.filter(|_| !meta_incog && meta_view_id >= 0) {
+                                        let json = saved.to_json();
+                                        app.state::<crate::db::DbState>().execute(move |conn| {
+                                            let _ = crate::db::tabs_repo::set_history(conn, meta_view_id, Some(&json));
+                                        });
+                                    }
+                                    Ok(())
+                                },
+                            ));
+                            let _ = core.CallDevToolsProtocolMethod(
+                                &windows::core::HSTRING::from("Page.getNavigationHistory"),
+                                &windows::core::HSTRING::from("{}"),
+                                &done,
+                            );
+                            Ok(())
+                        }));
+                        let mut tok7: i64 = 0;
+                        let _ = core.add_HistoryChanged(&history_handler, &mut tok7);
+
+                        // The restore page (engine::history) is answered here and
+                        // never reaches the network.
+                        use webview2_com::Microsoft::Web::WebView2::Win32::{
+                            ICoreWebView2_2, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                        };
+                        if let Ok(env) = core.cast::<ICoreWebView2_2>().and_then(|c| c.Environment()) {
+                            let _ = core.AddWebResourceRequestedFilter(
+                                &windows::core::HSTRING::from(format!("{}/*", history::RESTORE_ORIGIN)),
+                                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                            );
+                            let restore_handler = webview2_com::WebResourceRequestedEventHandler::create(Box::new(
+                                move |_, args| {
+                                    let Some(args) = args else { return Ok(()) };
+                                    let Ok(request) = args.Request() else { return Ok(()) };
+                                    let url = take_string(|p| request.Uri(p));
+                                    if !history::is_restore_url(&url) {
+                                        return Ok(());
+                                    }
+                                    let body = history::page(&url);
+                                    let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(body.as_bytes()));
+                                    let headers = "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\
+                                                   Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'";
+                                    if let Ok(response) = env.CreateWebResourceResponse(
+                                        stream.as_ref(),
+                                        200,
+                                        &windows::core::HSTRING::from("OK"),
+                                        &windows::core::HSTRING::from(headers),
+                                    ) {
+                                        let _ = args.SetResponse(&response);
+                                    }
+                                    Ok(())
+                                },
+                            ));
+                            let mut tok8: i64 = 0;
+                            let _ = core.add_WebResourceRequested(&restore_handler, &mut tok8);
+                        }
                     }
                 }
             });
@@ -586,6 +847,7 @@ impl WebView2ContentView {
             download_seen,
             pip_active,
             pip_auto,
+            nav: nav.clone(),
         };
 
         // Lightweight scroll poller. Title/URL are event-driven now; the only
@@ -621,8 +883,12 @@ impl WebView2ContentView {
                     continue;
                 }
                 let js_cache = cache_poll.clone();
+                let js_nav = nav.clone();
                 let _ = webview_poll.eval_with_callback(SCROLL_JS, move |res| {
                     if let Ok(y) = res.trim().trim_matches('"').parse::<f64>() {
+                        if let Ok(mut n) = js_nav.lock() {
+                            n.record_scroll(y);
+                        }
                         if let Ok(mut c) = js_cache.lock() {
                             c.scroll_y = y;
                         }
@@ -803,8 +1069,8 @@ impl ContentView for WebView2ContentView {
             can_go_back: false,
             can_go_forward: false,
         });
-        if let Ok(u) = self.webview.url() {
-            state.url = u.to_string();
+        if let Some(u) = self.page_url() {
+            state.url = u;
         }
         state
     }
@@ -1032,6 +1298,25 @@ impl ContentView for WebView2ContentView {
     }
     fn in_picture_in_picture(&self) -> bool {
         self.pip_active.load(Ordering::Relaxed)
+    }
+    fn history(&self) -> Option<History> {
+        self.nav.lock().ok()?.history.clone()
+    }
+    fn restore(&self, saved: &History) {
+        let Some(entry) = saved.current().cloned() else { return };
+        let single = saved.entries.len() == 1;
+        if let Ok(mut n) = self.nav.lock() {
+            n.history = Some(saved.clone());
+            // With other entries the restore page carries the scroll position.
+            n.pending_scroll = (single && entry.scroll > 0.0)
+                .then(|| PendingScroll { url: entry.url.clone(), y: entry.scroll, navigation: None });
+            n.pending_restore = (!single).then(|| saved.clone());
+        }
+        if single {
+            self.navigate(&entry.url);
+        } else {
+            self.navigate(&history::start_url());
+        }
     }
 }
 

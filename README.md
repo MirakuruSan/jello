@@ -26,10 +26,12 @@ extensions are supported.
   install on store pages.
 - **Picture-in-picture.** Alt+P floats a video; switching tabs or minimizing
   floats a playing video automatically.
-- **Low memory use.** Configurable limit on loaded tabs, background tabs that
-  freeze and trim memory when idle, and a memory saver that unloads tabs you
-  haven't used in a while. Tabs playing audio, downloading, or in
-  picture-in-picture are left alone.
+- **Low memory and CPU use.** Configurable limit on loaded tabs, background
+  tabs that freeze and trim memory when idle, and a memory saver that unloads
+  tabs you haven't used in a while. Tabs playing audio, downloading, or in
+  picture-in-picture are left alone. Pages stop drawing while the window is
+  minimized, covered by other windows, or on another desktop (audio keeps
+  playing), and YouTube's Ambient mode is off unless you allow it.
 - **Downloads** with pause / resume / retry, progress in the top bar, and
   downloads that keep going after their tab is closed.
 - **Windows integration.** Registers as a web browser and as an "Open with"
@@ -37,7 +39,9 @@ extensions are supported.
 - **Native context menus** on pages, tabs, and the address bar.
 - **Screenshot & OCR capture** with copy / save / search / Ask-AI actions.
 - **Tab management** — virtualized tab panel, MRU switching (Ctrl+Tab),
-  reopen-closed (Ctrl+Shift+T), pin, mute, drag-reorder, unload.
+  reopen-closed (Ctrl+Shift+T), pin, mute, drag-reorder, unload. Tabs come
+  back after a restart or an unload with their back/forward history and
+  scroll positions.
 - **Per-host zoom** (Ctrl+scroll and Ctrl +/-/0), **always-on-top pin**, and
   **minimize-to-tray**.
 - **Global hotkeys** — summon, palette, address bar, screenshot, OCR — all

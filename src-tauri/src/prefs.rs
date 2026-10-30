@@ -17,6 +17,7 @@ static CLEAR_HISTORY_ON_EXIT: AtomicBool = AtomicBool::new(false);
 static AD_BLOCKER: AtomicU8 = AtomicU8::new(AdBlocker::Builtin as u8);
 static AD_BLOCKING_PAUSED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 static FINGERPRINT_PROTECTION: AtomicBool = AtomicBool::new(true);
+static YOUTUBE_AMBIENT: AtomicBool = AtomicBool::new(false);
 static FINGERPRINT_ALLOWED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
 /// Which ad blocker filters pages (`adBlocker` setting).
@@ -120,6 +121,13 @@ pub fn fingerprint_protection() -> bool {
     FINGERPRINT_PROTECTION.load(Ordering::Relaxed)
 }
 
+/// YouTube's Ambient mode is left as YouTube sets it (`youtubeAmbientMode`).
+/// Off by default: Jello turns it off, since its glow behind the video keeps
+/// the whole page redrawing at the display's refresh rate.
+pub fn youtube_ambient_mode() -> bool {
+    YOUTUBE_AMBIENT.load(Ordering::Relaxed)
+}
+
 /// Sites (registrable domains) exempted from fingerprinting protection, the
 /// `fingerprintAllowedSites` list.
 pub fn fingerprint_allowed_sites() -> Vec<String> {
@@ -191,12 +199,14 @@ pub fn apply(key: &str, value: &serde_json::Value) {
                 *FINGERPRINT_ALLOWED.write().unwrap() = sites;
             }
         }
-        "autoPip" | "passwordAutosave" | "generalAutofill" | "clearHistoryOnExit" | "fingerprintProtection" => {
+        "autoPip" | "passwordAutosave" | "generalAutofill" | "clearHistoryOnExit" | "fingerprintProtection"
+        | "youtubeAmbientMode" => {
             let flag = match key {
                 "autoPip" => &AUTO_PIP,
                 "passwordAutosave" => &PASSWORD_AUTOSAVE,
                 "generalAutofill" => &GENERAL_AUTOFILL,
                 "fingerprintProtection" => &FINGERPRINT_PROTECTION,
+                "youtubeAmbientMode" => &YOUTUBE_AMBIENT,
                 _ => &CLEAR_HISTORY_ON_EXIT,
             };
             if let Some(b) = as_bool(value) {

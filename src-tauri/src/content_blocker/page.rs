@@ -118,14 +118,26 @@ enum Replay {
     /// Back or forward: the same history entry.
     History { url: String },
     Reload { url: String },
+    /// The restore page replacing itself: replaced again, from the page.
+    Replace { url: String },
 }
 
 impl Replay {
     fn url(&self) -> &str {
         match self {
-            Replay::Get { url, .. } | Replay::Post { url, .. } | Replay::History { url } | Replay::Reload { url } => url,
+            Replay::Get { url, .. }
+            | Replay::Post { url, .. }
+            | Replay::History { url }
+            | Replay::Reload { url }
+            | Replay::Replace { url } => url,
         }
     }
+}
+
+/// Script that replaces the current document with `url`, keeping the rest
+/// of the tab's history.
+fn replace_js(url: &str) -> String {
+    format!("location.replace({})", serde_json::to_string(url).unwrap_or_default())
 }
 
 /// A form post being held. Its request is answered with a redirect to the same
@@ -206,13 +218,35 @@ fn document_start_version() -> u64 {
 }
 
 /// The script registered for every document: fingerprinting protection, then
-/// the page channel hand-over.
+/// the page channel hand-over, then YouTube's Ambient mode switched off
+/// unless the user keeps it.
 fn document_start_script() -> String {
     let key = serde_json::to_string(channel_key()).unwrap_or_default();
     let mut js = crate::fingerprint::document_script().unwrap_or_default();
     js.push_str(&format!("\n{BOOTSTRAP_JS}({key});"));
+    if !crate::prefs::youtube_ambient_mode() {
+        js.push('\n');
+        js.push_str(YOUTUBE_AMBIENT_OFF_JS);
+    }
     js
 }
+
+/// Turns YouTube's Ambient mode off the way its own player setting does, a
+/// flag in its PREF cookie, before YouTube's scripts read it. The glow it
+/// draws behind the video keeps the whole page redrawing at the display's
+/// refresh rate.
+const YOUTUBE_AMBIENT_OFF_JS: &str = r#"(() => {
+  try {
+    if (location.hostname !== "www.youtube.com" || window !== window.top) return;
+    const pref = (/(?:^|;\s*)PREF=([^;]*)/.exec(document.cookie) || [])[1] || "";
+    const f7 = /(?:^|&)f7=([0-9a-f]+)/i.exec(pref);
+    const flags = f7 ? parseInt(f7[1], 16) : 0;
+    if (flags & 0x40) return;
+    const value = (flags | 0x40).toString(16);
+    const next = f7 ? pref.replace(/(^|&)f7=[0-9a-f]+/i, "$1f7=" + value) : (pref ? pref + "&" : "") + "f7=" + value;
+    document.cookie = "PREF=" + next + "; domain=.youtube.com; path=/; max-age=34560000; secure";
+  } catch (e) {}
+})();"#;
 
 /// The browser's client hints are known (or could not be read): report them
 /// on every live page, then start navigations that waited for them.
@@ -248,17 +282,53 @@ fn resume(state: &Arc<Mutex<PageState>>, webview: &tauri::Webview<tauri::Wry>, e
             return;
         }
         let Some(held) = s.held.take() else { return };
+        tracing::debug!("starting {} again{}", held.replay.url(), if expired { " (hold expired)" } else { "" });
         s.replaying = Some(held.replay.url().to_string());
         held.replay
     };
     #[cfg(target_os = "windows")]
-    let _ = webview.with_webview(move |w| unsafe {
-        if let Ok(core) = w.controller().CoreWebView2() {
-            start_again(&core, replay);
+    {
+        let replacing = matches!(replay, Replay::Replace { .. }).then(|| replay.url().to_string());
+        let _ = webview.with_webview(move |w| unsafe {
+            if let Ok(core) = w.controller().CoreWebView2() {
+                start_again(&core, replay);
+            }
+        });
+        if let Some(url) = replacing {
+            confirm_replace(state.clone(), webview.clone(), url);
         }
-    });
+    }
     #[cfg(not(target_os = "windows"))]
     let _ = (webview, replay);
+}
+
+/// A replacement the restore page is asked for while its cancelled
+/// navigation is still finishing can be dropped by the page. Ask again until
+/// it starts, as long as the tab is still on the restore page and nothing
+/// else was held since; replacing with the same page twice is harmless.
+#[cfg(target_os = "windows")]
+fn confirm_replace(state: Arc<Mutex<PageState>>, webview: tauri::Webview<tauri::Wry>, url: String) {
+    std::thread::spawn(move || {
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let pending = state
+                .lock()
+                .map(|s| s.held.is_none() && s.replaying.as_deref() == Some(url.as_str()))
+                .unwrap_or(false);
+            if !pending {
+                return;
+            }
+            let url = url.clone();
+            let _ = webview.with_webview(move |w| unsafe {
+                if let Ok(core) = w.controller().CoreWebView2() {
+                    if crate::engine::history::is_restore_url(&take_string(|p| core.Source(p))) {
+                        tracing::debug!("asking the restore page again for {}", url);
+                        start_again(&core, Replay::Replace { url });
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// What the built-in blocker did on a tab's current page, and whether
@@ -858,6 +928,14 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
     let on_navigation = NavigationStartingEventHandler::create(Box::new(move |sender, args| {
         let (Some(core), Some(args)) = (sender, args) else { return Ok(()) };
         let url = take_string(|p| args.Uri(p));
+        // The restore page (engine::history) needs no scripts and leaves the
+        // page state alone. It replaces itself with the page it stands for;
+        // that navigation, if held, is started again as a replacement too,
+        // so the tab's other history entries stay.
+        if crate::engine::history::is_restore_url(&url) {
+            return Ok(());
+        }
+        let from_restore = crate::engine::history::is_restore_url(&take_string(|p| core.Source(p)));
         let host = hostname(&url).filter(|_| url.starts_with("http"));
         let enabled = crate::prefs::builtin_adblock();
         let paused = host.as_deref().is_some_and(crate::prefs::ad_blocking_paused);
@@ -867,7 +945,11 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         if active && !posted {
             if let Some(clean) = removeparam_target(&url) {
                 let _ = args.SetCancel(true);
-                let _ = core.Navigate(&HSTRING::from(clean));
+                if from_restore {
+                    run_script(&core, replace_js(&clean));
+                } else {
+                    let _ = core.Navigate(&HSTRING::from(clean));
+                }
                 return Ok(());
             }
         }
@@ -944,11 +1026,17 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
                 Some(Replay::History { url: url.clone() })
             } else if kind == COREWEBVIEW2_NAVIGATION_KIND_RELOAD {
                 Some(Replay::Reload { url: url.clone() })
+            } else if from_restore {
+                Some(Replay::Replace { url: url.clone() })
             } else {
                 headers.map(|headers| Replay::Get { url: url.clone(), headers })
             };
             match replay {
                 Some(replay) => {
+                    tracing::debug!(
+                        "holding {} (scripts {}, inflight {}, ready {}, engine {}, hints {})",
+                        url, needs_scripts, s.inflight, s.ready, !wait_engine, !wait_hints
+                    );
                     let _ = args.SetCancel(true);
                     s.held = Some(Held { generation, replay });
                     let timer_state = nav_state.clone();
@@ -1150,6 +1238,13 @@ unsafe fn start_again(core: &webview2_com::Microsoft::Web::WebView2::Win32::ICor
         }
         Replay::Reload { .. } => {
             let _ = core.Reload();
+        }
+        Replay::Replace { url } => {
+            let done = webview2_com::ExecuteScriptCompletedHandler::create(Box::new(|hr, result: String| {
+                tracing::debug!("replacing the restore page: {:?} {}", hr, result);
+                Ok(())
+            }));
+            let _ = core.ExecuteScript(&HSTRING::from(replace_js(&url)), &done);
         }
         Replay::History { url } => {
             let nav_core = core.clone();

@@ -134,6 +134,9 @@ pub async fn settings_set(
     if obj.contains_key("builtinAdblock") && crate::prefs::builtin_adblock() {
         crate::content_blocker::start(&app);
     }
+    if obj.contains_key("youtubeAmbientMode") {
+        crate::content_blocker::page::document_start_changed();
+    }
     db_call(&db, move |conn| {
         let tx = conn.transaction()?;
         for (k, v) in obj {

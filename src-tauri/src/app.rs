@@ -1051,6 +1051,8 @@ pub fn run() {
             // Fingerprinting protection reports the browser's client hints
             // without the WebView2 brand; read them from Jello's own window.
             crate::fingerprint::start(app.handle());
+            // Pages rest while nobody can see the main window.
+            crate::platform::win_occlusion::start(app.handle());
 
             // Purge stale PROFILE extensions: AddBrowserExtension persists in the
             // shared WebView2 profile across sessions, so an extension disabled or

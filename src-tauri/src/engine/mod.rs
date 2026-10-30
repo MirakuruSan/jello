@@ -74,8 +74,19 @@ pub trait ContentView {
     fn picture_in_picture(&self, _req: PipRequest) {}
     /// Jello last put a video from this view into picture-in-picture.
     fn in_picture_in_picture(&self) -> bool { false }
+    /// The view's back/forward entries with their scroll positions, None
+    /// before its first page.
+    fn history(&self) -> Option<history::History> { None }
+    /// Load a saved history: its current entry, scrolled to where it was,
+    /// with the other entries reachable through back and forward.
+    fn restore(&self, history: &history::History) {
+        if let Some(entry) = history.current() {
+            self.navigate(&entry.url);
+        }
+    }
 }
 
+pub mod history;
 pub mod webview2;
 pub mod pool;
 pub mod fractional_index;

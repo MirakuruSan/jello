@@ -92,14 +92,30 @@ pub fn update_tab(conn: &Connection, tab: &Tab) -> Result<()> {
     Ok(())
 }
 
+/// A tab's saved back/forward entries (engine::history::History as JSON).
+pub fn get_history(conn: &Connection, id: i32) -> Result<Option<String>> {
+    conn.query_row("SELECT history FROM tabs WHERE id = ?1", [id], |r| r.get(0))
+        .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })
+}
+
+pub fn set_history(conn: &Connection, id: i32, history: Option<&str>) -> Result<()> {
+    conn.execute("UPDATE tabs SET history = ?2 WHERE id = ?1", params![id, history])?;
+    Ok(())
+}
+
 pub fn delete_tab(conn: &Connection, id: i32) -> Result<()> {
     conn.execute("DELETE FROM tabs WHERE id = ?1", [id])?;
     Ok(())
 }
 
-/// Push a just-closed tab onto the per-window undo stack, trimming to 25 newest.
+/// Push a just-closed tab, with its back/forward entries, onto the per-window
+/// undo stack, trimming to 25 newest.
 pub fn push_closed_tab(conn: &Connection, tab: &Tab) -> Result<()> {
-    let tab_json = serde_json::to_string(tab).unwrap_or_default();
+    let mut value = serde_json::to_value(tab).unwrap_or_default();
+    if let (Some(history), Some(obj)) = (get_history(conn, tab.id)?, value.as_object_mut()) {
+        obj.insert("history".to_string(), serde_json::Value::String(history));
+    }
+    let tab_json = value.to_string();
     let closed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -118,8 +134,9 @@ pub fn push_closed_tab(conn: &Connection, tab: &Tab) -> Result<()> {
     Ok(())
 }
 
-/// Pop the most-recently-closed tab for a window, returning its serialized state.
-pub fn pop_closed_tab(conn: &Connection, window_id: i32) -> Result<Option<Tab>> {
+/// Pop the most-recently-closed tab for a window, returning its serialized
+/// state and back/forward entries.
+pub fn pop_closed_tab(conn: &Connection, window_id: i32) -> Result<Option<(Tab, Option<String>)>> {
     let row: Option<(i32, String)> = conn
         .query_row(
             "SELECT id, tab_json FROM closed_tabs WHERE window_id = ?1 ORDER BY id DESC LIMIT 1",
@@ -129,7 +146,10 @@ pub fn pop_closed_tab(conn: &Connection, window_id: i32) -> Result<Option<Tab>> 
         .ok();
     if let Some((row_id, tab_json)) = row {
         conn.execute("DELETE FROM closed_tabs WHERE id = ?1", [row_id])?;
-        Ok(serde_json::from_str::<Tab>(&tab_json).ok())
+        let history = serde_json::from_str::<serde_json::Value>(&tab_json)
+            .ok()
+            .and_then(|v| v.get("history").and_then(|h| h.as_str()).map(str::to_string));
+        Ok(serde_json::from_str::<Tab>(&tab_json).ok().map(|tab| (tab, history)))
     } else {
         Ok(None)
     }

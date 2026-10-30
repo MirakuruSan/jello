@@ -77,6 +77,10 @@ pub const MIGRATIONS: &[&str] = &[
       ('Wikipedia', 'w', 'https://en.wikipedia.org/wiki/Special:Search?search=%s'),
       ('GitHub', 'gh', 'https://github.com/search?q=%s');
     "#,
+    // A tab's back/forward entries (engine::history::History as JSON).
+    r#"
+    ALTER TABLE tabs ADD COLUMN history TEXT;
+    "#,
 ];
 
 pub fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {

@@ -129,6 +129,22 @@
     originals.set(replacement, original);
     define(target, name, { ...d, get: replacement });
   };
+  const setter = (target, name, make) => {
+    const d = target && Object.getOwnPropertyDescriptor(target, name);
+    if (!d || typeof d.set !== "function") return;
+    const original = d.set;
+    const impl = make(original);
+    const replacement = Object.getOwnPropertyDescriptor(
+      {
+        set [name](value) {
+          impl.call(this, value);
+        },
+      },
+      name
+    ).set;
+    originals.set(replacement, original);
+    define(target, name, { ...d, set: replacement });
+  };
   method(Function.prototype, "toString", (original) =>
     function () {
       const o = originals.get(this);
@@ -582,15 +598,16 @@
     );
   }
 
-  // Local fonts through FontFace sources: the hidden fonts are not found.
+  // Local fonts named in font sources, `local(...)`: the hidden ones are not
+  // found, whether the source comes from a FontFace or a style sheet.
+  const missing = 'local("f' + seed("fonts").toString(36) + '")';
+  const keep = (source) =>
+    typeof source === "string" && /local\s*\(/i.test(source)
+      ? source.replace(/local\(\s*(["']?)([^"')]+)\1\s*\)/gi, (all, quote, name) =>
+          hiddenNames.has(name.trim().toLowerCase()) ? missing : all
+        )
+      : source;
   if (G.FontFace) {
-    const missing = 'local("f' + seed("fonts").toString(36) + '")';
-    const keep = (source) =>
-      typeof source === "string"
-        ? source.replace(/local\(\s*(["']?)([^"')]+)\1\s*\)/gi, (all, quote, name) =>
-            hiddenNames.has(name.trim().toLowerCase()) ? missing : all
-          )
-        : source;
     const Original = G.FontFace;
     const Face = function FontFace(family, source) {
       if (!new.target) return Original.apply(this, arguments);
@@ -604,6 +621,171 @@
     Object.setPrototypeOf(Face, Object.getPrototypeOf(Original));
     originals.set(Face, Original);
     define(G, "FontFace", { ...Object.getOwnPropertyDescriptor(G, "FontFace"), value: Face });
+  }
+
+  // Style sheets: an @font-face rule can name a local font too. Rule text a
+  // script hands to the CSS object model is cleaned on the way in, style
+  // elements and markup a script inserts as they arrive, the page's own
+  // style elements as the parser adds them, and linked sheets once loaded.
+  // Sheets from other sites cannot be read and stay as they are.
+  if (isWindow && hiddenNames.size && G.CSSStyleSheet && G.CSSStyleDeclaration && G.document) {
+    const D = G.document;
+    const Decl = G.CSSStyleDeclaration.prototype;
+    const getProperty = Decl.getPropertyValue;
+    const setProperty = Decl.setProperty;
+    const done = new WeakSet();
+    const fixRule = (rule) => {
+      if (G.CSSFontFaceRule && rule instanceof G.CSSFontFaceRule) {
+        const src = getProperty.call(rule.style, "src");
+        const kept = keep(src);
+        if (kept !== src) setProperty.call(rule.style, "src", kept);
+      } else if (G.CSSImportRule && rule instanceof G.CSSImportRule) {
+        if (rule.styleSheet) fix(rule.styleSheet, false);
+      } else if (rule.cssRules) {
+        for (let i = 0; i < rule.cssRules.length; i++) fixRule(rule.cssRules[i]);
+      }
+    };
+    const fix = (sheet, again) => {
+      if (!sheet || (done.has(sheet) && !again)) return;
+      done.add(sheet);
+      // A style element's text tells cheaply whether its rules need a look
+      // (rules a script inserts were cleaned on the way in).
+      const owner = sheet.ownerNode;
+      if (owner && owner.localName === "style" && !/local\s*\(|@import/i.test(owner.textContent)) return;
+      let rules;
+      try {
+        rules = sheet.cssRules;
+      } catch (e) {
+        return;
+      }
+      for (let i = 0; i < rules.length; i++) fixRule(rules[i]);
+    };
+    const scan = (root) => {
+      const sheets = root && root.styleSheets;
+      if (sheets) for (let i = 0; i < sheets.length; i++) fix(sheets[i], false);
+    };
+    const scanAround = (node) => {
+      const root = node && node.isConnected ? node.getRootNode() : null;
+      if (root) scan(root);
+    };
+    const isStyle = (node) => !!node && node.localName === "style";
+
+    for (const proto of [G.CSSStyleSheet.prototype, G.CSSGroupingRule && G.CSSGroupingRule.prototype]) {
+      for (const name of ["insertRule", "addRule"]) {
+        method(proto, name, (original) =>
+          function () {
+            const args = Array.prototype.slice.call(arguments);
+            args[name === "addRule" ? 1 : 0] = keep(args[name === "addRule" ? 1 : 0]);
+            return original.apply(this, args);
+          }
+        );
+      }
+    }
+    for (const name of ["replace", "replaceSync"]) {
+      method(G.CSSStyleSheet.prototype, name, (original) =>
+        function (text) {
+          const args = Array.prototype.slice.call(arguments);
+          args[0] = keep(text);
+          return original.apply(this, args);
+        }
+      );
+    }
+    method(Decl, "setProperty", (original) =>
+      function (name) {
+        if (String(name).toLowerCase() !== "src") return original.apply(this, arguments);
+        const args = Array.prototype.slice.call(arguments);
+        args[1] = keep(args[1]);
+        return original.apply(this, args);
+      }
+    );
+    setter(Decl, "cssText", (original) =>
+      function (value) {
+        original.call(this, keep(value));
+      }
+    );
+
+    // A style element added, or its text set, by a script: cleaned before
+    // the script can measure anything with it. Markup with a font rule in
+    // an element not yet in the document marks the element, and whatever
+    // it is put into, until it arrives.
+    const hasFace = (value) => /@font-face/i.test(String(value));
+    const carrying = new WeakSet();
+    const carries = (node) => isStyle(node) || (!!node && carrying.has(node));
+    const arrived = (parent, node) => {
+      if (node.isConnected) scanAround(node);
+      else carrying.add(parent);
+    };
+    for (const name of ["appendChild", "insertBefore", "replaceChild"]) {
+      method(G.Node.prototype, name, (original) =>
+        function (node) {
+          const result = original.apply(this, arguments);
+          if (carries(node)) arrived(this, node);
+          else if (isStyle(this)) scanAround(this);
+          return result;
+        }
+      );
+    }
+    for (const name of ["append", "prepend"]) {
+      method(G.Element.prototype, name, (original) =>
+        function () {
+          const result = original.apply(this, arguments);
+          if (isStyle(this) || Array.prototype.some.call(arguments, carries)) arrived(this, this);
+          return result;
+        }
+      );
+    }
+    setter(G.Node.prototype, "textContent", (original) =>
+      function (value) {
+        original.call(this, value);
+        if (isStyle(this)) scanAround(this);
+      }
+    );
+    setter(G.Element.prototype, "innerHTML", (original) =>
+      function (value) {
+        original.call(this, value);
+        if (isStyle(this) || hasFace(value)) arrived(this, this);
+      }
+    );
+    method(G.Element.prototype, "insertAdjacentHTML", (original) =>
+      function (position, text) {
+        const result = original.apply(this, arguments);
+        if (hasFace(text)) arrived(this, this);
+        return result;
+      }
+    );
+    if (G.ShadowRoot) {
+      setter(G.ShadowRoot.prototype, "innerHTML", (original) =>
+        function (value) {
+          original.call(this, value);
+          if (hasFace(value)) scan(this);
+        }
+      );
+    }
+
+    // While the HTML parser builds the page, its style elements, before the
+    // page renders or runs the next script; watching every DOM change for
+    // the life of the page would slow down pages that change a lot. Linked
+    // sheets (with their imports) once they have loaded.
+    if (D.readyState === "loading") {
+      const parsing = new G.MutationObserver(() => scan(D));
+      parsing.observe(D, { childList: true, subtree: true });
+      D.addEventListener(
+        "DOMContentLoaded",
+        () => {
+          parsing.disconnect();
+          scan(D);
+        },
+        { once: true }
+      );
+    }
+    D.addEventListener(
+      "load",
+      (e) => {
+        const t = e.target;
+        if (t && (t.localName === "link" || t.localName === "style")) fix(t.sheet, true);
+      },
+      true
+    );
   }
 
   // Audio: rendered samples are scaled by a per-site factor within a few
