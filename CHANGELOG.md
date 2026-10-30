@@ -4,7 +4,7 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.4.15] — 2026-10-30
 
 ### Added
 - **Tabs come back with their history.** Each tab keeps its back and forward
