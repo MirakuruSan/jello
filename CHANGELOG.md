@@ -4,7 +4,7 @@ All notable changes to Jello are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.4.14] — 2026-10-30
 
 ### Added
 - **Fingerprinting protection, on by default.** Sites no longer see your

@@ -9,7 +9,7 @@ works as an instant research tool rather than a heavyweight browser.
 No telemetry. Screenshot search and OCR text capture are built in, and Chrome
 extensions are supported.
 
-> Status: **v0.4.13** — active development.
+> Status: **v0.4.14** — active development.
 
 ## Features
 
