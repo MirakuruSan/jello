@@ -10,15 +10,20 @@
 // same values for the whole session, while another site, or the same site in
 // the next session, sees different ones and cannot link the two.
 //
-// cfg: secret    random per-session string
-//      suffixes  public suffix rules, "\n"-separated with "\n" at both ends
-//      allow     sites the user exempted (breakage)
-//      marker    query flag that marks shared worker scripts (documents)
-//      top       top-level origin, for workers (documents read their own)
-(function (cfg) {
+// cfg: secret          random per-session string (documents), or
+//      key             the site's key derived from it (blob shared workers)
+//      suffixes        public suffix rules, "\n"-separated with "\n" at both ends
+//      allow           sites the user exempted (breakage)
+//      hiddenFamilies  installed font families outside the Windows defaults
+//      hiddenNames     full and PostScript names of those fonts
+//      marker          query flag that marks shared worker scripts (documents)
+//      top             top-level origin, for workers (documents read their own)
+(function farble(cfg) {
   "use strict";
   const G = globalThis;
   const isWindow = typeof G.Window === "function" && G instanceof G.Window;
+  // This script's own text, to prepare blob shared workers with it.
+  const source = Function.prototype.toString.call(farble);
 
   // Registrable domain of a hostname by the public suffix rules: the suffix
   // plus one label. IP addresses and unlisted single labels stay as they are.
@@ -80,8 +85,11 @@
     h ^= h >>> 13;
     return h >>> 0;
   };
-  // An independent seed per purpose.
-  const seed = (purpose) => hash(purpose + "\n" + cfg.secret + "\n" + site);
+  // A site's key comes from the session secret; contexts a page could read
+  // the script of get only their site's key. Seeds per purpose come from it.
+  const keyFor = (name) => [0, 1, 2, 3].map((i) => hash(i + "\n" + cfg.secret + "\n" + name).toString(16)).join("");
+  const siteKey = cfg.key !== undefined ? cfg.key : keyFor(site);
+  const seed = (purpose) => hash(purpose + "\n" + siteKey);
 
   // Replacements look like the built-ins they replace: same name, length and
   // property attributes, and Function.prototype.toString shows native code.
@@ -213,9 +221,76 @@
     );
   }
 
-  // WebGL: one generic GPU for everyone, and noised readback.
+  // WebGL: one generic GPU for everyone, capabilities no higher than those
+  // of mainstream Direct3D 11 graphics, and noised readback. Reporting less
+  // than the hardware offers is safe (pages use less); it is never more.
   const GPU_VENDOR = "Google Inc. (Intel)";
   const GPU_RENDERER = "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)";
+  const LIMITS = new Map([
+    [0x0d33, 16384], // MAX_TEXTURE_SIZE
+    [0x851c, 16384], // MAX_CUBE_MAP_TEXTURE_SIZE
+    [0x84e8, 16384], // MAX_RENDERBUFFER_SIZE
+    [0x0d50, 4], // SUBPIXEL_BITS
+    [0x80a9, 4], // SAMPLES
+    [0x8869, 16], // MAX_VERTEX_ATTRIBS
+    [0x8dfb, 4095], // MAX_VERTEX_UNIFORM_VECTORS
+    [0x8dfc, 30], // MAX_VARYING_VECTORS
+    [0x8dfd, 1024], // MAX_FRAGMENT_UNIFORM_VECTORS
+    [0x8b4d, 32], // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+    [0x8b4c, 16], // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+    [0x8872, 16], // MAX_TEXTURE_IMAGE_UNITS
+    [0x84ff, 16], // MAX_TEXTURE_MAX_ANISOTROPY_EXT
+    [0x8073, 2048], // MAX_3D_TEXTURE_SIZE
+    [0x88ff, 2048], // MAX_ARRAY_TEXTURE_LAYERS
+    [0x80e8, 2147483647], // MAX_ELEMENTS_VERTICES
+    [0x80e9, 2147483647], // MAX_ELEMENTS_INDICES
+    [0x8d6b, 4294967294], // MAX_ELEMENT_INDEX
+    [0x84fd, 2], // MAX_TEXTURE_LOD_BIAS
+    [0x8824, 8], // MAX_DRAW_BUFFERS
+    [0x8cdf, 8], // MAX_COLOR_ATTACHMENTS
+    [0x8d57, 4], // MAX_SAMPLES
+    [0x8b49, 4096], // MAX_FRAGMENT_UNIFORM_COMPONENTS
+    [0x8b4a, 16380], // MAX_VERTEX_UNIFORM_COMPONENTS
+    [0x8905, 7], // MAX_PROGRAM_TEXEL_OFFSET
+    [0x8b4b, 120], // MAX_VARYING_COMPONENTS
+    [0x9122, 120], // MAX_VERTEX_OUTPUT_COMPONENTS
+    [0x9125, 120], // MAX_FRAGMENT_INPUT_COMPONENTS
+    [0x8c80, 4], // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
+    [0x8c8a, 120], // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
+    [0x8c8b, 4], // MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
+    [0x8a2b, 12], // MAX_VERTEX_UNIFORM_BLOCKS
+    [0x8a2d, 12], // MAX_FRAGMENT_UNIFORM_BLOCKS
+    [0x8a2e, 24], // MAX_COMBINED_UNIFORM_BLOCKS
+    [0x8a2f, 24], // MAX_UNIFORM_BUFFER_BINDINGS
+    [0x8a30, 65536], // MAX_UNIFORM_BLOCK_SIZE
+    [0x8a31, 212988], // MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS
+    [0x8a33, 200704], // MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS
+    [0x9111, 0], // MAX_SERVER_WAIT_TIMEOUT
+    [0x9247, 0], // MAX_CLIENT_WAIT_TIMEOUT_WEBGL
+  ]);
+  // Lower bounds a page relies on: report at least these.
+  const FLOORS = new Map([
+    [0x8904, -8], // MIN_PROGRAM_TEXEL_OFFSET
+    [0x8a34, 256], // UNIFORM_BUFFER_OFFSET_ALIGNMENT
+  ]);
+  // [min, max] ranges and the maximum viewport.
+  const RANGES = new Map([
+    [0x846d, [1, 1024]], // ALIASED_POINT_SIZE_RANGE
+    [0x846e, [1, 1]], // ALIASED_LINE_WIDTH_RANGE
+  ]);
+  const VIEWPORT = 0x0d3a; // MAX_VIEWPORT_DIMS
+  const EXTENSIONS = new Set(
+    [
+      "ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_color_buffer_float", "EXT_color_buffer_half_float",
+      "EXT_float_blend", "EXT_frag_depth", "EXT_shader_texture_lod", "EXT_sRGB", "EXT_texture_compression_bptc",
+      "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "KHR_parallel_shader_compile",
+      "OES_draw_buffers_indexed", "OES_element_index_uint", "OES_fbo_render_mipmap", "OES_standard_derivatives",
+      "OES_texture_float", "OES_texture_float_linear", "OES_texture_half_float", "OES_texture_half_float_linear",
+      "OES_vertex_array_object", "WEBGL_color_buffer_float", "WEBGL_compressed_texture_s3tc",
+      "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_depth_texture",
+      "WEBGL_draw_buffers", "WEBGL_lose_context", "WEBGL_multi_draw",
+    ].map((e) => e.toLowerCase())
+  );
   for (const C of [G.WebGLRenderingContext, G.WebGL2RenderingContext].filter(Boolean)) {
     method(C.prototype, "getParameter", (original) =>
       function (pname) {
@@ -224,7 +299,41 @@
           if (pname === 0x9245) return GPU_VENDOR; // UNMASKED_VENDOR_WEBGL
           if (pname === 0x9246) return GPU_RENDERER; // UNMASKED_RENDERER_WEBGL
         }
+        if (typeof value === "number") {
+          if (LIMITS.has(pname)) return Math.min(value, LIMITS.get(pname));
+          if (FLOORS.has(pname)) return Math.max(value, FLOORS.get(pname));
+        }
+        if (value && value.length === 2 && (RANGES.has(pname) || pname === VIEWPORT)) {
+          const out = new value.constructor(2);
+          if (pname === VIEWPORT) {
+            out[0] = Math.min(value[0], 32767);
+            out[1] = Math.min(value[1], 32767);
+          } else {
+            const [low, high] = RANGES.get(pname);
+            out[0] = Math.max(value[0], low);
+            out[1] = Math.min(value[1], high);
+          }
+          return out;
+        }
         return value;
+      }
+    );
+    method(C.prototype, "getSupportedExtensions", (original) =>
+      function () {
+        const list = original.apply(this, arguments);
+        return list && list.filter((e) => EXTENSIONS.has(e.toLowerCase()));
+      }
+    );
+    method(C.prototype, "getExtension", (original) =>
+      function (name) {
+        return EXTENSIONS.has(String(name).toLowerCase()) ? original.apply(this, arguments) : null;
+      }
+    );
+    method(C.prototype, "getInternalformatParameter", (original) =>
+      function (target, internalformat, pname) {
+        const value = original.apply(this, arguments);
+        // SAMPLES: the sample counts a format supports, within MAX_SAMPLES.
+        return pname === 0x80a9 && value && value.filter ? value.filter((n) => n <= LIMITS.get(0x8d57)) : value;
       }
     );
     method(C.prototype, "readPixels", (original) =>
@@ -352,30 +461,134 @@
     }
   }
 
-  // Local fonts through FontFace: only the fonts Windows installs by
-  // default, so fonts added by other software cannot be told apart.
-  if (G.FontFace) {
-    const defaults = new Set(
-      [
-        "Arial", "Arial Black", "Bahnschrift", "Calibri", "Calibri Light", "Cambria", "Cambria Math", "Candara",
-        "Comic Sans MS", "Consolas", "Constantia", "Corbel", "Courier New", "Ebrima", "Franklin Gothic Medium",
-        "Gabriola", "Gadugi", "Georgia", "HoloLens MDL2 Assets", "Impact", "Ink Free", "Javanese Text",
-        "Leelawadee UI", "Leelawadee UI Semilight", "Lucida Console", "Lucida Sans Unicode", "Malgun Gothic",
-        "Malgun Gothic Semilight", "Marlett", "Microsoft Himalaya", "Microsoft JhengHei", "Microsoft JhengHei UI",
-        "Microsoft New Tai Lue", "Microsoft PhagsPa", "Microsoft Sans Serif", "Microsoft Tai Le", "Microsoft YaHei",
-        "Microsoft YaHei UI", "Microsoft Yi Baiti", "MingLiU-ExtB", "Mongolian Baiti", "MS Gothic", "MS PGothic",
-        "MS UI Gothic", "MV Boli", "Myanmar Text", "Nirmala UI", "Nirmala UI Semilight", "Palatino Linotype",
-        "Segoe Fluent Icons", "Segoe MDL2 Assets", "Segoe Print", "Segoe Script", "Segoe UI", "Segoe UI Black",
-        "Segoe UI Emoji", "Segoe UI Historic", "Segoe UI Light", "Segoe UI Semibold", "Segoe UI Semilight",
-        "Segoe UI Symbol", "Segoe UI Variable", "SimSun", "NSimSun", "Sitka", "Sylfaen", "Symbol", "Tahoma",
-        "Times New Roman", "Trebuchet MS", "Verdana", "Webdings", "Wingdings", "Yu Gothic", "Yu Gothic UI",
-      ].map((f) => f.toLowerCase())
+  // Installed fonts: pages see the fonts every Windows install has and their
+  // own web fonts, not fonts other software added. Each hidden family gets a
+  // font face covering only U+0000, so text in that family falls through to
+  // the next family in the list, exactly as if it were not installed. This
+  // holds wherever a page names a font (style sheets, style attributes,
+  // canvas). The faces are loaded now, before page scripts, and are left out
+  // of everything the page can read from its font set.
+  const hiddenFamilies = cfg.hiddenFamilies || [];
+  const hiddenNames = new Set([...hiddenFamilies, ...(cfg.hiddenNames || [])].map((f) => f.toLowerCase()));
+  const fontSet = isWindow ? G.document && G.document.fonts : G.fonts;
+  if (G.FontFace && G.FontFaceSet && fontSet && hiddenFamilies.length) {
+    const S = G.FontFaceSet.prototype;
+    const values = S.values;
+    const entries = S.entries;
+    const remove = S.delete;
+    const ours = new WeakSet();
+    const OriginalFace = G.FontFace;
+    let installed = false;
+    const install = () => {
+      if (installed) return;
+      installed = true;
+      for (const family of hiddenFamilies) {
+        try {
+          const face = new OriginalFace(family, 'local("Arial")', { unicodeRange: "U+0" });
+          ours.add(face);
+          S.add.call(fontSet, face);
+          face.load().catch(() => {});
+        } catch (e) {}
+      }
+    };
+    // A worker draws text only through OffscreenCanvas, so its faces are
+    // added when it first creates a canvas context. Creating font faces
+    // while the DevTools protocol holds a new worker at start deadlocks it.
+    if (isWindow) install();
+    else if (G.OffscreenCanvas) {
+      method(G.OffscreenCanvas.prototype, "getContext", (original) =>
+        function () {
+          install();
+          return original.apply(this, arguments);
+        }
+      );
+    }
+    const visible = (set) => Array.from(values.call(set)).filter((f) => !ours.has(f));
+    const pageLoading = (set) => visible(set).some((f) => f.status === "loading");
+    // Loading events that only concern these faces end here, before any
+    // listener of the page (this one is registered first).
+    for (const type of ["loading", "loadingdone", "loadingerror"]) {
+      fontSet.addEventListener(
+        type,
+        (e) => {
+          if (Array.from(e.fontfaces).every((f) => ours.has(f)) && !pageLoading(fontSet)) e.stopImmediatePropagation();
+        },
+        true
+      );
+    }
+    if (G.FontFaceSetLoadEvent) {
+      getter(G.FontFaceSetLoadEvent.prototype, "fontfaces", (original) =>
+        function () {
+          return Object.freeze(Array.from(original.call(this)).filter((f) => !ours.has(f)));
+        }
+      );
+    }
+    const iterate = (original) =>
+      function () {
+        return original.call(new G.FontFaceSet(visible(this)));
+      };
+    method(S, "values", iterate);
+    // keys and @@iterator are the same function as values on a set.
+    for (const alias of ["keys", Symbol.iterator]) {
+      const d = Object.getOwnPropertyDescriptor(S, alias);
+      if (d && d.value === values) define(S, alias, { ...d, value: S.values });
+      else method(S, alias, iterate);
+    }
+    method(S, "entries", () =>
+      function () {
+        return entries.call(new G.FontFaceSet(visible(this)));
+      }
     );
+    method(S, "forEach", () =>
+      function (callback, thisArg) {
+        for (const face of visible(this)) callback.call(thisArg, face, face, this);
+      }
+    );
+    method(S, "has", (original) =>
+      function (face) {
+        return !ours.has(face) && original.apply(this, arguments);
+      }
+    );
+    method(S, "delete", (original) =>
+      function (face) {
+        return !ours.has(face) && original.apply(this, arguments);
+      }
+    );
+    method(S, "clear", () =>
+      function () {
+        for (const face of visible(this)) remove.call(this, face);
+      }
+    );
+    method(S, "load", (original) =>
+      function () {
+        return original.apply(this, arguments).then((faces) => faces.filter((f) => !ours.has(f)));
+      }
+    );
+    getter(S, "size", () =>
+      function () {
+        return visible(this).length;
+      }
+    );
+    getter(S, "status", (original) =>
+      function () {
+        const status = original.call(this);
+        return status === "loading" && !pageLoading(this) ? "loaded" : status;
+      }
+    );
+  }
+  if (isWindow && typeof G.queryLocalFonts === "function") {
+    method(G, "queryLocalFonts", () => () =>
+      Promise.reject(new DOMException("Local fonts are not available.", "NotAllowedError"))
+    );
+  }
+
+  // Local fonts through FontFace sources: the hidden fonts are not found.
+  if (G.FontFace) {
     const missing = 'local("f' + seed("fonts").toString(36) + '")';
     const keep = (source) =>
       typeof source === "string"
         ? source.replace(/local\(\s*(["']?)([^"')]+)\1\s*\)/gi, (all, quote, name) =>
-            defaults.has(name.trim().toLowerCase()) ? all : missing
+            hiddenNames.has(name.trim().toLowerCase()) ? missing : all
           )
         : source;
     const Original = G.FontFace;
@@ -437,11 +650,11 @@
     }
   }
 
-  // Navigator: hardware figures from common values (never above the real
-  // ones), one language, and no WebView2 brand.
+  // Navigator: hardware figures picked per site (never above the real ones:
+  // 2 to 8 cores, 2, 4 or 8 GB), one language, and no WebView2 brand.
   const navigators = [G.Navigator, G.WorkerNavigator].filter(Boolean).map((N) => N.prototype);
-  const cores = [4, 8][seed("cores") & 1];
-  const memory = [4, 8][seed("memory") & 1];
+  const cores = 2 + (seed("cores") % 7);
+  const memory = [2, 4, 8][seed("memory") % 3];
   for (const proto of navigators) {
     getter(proto, "hardwareConcurrency", (original) =>
       function () {
@@ -519,23 +732,75 @@
     }
   }
 
-  // Shared workers are prepared by Jello when their script loads; the
-  // per-session marker added to their URL tells it which request that is.
-  // Jello answers the marked request itself and loads the original URL, so
-  // the server never sees the marker.
+  // Shared workers. One from a network URL is prepared by Jello when its
+  // script loads; the per-session marker added to the URL tells it which
+  // request that is, and Jello loads the original URL, so the server never
+  // sees the marker. One from a blob: URL is started from a wrapper blob
+  // instead: this script with the site's key, then the original script. The
+  // wrapper's URL is revoked once the worker has it, so the worker cannot
+  // read it back; later connections from this document reuse it and reach
+  // the same worker.
   if (isWindow && G.SharedWorker && cfg.marker) {
     const Original = G.SharedWorker;
+    const createObjectURL = URL.createObjectURL;
+    const revokeObjectURL = URL.revokeObjectURL;
+    const blobs = new Map();
+    method(URL, "createObjectURL", (original) =>
+      function (object) {
+        const url = original.apply(this, arguments);
+        if (object instanceof G.Blob) blobs.set(url, object);
+        return url;
+      }
+    );
+    method(URL, "revokeObjectURL", (original) =>
+      function (url) {
+        blobs.delete(String(url));
+        return original.apply(this, arguments);
+      }
+    );
+    const wrappers = new Map();
+    const wrapperFor = (url, options) => {
+      const module = !!options && typeof options === "object" && options.type === "module";
+      const name = typeof options === "string" ? options : (options && options.name) || "";
+      const cacheKey = url + "\n" + name + "\n" + module;
+      let wrapper = wrappers.get(cacheKey);
+      if (wrapper) return [wrapper, false];
+      const ownSite = registrable(G.location.hostname) || site;
+      const workerCfg = {
+        key: keyFor(ownSite),
+        suffixes: cfg.suffixes,
+        allow: cfg.allow,
+        hiddenFamilies: cfg.hiddenFamilies,
+        hiddenNames: cfg.hiddenNames,
+        top: G.location.origin,
+      };
+      const original = blobs.get(url);
+      const load = module ? "import " + JSON.stringify(url) + ";" : "importScripts(" + JSON.stringify(url) + ");";
+      const parts = ["(" + source + ")(" + JSON.stringify(workerCfg) + ");\n", original || load];
+      wrapper = createObjectURL.call(URL, new G.Blob(parts, { type: "text/javascript" }));
+      wrappers.set(cacheKey, wrapper);
+      return [wrapper, true];
+    };
     const Shared = function SharedWorker(url) {
       if (!new.target) return Original.apply(this, arguments);
       const args = Array.prototype.slice.call(arguments);
+      let created = null;
       try {
         const target = new URL(url, document.baseURI);
         if (target.protocol === "https:" || target.protocol === "http:") {
           target.search += (target.search ? "&" : "?") + cfg.marker;
           args[0] = target.href;
+        } else if (target.protocol === "blob:") {
+          const [wrapper, fresh] = wrapperFor(target.href, args[1]);
+          args[0] = wrapper;
+          if (fresh) created = wrapper;
         }
       } catch (e) {}
-      return Reflect.construct(Original, args, new.target);
+      try {
+        return Reflect.construct(Original, args, new.target);
+      } finally {
+        if (created) revokeObjectURL.call(URL, created);
+      }
     };
     define(Shared, "length", { value: Original.length, configurable: true });
     define(Shared, "prototype", { value: Original.prototype });

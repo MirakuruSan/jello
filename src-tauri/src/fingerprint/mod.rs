@@ -8,7 +8,9 @@
 //! DevTools protocol holds at start until the script has run there (`attach`).
 //! Workers and frames are also told to report the Edge browser Jello is built
 //! on: client hints (`Sec-CH-UA`, `navigator.userAgentData`) without the
-//! WebView2 brand, and one language in `Accept-Language`.
+//! WebView2 brand, and one language in `Accept-Language`. The script hides
+//! installed font families outside the Windows defaults, which are read once
+//! through DirectWrite.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -96,11 +98,128 @@ pub fn registrable(host: &str) -> String {
     }
 }
 
+/// Font families every Windows 10 and 11 install has. Pages may use these
+/// and their own web fonts; other installed families are hidden from them.
+const DEFAULT_FONTS: &[&str] = &[
+    "Arial", "Arial Black", "Bahnschrift", "Calibri", "Calibri Light", "Cambria", "Cambria Math", "Candara",
+    "Cascadia Code", "Cascadia Mono", "Comic Sans MS", "Consolas", "Constantia", "Corbel", "Courier",
+    "Courier New", "Ebrima", "Fixedsys", "Franklin Gothic Medium", "Gabriola", "Gadugi", "Georgia",
+    "HoloLens MDL2 Assets", "Impact", "Ink Free", "Javanese Text", "Leelawadee UI", "Lucida Console",
+    "Lucida Sans Unicode", "Malgun Gothic", "Marlett", "Microsoft Himalaya", "Microsoft JhengHei",
+    "Microsoft JhengHei UI", "Microsoft New Tai Lue", "Microsoft PhagsPa", "Microsoft Sans Serif",
+    "Microsoft Tai Le", "Microsoft YaHei", "Microsoft YaHei UI", "Microsoft Yi Baiti", "MingLiU-ExtB",
+    "MingLiU_HKSCS-ExtB", "Modern", "Mongolian Baiti", "MS Gothic", "MS PGothic", "MS Sans Serif", "MS Serif",
+    "MS UI Gothic", "MV Boli", "Myanmar Text", "Nirmala UI", "NSimSun", "Palatino Linotype", "PMingLiU-ExtB",
+    "Roman", "Script", "Segoe Fluent Icons", "Segoe MDL2 Assets", "Segoe Print", "Segoe Script", "Segoe UI",
+    "Segoe UI Emoji", "Segoe UI Historic", "Segoe UI Symbol", "Segoe UI Variable", "Segoe UI Variable Display",
+    "Segoe UI Variable Small", "Segoe UI Variable Text", "SimSun", "SimSun-ExtB", "Sitka", "Sitka Banner",
+    "Sitka Display", "Sitka Heading", "Sitka Small", "Sitka Subheading", "Sitka Text", "Small Fonts", "Sylfaen",
+    "Symbol", "System", "Tahoma", "Terminal", "Times New Roman", "Trebuchet MS", "Verdana", "Webdings",
+    "Wingdings", "Yu Gothic", "Yu Gothic UI",
+];
+
+/// The names of one installed font family: its family names (typographic
+/// and Win32, every language) and the full and PostScript names of its
+/// fonts, which `local()` matches.
+#[derive(Default)]
+struct FontFamily {
+    families: Vec<String>,
+    faces: Vec<String>,
+}
+
+/// Families to hide (names pages use in `font-family`) and face names to keep
+/// out of `local()`, for installed families not in DEFAULT_FONTS. A family is
+/// a default one when any of its family names is (`Segoe UI Semibold` is part
+/// of `Segoe UI`, and localized names come with their family).
+fn hidden_fonts(installed: &[FontFamily]) -> (Vec<String>, Vec<String>) {
+    let defaults: std::collections::HashSet<String> = DEFAULT_FONTS.iter().map(|f| f.to_lowercase()).collect();
+    let mut families = std::collections::BTreeSet::new();
+    let mut faces = std::collections::BTreeSet::new();
+    for family in installed {
+        let default = family.families.iter().any(|name| defaults.contains(&name.to_lowercase()));
+        if !default {
+            families.extend(family.families.iter().cloned());
+            faces.extend(family.faces.iter().cloned());
+        }
+    }
+    (families.into_iter().collect(), faces.into_iter().collect())
+}
+
+/// The hidden fonts of this computer, read once through DirectWrite.
+fn hidden() -> &'static (Vec<String>, Vec<String>) {
+    static HIDDEN: OnceLock<(Vec<String>, Vec<String>)> = OnceLock::new();
+    HIDDEN.get_or_init(|| hidden_fonts(&installed_fonts()))
+}
+
+#[cfg(target_os = "windows")]
+fn installed_fonts() -> Vec<FontFamily> {
+    use windows::Win32::Graphics::DirectWrite::*;
+    let strings = |list: &IDWriteLocalizedStrings, out: &mut Vec<String>| unsafe {
+        for i in 0..list.GetCount() {
+            let Ok(len) = list.GetStringLength(i) else { continue };
+            let mut buf = vec![0u16; len as usize + 1];
+            if list.GetString(i, &mut buf).is_ok() {
+                let name = String::from_utf16_lossy(&buf[..len as usize]);
+                if !name.is_empty() && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(factory) = DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) else { return out };
+        let mut collection = None;
+        if factory.GetSystemFontCollection(&mut collection, false).is_err() {
+            return out;
+        }
+        let Some(collection) = collection else { return out };
+        for i in 0..collection.GetFontFamilyCount() {
+            let Ok(family) = collection.GetFontFamily(i) else { continue };
+            let mut names = FontFamily::default();
+            if let Ok(list) = family.GetFamilyNames() {
+                strings(&list, &mut names.families);
+            }
+            for j in 0..family.GetFontCount() {
+                let Ok(font) = family.GetFont(j) else { continue };
+                for id in [
+                    DWRITE_INFORMATIONAL_STRING_WIN32_FAMILY_NAMES,
+                    DWRITE_INFORMATIONAL_STRING_FULL_NAME,
+                    DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME,
+                ] {
+                    let mut list = None;
+                    let mut exists = windows::core::BOOL::default();
+                    if font.GetInformationalStrings(id, &mut list, &mut exists).is_ok() && exists.as_bool() {
+                        if let Some(list) = list {
+                            let target = if id == DWRITE_INFORMATIONAL_STRING_WIN32_FAMILY_NAMES {
+                                &mut names.families
+                            } else {
+                                &mut names.faces
+                            };
+                            strings(&list, target);
+                        }
+                    }
+                }
+            }
+            out.push(names);
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "windows"))]
+fn installed_fonts() -> Vec<FontFamily> {
+    Vec::new()
+}
+
 fn config(top: Option<&str>) -> String {
+    let (hidden_families, hidden_faces) = hidden();
     let mut cfg = serde_json::json!({
         "secret": secret(),
         "suffixes": suffixes(),
         "allow": crate::prefs::fingerprint_allowed_sites(),
+        "hiddenFamilies": hidden_families,
+        "hiddenNames": hidden_faces,
     });
     match top {
         Some(top) => cfg["top"] = serde_json::Value::String(top.to_string()),
@@ -183,6 +302,7 @@ pub fn client_hints_pending() -> bool {
 pub fn start(app: &tauri::AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
+        let _ = hidden();
         for _ in 0..20 {
             if HINTS.load(Ordering::SeqCst) == 1 {
                 return;
@@ -488,6 +608,23 @@ mod tests {
         assert_eq!(registrable("www.ck"), "www.ck");
         // Internationalized suffixes are matched in punycode.
         assert_eq!(registrable("xn--fiqs8s.xn--fiqs8s"), "xn--fiqs8s.xn--fiqs8s");
+    }
+
+    #[test]
+    fn only_fonts_outside_the_windows_defaults_are_hidden() {
+        let family = |families: &[&str], faces: &[&str]| FontFamily {
+            families: families.iter().map(|s| s.to_string()).collect(),
+            faces: faces.iter().map(|s| s.to_string()).collect(),
+        };
+        let installed = [
+            family(&["Segoe UI", "Segoe UI Semibold"], &["Segoe UI Semibold", "SegoeUI-Semibold"]),
+            family(&["MS Gothic", "ＭＳ ゴシック"], &["MS Gothic"]),
+            family(&["DejaVu Sans", "DejaVu Sans Light"], &["DejaVu Sans Bold", "DejaVuSans-Bold"]),
+            family(&["Arial Nova"], &["Arial Nova"]),
+        ];
+        let (families, faces) = hidden_fonts(&installed);
+        assert_eq!(families, ["Arial Nova", "DejaVu Sans", "DejaVu Sans Light"]);
+        assert_eq!(faces, ["Arial Nova", "DejaVu Sans Bold", "DejaVuSans-Bold"]);
     }
 
     #[test]

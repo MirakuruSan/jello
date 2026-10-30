@@ -671,8 +671,12 @@ unsafe fn hook(w: tauri::webview::PlatformWebview, state: Arc<Mutex<PageState>>,
         let _ = args.ResourceContext(&mut ctx);
         let method = take_string(|p| req.Method(p));
         // A shared worker's main script gets fingerprinting protection first
-        // (see fingerprint::shared_worker_script).
-        if let Some(original) = crate::fingerprint::shared_worker_original(&url) {
+        // (see fingerprint::shared_worker_script). Only the script load itself
+        // is answered: the worker reading its own URL gets the original.
+        let shared_worker = (ctx == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_OTHER)
+            .then(|| crate::fingerprint::shared_worker_original(&url))
+            .flatten();
+        if let Some(original) = shared_worker {
             if let Some(js) = crate::fingerprint::shared_worker_script(&original) {
                 let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(js.as_bytes()));
                 let headers = "Content-Type: text/javascript\r\nCache-Control: no-store";
